@@ -1,0 +1,5 @@
+market,ticker,name,event_date,event_type,title,source,source_url,importance_score,summary
+US,NVDA,NVIDIA,2026-05-10,earnings,AI demand beat,manual,,0.82,Revenue or guidance beat with post-earnings momentum.
+US,TSLA,Tesla,2026-05-10,analyst_rating,Analyst upgrade after delivery data,manual,,0.66,Rating or target price change after a measurable catalyst.
+HK,0700.HK,腾讯控股,2026-05-11,buyback,回购金额扩大,manual,,0.76,回购力度提升并配合平台整理突破。
+HK,1810.HK,小米集团-W,2026-05-11,southbound,南向资金连续净买入,manual,,0.70,南向资金与核心业务催化共振。

@@ -1,0 +1,36 @@
+market,ticker,name,source,source_symbol,active,tags
+US,NVDA,NVIDIA,sina_us,NVDA,1,ai|semiconductor|mega_cap
+US,AMD,Advanced Micro Devices,sina_us,AMD,1,semiconductor|ai
+US,AVGO,Broadcom,sina_us,AVGO,1,semiconductor|ai
+US,MSFT,Microsoft,sina_us,MSFT,1,ai|cloud|mega_cap
+US,AAPL,Apple,sina_us,AAPL,1,consumer|mega_cap
+US,META,Meta Platforms,sina_us,META,1,ai|ads|mega_cap
+US,AMZN,Amazon,sina_us,AMZN,1,cloud|consumer|mega_cap
+US,GOOGL,Alphabet,sina_us,GOOGL,1,ai|ads|mega_cap
+US,TSLA,Tesla,sina_us,TSLA,1,ev|momentum
+US,PLTR,Palantir,sina_us,PLTR,1,ai|software|momentum
+US,SMCI,Super Micro Computer,sina_us,SMCI,1,ai|hardware|high_beta
+US,COIN,Coinbase,sina_us,COIN,1,crypto|high_beta
+US,MSTR,MicroStrategy,sina_us,MSTR,1,crypto|high_beta
+HK,0700.HK,腾讯控股,tencent_hk,hk00700,1,internet|southbound|mega_cap
+HK,9988.HK,阿里巴巴-W,tencent_hk,hk09988,1,internet|ecommerce|southbound
+HK,3690.HK,美团-W,tencent_hk,hk03690,1,internet|local_services|southbound
+HK,1810.HK,小米集团-W,tencent_hk,hk01810,1,hardware|ev|southbound
+HK,1024.HK,快手-W,tencent_hk,hk01024,1,internet|ads|southbound
+HK,9618.HK,京东集团-SW,tencent_hk,hk09618,1,ecommerce|southbound
+HK,9999.HK,网易-S,tencent_hk,hk09999,1,gaming|southbound
+HK,0981.HK,中芯国际,tencent_hk,hk00981,1,semiconductor|southbound
+HK,1211.HK,比亚迪股份,tencent_hk,hk01211,1,ev|southbound
+HK,2269.HK,药明生物,tencent_hk,hk02269,1,biotech|southbound
+CN_A,002674.SZ,兴业科技,sina_cn,sz002674,1,institutional_research|ev_interior
+CN_A,300750.SZ,宁德时代,sina_cn,sz300750,1,ev_battery|large_cap
+CN_A,002594.SZ,比亚迪,sina_cn,sz002594,1,ev|large_cap
+CN_A,601127.SS,赛力斯,sina_cn,sh601127,1,ev|huawei_auto
+CN_A,300308.SZ,中际旭创,sina_cn,sz300308,1,ai|optical_module
+CN_A,300502.SZ,新易盛,sina_cn,sz300502,1,ai|optical_module
+CN_A,002475.SZ,立讯精密,sina_cn,sz002475,1,consumer_electronics
+CN_A,600519.SS,贵州茅台,sina_cn,sh600519,1,consumer|large_cap
+CN_A,000858.SZ,五粮液,sina_cn,sz000858,1,consumer
+CN_A,601318.SS,中国平安,sina_cn,sh601318,1,insurance|large_cap
+CN_A,688981.SS,中芯国际,sina_cn,sh688981,1,semiconductor
+CN_A,000333.SZ,美的集团,sina_cn,sz000333,1,appliance|large_cap

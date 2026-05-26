@@ -6,83 +6,61 @@ from pathlib import Path
 
 from .db import upsert_many
 from .db import dump_json
-from .ledger import add_signal, add_tracking_event, immutable_hash, now_utc
+from .ledger import now_utc
 from .strategy_library import rows as strategy_rows
 
 
 XINGYE_CSV = Path("data/reference/xingye_002674_20260401_20260525.csv")
+DEPRECATED_STRATEGY_IDS = (
+    "institutional_research_revaluation",
+    "event_catalyst_reaction",
+    "post_earnings_momentum",
+    "crowded_short_reversal",
+    "hk_value_repair",
+    "hk_internet_trend_recovery",
+)
 
 
 def seed_strategies(conn: sqlite3.Connection) -> int:
     count = upsert_many(conn, "strategies", strategy_rows(), ("id",))
-    retire_merged_strategies(conn)
-    retire_split_event_strategy(conn)
+    purge_deprecated_strategies(conn)
     return count
 
 
-def retire_merged_strategies(conn: sqlite3.Connection) -> None:
-    old_id = "institutional_research_revaluation"
-    new_id = "xingye_style_prepositioning"
-    conn.execute(
-        """
-        UPDATE signals AS s
-        SET strategy_id = ?
-        WHERE strategy_id = ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM signals dup
-              WHERE dup.signal_date = s.signal_date
-                AND dup.ticker = s.ticker
-                AND dup.market = s.market
-                AND dup.strategy_id = ?
-          )
-        """,
-        (new_id, old_id, new_id),
-    )
-    conn.execute(
-        """
-        UPDATE candidates AS c
-        SET strategy_id = ?
-        WHERE strategy_id = ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM candidates dup
-              WHERE dup.as_of_date = c.as_of_date
-                AND dup.market = c.market
-                AND dup.ticker = c.ticker
-                AND dup.strategy_id = ?
-          )
-        """,
-        (new_id, old_id, new_id),
-    )
-    conn.execute(
-        """
-        UPDATE strategies
-        SET status = 'RETIRED',
-            weight = 0,
-            name = '已合并：机构调研后重估首阳'
-        WHERE id = ?
-        """,
-        (old_id,),
-    )
-    for row in conn.execute("SELECT * FROM signals WHERE strategy_id = ?", (new_id,)).fetchall():
+def purge_deprecated_strategies(conn: sqlite3.Connection) -> None:
+    placeholders = ", ".join("?" for _ in DEPRECATED_STRATEGY_IDS)
+    candidate_ids = [
+        int(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM candidates WHERE strategy_id IN ({placeholders})",
+            DEPRECATED_STRATEGY_IDS,
+        ).fetchall()
+    ]
+    if candidate_ids:
+        candidate_placeholders = ", ".join("?" for _ in candidate_ids)
         conn.execute(
-            "UPDATE signals SET immutable_hash = ? WHERE id = ?",
-            (immutable_hash(dict(row)), int(row["id"])),
+            f"DELETE FROM candidate_horizon_evaluations WHERE candidate_id IN ({candidate_placeholders})",
+            candidate_ids,
         )
-    conn.commit()
-
-
-def retire_split_event_strategy(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        UPDATE strategies
-        SET status = 'RETIRED',
-            weight = 0,
-            name = '已拆分：泛公告调研事件催化'
-        WHERE id = 'event_catalyst_reaction'
-        """
-    )
+        conn.execute(
+            f"DELETE FROM candidate_evaluations WHERE candidate_id IN ({candidate_placeholders})",
+            candidate_ids,
+        )
+        conn.execute(f"DELETE FROM candidates WHERE id IN ({candidate_placeholders})", candidate_ids)
+    signal_ids = [
+        int(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM signals WHERE strategy_id IN ({placeholders})",
+            DEPRECATED_STRATEGY_IDS,
+        ).fetchall()
+    ]
+    if signal_ids:
+        signal_placeholders = ", ".join("?" for _ in signal_ids)
+        conn.execute(f"DELETE FROM tracking_events WHERE signal_id IN ({signal_placeholders})", signal_ids)
+        conn.execute(f"DELETE FROM evaluations WHERE signal_id IN ({signal_placeholders})", signal_ids)
+        conn.execute(f"DELETE FROM signals WHERE id IN ({signal_placeholders})", signal_ids)
+    conn.execute(f"DELETE FROM strategy_audits WHERE strategy_id IN ({placeholders})", DEPRECATED_STRATEGY_IDS)
+    conn.execute(f"DELETE FROM strategies WHERE id IN ({placeholders})", DEPRECATED_STRATEGY_IDS)
     conn.commit()
 
 
@@ -132,90 +110,9 @@ def seed_research_events(conn: sqlite3.Connection) -> int:
     return upsert_many(conn, "research_events", rows, ("market", "ticker", "event_date", "event_type"))
 
 
-def seed_xingye_signal(conn: sqlite3.Connection) -> int:
-    signal_id = add_signal(
-        conn,
-        {
-            "signal_date": "2026-05-13",
-            "ticker": "002674.SZ",
-            "name": "兴业科技",
-            "market": "CN_A",
-            "strategy_id": "xingye_style_prepositioning",
-            "entry_type": "BUY_CANDIDATE",
-            "entry_price": 13.73,
-            "buy_zone_low": 13.45,
-            "buy_zone_high": 13.85,
-            "stop_loss": 13.12,
-            "target_1": 14.70,
-            "target_2": 15.97,
-            "horizon_days": 15,
-            "confidence": "B+",
-            "thesis": (
-                "4月28日投资者交流会、5月6日披露记录后，传统皮革公司出现新能源车内饰"
-                "供应链重估线索；5月13日放量中阳，像重估首阳而非涨停追高。"
-            ),
-            "trigger_condition": (
-                "调研后整理数日，5月13日涨4.09%，成交量67102手，约为此前5日均量1.87倍；"
-                "买点应在启动日收盘附近或次日回踩不破启动日中枢时。"
-            ),
-            "risk_notes": (
-                "公开资金流在5月13日未显示强主力净流入，不能把该案例简单归因于主力提前埋伏；"
-                "若跌破13.12或后续催化无法兑现，应视为重估失败。"
-            ),
-            "evidence_json": [
-                {
-                    "type": "announcement",
-                    "title": "兴业科技：2026年4月28日投资者活动记录",
-                    "url": "https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=12298774&stockid=002674",
-                },
-                {
-                    "type": "price_action",
-                    "title": "5月13日放量中阳，5月25日涨停",
-                    "url": "https://finance.sina.com.cn/stock/aiassist/ydfx/2026-05-25/doc-inhzamvr5186304.shtml",
-                },
-                {
-                    "type": "capital_event",
-                    "title": "5月18日4亿元无抵押授信公告转载",
-                    "url": "https://www.aastocks.com/sc/cnhk/news/china-hot-topic-content.aspx?catg=4&id=YLC6167810N&source=YOULIAN",
-                },
-            ],
-        },
-    )
-    existing_events = conn.execute(
-        "SELECT COUNT(*) AS count FROM tracking_events WHERE signal_id = ?", (signal_id,)
-    ).fetchone()["count"]
-    if existing_events == 0:
-        add_tracking_event(
-            conn,
-            signal_id,
-            "2026-05-13",
-            "TRIGGERED",
-            "放量中阳触发兴业科技型重估埋伏启动观察买点。",
-            13.73,
-        )
-        add_tracking_event(
-            conn,
-            signal_id,
-            "2026-05-20",
-            "CONFIRMED",
-            "收盘14.51，成交额显著放大，进入突破确认阶段。",
-            14.51,
-        )
-        add_tracking_event(
-            conn,
-            signal_id,
-            "2026-05-25",
-            "TARGET_2_HIT",
-            "触及15.97涨停价，样本进入情绪兑现区，需要复盘是否继续持有。",
-            15.97,
-        )
-    return signal_id
-
-
 def seed_all(conn: sqlite3.Connection) -> dict[str, int]:
     return {
         "strategies": seed_strategies(conn),
         "price_bars": seed_price_bars(conn),
         "research_events": seed_research_events(conn),
-        "xingye_signal_id": seed_xingye_signal(conn),
     }

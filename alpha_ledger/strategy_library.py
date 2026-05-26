@@ -8,7 +8,7 @@ STRATEGIES = [
     {
         "id": "trend_breakout",
         "name": "强趋势突破",
-        "market_scope": "US/HK/CN_A",
+        "market_scope": "CN_A",
         "thesis": "在行业或指数强势阶段，价格突破中期平台且成交量确认时，趋势延续概率提高。",
         "entry_rules_json": dump_json(
             {
@@ -28,93 +28,9 @@ STRATEGIES = [
         "weight": 1.0,
     },
     {
-        "id": "post_earnings_momentum",
-        "name": "财报后动量",
-        "market_scope": "US/HK/CN_A",
-        "thesis": "财报超预期、指引上修或利润率改善后，市场常出现第二波重估。",
-        "entry_rules_json": dump_json(
-            {
-                "fundamental": "营收、利润、毛利率或指引明显优于预期",
-                "price": "财报后不跌破缺口或放量站稳关键均线",
-                "confirmation": "券商上修或机构资金持续流入",
-            }
-        ),
-        "exit_rules_json": dump_json(
-            {
-                "stop": "跌破财报后首日低点",
-                "take_profit": "达到预设目标或动量衰减",
-            }
-        ),
-        "status": "ACTIVE",
-        "weight": 1.0,
-    },
-    {
-        "id": "crowded_short_reversal",
-        "name": "空头拥挤反转",
-        "market_scope": "US",
-        "thesis": "高空头拥挤股票在利空出尽、资金回补或基本面改善时可能出现快速反转。",
-        "entry_rules_json": dump_json(
-            {
-                "short_interest": "空头比例高且回补天数较高",
-                "catalyst": "利空落地、融资改善、业绩改善或监管风险下降",
-                "price": "放量长阳收复关键均线",
-            }
-        ),
-        "exit_rules_json": dump_json(
-            {
-                "stop": "反转日低点失守",
-                "take_profit": "短线急涨后分批落袋",
-            }
-        ),
-        "status": "ACTIVE",
-        "weight": 0.8,
-    },
-    {
-        "id": "hk_value_repair",
-        "name": "港股低估值修复",
-        "market_scope": "HK",
-        "thesis": "港股低估值资产在盈利边际改善、政策预期或流动性回暖时会出现估值修复。",
-        "entry_rules_json": dump_json(
-            {
-                "valuation": "估值低于自身历史分位或同业",
-                "fundamental": "盈利、现金流或回购出现改善",
-                "flow": "南向资金、成交额或板块热度改善",
-            }
-        ),
-        "exit_rules_json": dump_json(
-            {
-                "stop": "修复逻辑被证伪或跌破中期支撑",
-                "take_profit": "估值回到中位或行情进入拥挤",
-            }
-        ),
-        "status": "ACTIVE",
-        "weight": 1.0,
-    },
-    {
-        "id": "hk_internet_trend_recovery",
-        "name": "港股互联网龙头趋势恢复",
-        "market_scope": "HK",
-        "thesis": "腾讯、阿里、美团、小米等龙头在业绩、回购、政策和趋势共振时适合中期波段。",
-        "entry_rules_json": dump_json(
-            {
-                "trend": "站上20/60日均线并形成更高低点",
-                "fundamental": "利润率、回购、业务增长或产品周期改善",
-                "flow": "南向资金和成交额同步改善",
-            }
-        ),
-        "exit_rules_json": dump_json(
-            {
-                "stop": "跌破趋势恢复结构",
-                "take_profit": "阶段涨幅过大且成交拥挤",
-            }
-        ),
-        "status": "ACTIVE",
-        "weight": 1.0,
-    },
-    {
         "id": "abnormal_volume_small_midcap",
         "name": "中小盘异常放量异动",
-        "market_scope": "US/HK/CN_A",
+        "market_scope": "CN_A",
         "thesis": "中小盘低关注度股票在催化出现前后，量价异动往往先于市场共识。",
         "entry_rules_json": dump_json(
             {
@@ -131,24 +47,6 @@ STRATEGIES = [
         ),
         "status": "ACTIVE",
         "weight": 0.9,
-    },
-    {
-        "id": "event_catalyst_reaction",
-        "name": "已拆分：泛公告调研事件催化",
-        "market_scope": "CN_A/HK/US",
-        "thesis": "旧版泛事件策略已拆分为更硬的事件子策略，避免弱新闻和泛公告污染胜率。",
-        "entry_rules_json": dump_json(
-            {
-                "retired": "由 us_sec_event_momentum、us_news_event_momentum、hk_buyback_recovery、hk_southbound_recovery、hk_news_recovery、a_share_hard_event_catalyst 承接",
-            }
-        ),
-        "exit_rules_json": dump_json(
-            {
-                "retired": "不再生成新候选",
-            }
-        ),
-        "status": "RETIRED",
-        "weight": 0.0,
     },
     {
         "id": "us_sec_event_momentum",
@@ -168,7 +66,7 @@ STRATEGIES = [
                 "take_profit": "事件后动量衰减或到达第一目标",
             }
         ),
-        "status": "ACTIVE",
+        "status": "EXPERIMENTAL",
         "weight": 1.0,
     },
     {
@@ -184,7 +82,7 @@ STRATEGIES = [
             }
         ),
         "exit_rules_json": dump_json({"stop": "跌破新闻窗口低点", "take_profit": "短线动量衰减"}),
-        "status": "ACTIVE",
+        "status": "EXPERIMENTAL",
         "weight": 0.9,
     },
     {
@@ -200,7 +98,7 @@ STRATEGIES = [
             }
         ),
         "exit_rules_json": dump_json({"stop": "跌破回购窗口低点", "take_profit": "估值修复或趋势破坏"}),
-        "status": "ACTIVE",
+        "status": "EXPERIMENTAL",
         "weight": 0.95,
     },
     {
@@ -216,7 +114,7 @@ STRATEGIES = [
             }
         ),
         "exit_rules_json": dump_json({"stop": "跌破资金窗口低点", "take_profit": "南向热度衰减或趋势破坏"}),
-        "status": "ACTIVE",
+        "status": "EXPERIMENTAL",
         "weight": 0.9,
     },
     {
@@ -232,7 +130,7 @@ STRATEGIES = [
             }
         ),
         "exit_rules_json": dump_json({"stop": "跌破新闻窗口低点", "take_profit": "修复兑现或趋势破坏"}),
-        "status": "ACTIVE",
+        "status": "EXPERIMENTAL",
         "weight": 0.85,
     },
     {
@@ -283,10 +181,9 @@ STRATEGIES = [
 
 def rows() -> list[dict[str, object]]:
     created_at = now_utc()
+    default_version = "v1.1-cn-a-formal"
     horizon_by_strategy = {
         "trend_breakout": 20,
-        "hk_value_repair": 20,
-        "hk_internet_trend_recovery": 20,
         "xingye_style_prepositioning": 10,
         "abnormal_volume_small_midcap": 5,
     }
@@ -295,6 +192,7 @@ def rows() -> list[dict[str, object]]:
         rows.append(
             {
                 **strategy,
+                "version": default_version,
                 "target_horizon_days": horizon_by_strategy.get(str(strategy["id"]), 10),
                 "created_at": created_at,
             }

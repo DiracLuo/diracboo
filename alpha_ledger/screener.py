@@ -48,6 +48,65 @@ def _price_bar(conn: sqlite3.Connection, market: str, ticker: str, date: str) ->
     ).fetchone()
 
 
+def _next_price_date(conn: sqlite3.Connection, market: str, ticker: str, after_date: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT MIN(date) AS d
+        FROM price_bars
+        WHERE market = ? AND ticker = ? AND date > ?
+        """,
+        (market, ticker, after_date),
+    ).fetchone()
+    return str(row["d"]) if row and row["d"] else None
+
+
+def _market_regime(conn: sqlite3.Connection, market: str, as_of_date: str) -> str:
+    index_map = {
+        "CN_A": ("CN_A", "000300.SS"),
+        "HK": ("HK", "HSI.HK"),
+        "US": ("US", "SPY"),
+    }
+    entry = index_map.get(market)
+    if entry is None:
+        return "NEUTRAL"
+    idx_market, idx_ticker = entry
+    bars = conn.execute(
+        "SELECT close FROM price_bars WHERE market = ? AND ticker = ? AND date <= ? ORDER BY date DESC LIMIT 20",
+        (idx_market, idx_ticker, as_of_date),
+    ).fetchall()
+    if len(bars) >= 20:
+        closes = [float(row["close"]) for row in bars]
+    else:
+        proxy_rows = conn.execute(
+            """
+            SELECT date, AVG(COALESCE(change_pct, 0)) AS avg_change_pct
+            FROM price_bars
+            WHERE market = ? AND date <= ?
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT 20
+            """,
+            (market, as_of_date),
+        ).fetchall()
+        if len(proxy_rows) < 20:
+            return "NEUTRAL"
+        proxy_level = 100.0
+        proxy_closes: list[float] = []
+        for row in reversed(proxy_rows):
+            proxy_level *= 1.0 + float(row["avg_change_pct"] or 0.0) / 100.0
+            proxy_closes.append(proxy_level)
+        closes = list(reversed(proxy_closes))
+    if len(closes) < 20:
+        return "NEUTRAL"
+    current = closes[0]
+    ma20 = sum(closes) / len(closes)
+    if current > ma20 * 1.01:
+        return "BULL"
+    if current < ma20 * 0.99:
+        return "BEAR"
+    return "NEAR_MA"
+
+
 def _volume_average(rows: list[sqlite3.Row]) -> float | None:
     if not rows:
         return None
@@ -344,7 +403,9 @@ def _candidate(
     trigger_condition: str,
     risk_notes: str,
     evidence: list[dict[str, object]],
+    data_date: str = "",
 ) -> dict[str, object]:
+    reward_risk = round((target_1 - close) / (close - stop_loss), 2) if stop_loss > 0 and close > stop_loss else 0.0
     return {
         "as_of_date": as_of_date,
         "market": market,
@@ -359,11 +420,14 @@ def _candidate(
         "stop_loss": round(stop_loss, 2),
         "target_1": round(target_1, 2),
         "target_2": round(target_2, 2),
+        "reward_risk_ratio": reward_risk,
         "thesis": thesis,
         "trigger_condition": trigger_condition,
         "risk_notes": risk_notes,
         "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
         "status": "WATCHLIST",
+        "confirmation_status": "PENDING",
+        "data_date": data_date,
         "created_at": now_utc(),
     }
 
@@ -559,6 +623,11 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
         title = event["title"]
         flags_text = f"；财务支持：{', '.join(financial_flags)}" if financial_flags else ""
         target_1, target_2 = _target_prices(event["market"], close, prior, close * 1.06, close * 1.13)
+        reward_risk = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        if reward_risk < 1.0:
+            score -= 15
+        elif reward_risk < 1.5:
+            score -= 5
         candidates.append(
             _candidate(
                 as_of_date=as_of_date,
@@ -585,6 +654,7 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                         "url": event["source_url"],
                     }
                 ],
+                data_date=str(bar["date"]),
             )
         )
     return candidates
@@ -671,6 +741,11 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
         flags_text = f"；财务支持：{', '.join(financial_flags)}" if financial_flags else ""
         title = str(event["title"])
         target_1, target_2 = _target_prices(market, close, prior, close * 1.07, close * 1.16)
+        reward_risk = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        if reward_risk < 1.0:
+            score -= 15
+        elif reward_risk < 1.5:
+            score -= 5
         candidates.append(
             _candidate(
                 as_of_date=as_of_date,
@@ -711,6 +786,7 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
                         "url": None,
                     },
                 ],
+                data_date=str(bar["date"]),
             )
         )
     return candidates
@@ -738,9 +814,19 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
         breakout = close >= high_20 * 0.998 and close > ma_20 and volume_ratio >= 1.15 and change_pct > 0.8
         if not breakout:
             continue
+        regime = _market_regime(conn, item["market"], as_of_date)
+        if regime == "BEAR":
+            continue
         score = 52.0 + min(volume_ratio * 9.0, 18.0) + min(max((close / high_20 - 1.0) * 500.0, 0), 10.0)
+        if regime == "NEAR_MA":
+            score *= 0.8
         action = "WATCH_PULLBACK" if change_pct >= 8.5 else "BUY_CANDIDATE"
         target_1, target_2 = _target_prices(item["market"], close, prior, close * 1.08, close * 1.16)
+        reward_risk_val = (target_1 - close) / (close - max(low_10, close * 0.92)) if close > max(low_10, close * 0.92) else 0
+        if reward_risk_val < 1.0:
+            score -= 15
+        elif reward_risk_val < 1.5:
+            score -= 5
         candidates.append(
             _candidate(
                 as_of_date=as_of_date,
@@ -764,6 +850,7 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                     "若跌回突破位或成交量无法延续，应快速降级。"
                 ),
                 evidence=[{"type": "price_action", "title": "20日突破与放量确认", "url": None}],
+                data_date=str(bar["date"]),
             )
         )
     return candidates
@@ -788,8 +875,18 @@ def screen_abnormal_volume(conn: sqlite3.Connection, as_of_date: str) -> list[di
         abnormal = close > open_price and 2.8 <= change_pct <= 8.5 and volume_ratio >= 1.65
         if not abnormal:
             continue
+        regime = _market_regime(conn, item["market"], as_of_date)
+        if regime == "BEAR":
+            continue
         score = 45.0 + min(volume_ratio * 12.0, 30.0) + min(change_pct * 2.0, 15.0)
+        if regime == "NEAR_MA":
+            score *= 0.8
         target_1, target_2 = _target_prices(item["market"], close, prior, close * 1.07, close * 1.14)
+        reward_risk_val = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        if reward_risk_val < 1.0:
+            score -= 15
+        elif reward_risk_val < 1.5:
+            score -= 5
         candidates.append(
             _candidate(
                 as_of_date=as_of_date,
@@ -809,6 +906,7 @@ def screen_abnormal_volume(conn: sqlite3.Connection, as_of_date: str) -> list[di
                 ),
                 risk_notes="异常放量误报很多，必须结合公告、行业催化或后续不破启动日低点确认。",
                 evidence=[{"type": "price_action", "title": "异常放量中阳", "url": None}],
+                data_date=str(bar["date"]),
             )
         )
     return candidates
@@ -848,10 +946,10 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                 INSERT INTO candidates (
                     as_of_date, market, ticker, name, strategy_id, candidate_score,
                     action, entry_price, buy_zone_low, buy_zone_high, stop_loss,
-                    target_1, target_2, thesis, trigger_condition, risk_notes,
-                    evidence_json, status, created_at
+                    target_1, target_2, reward_risk_ratio, thesis, trigger_condition, risk_notes,
+                    evidence_json, status, confirmation_status, data_date, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(as_of_date, market, ticker, strategy_id) DO UPDATE SET
                     candidate_score=excluded.candidate_score,
                     action=excluded.action,
@@ -861,11 +959,14 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     stop_loss=excluded.stop_loss,
                     target_1=excluded.target_1,
                     target_2=excluded.target_2,
+                    reward_risk_ratio=excluded.reward_risk_ratio,
                     thesis=excluded.thesis,
                     trigger_condition=excluded.trigger_condition,
                     risk_notes=excluded.risk_notes,
                     evidence_json=excluded.evidence_json,
                     status=excluded.status,
+                    confirmation_status=excluded.confirmation_status,
+                    data_date=excluded.data_date,
                     created_at=excluded.created_at
                 """,
                 (
@@ -882,11 +983,14 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     row["stop_loss"],
                     row["target_1"],
                     row["target_2"],
+                    row["reward_risk_ratio"],
                     row["thesis"],
                     row["trigger_condition"],
                     row["risk_notes"],
                     row["evidence_json"],
                     row["status"],
+                    row["confirmation_status"],
+                    row["data_date"],
                     row["created_at"],
                 ),
             )
@@ -905,3 +1009,72 @@ def latest_candidates(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
         """,
         (as_of_date,),
     ).fetchall()
+
+
+def confirm_candidates(conn: sqlite3.Connection, as_of_date: str) -> tuple[int, int]:
+    pending = conn.execute(
+        """
+        SELECT c.* FROM candidates c
+        JOIN strategies st ON st.id = c.strategy_id
+        WHERE c.as_of_date < ?
+          AND c.action LIKE '%CONFIRM%'
+          AND c.status = 'WATCHLIST'
+          AND COALESCE(c.confirmation_status, 'PENDING') = 'PENDING'
+          AND st.status != 'RETIRED'
+        """,
+        (as_of_date,),
+    ).fetchall()
+
+    confirmed = 0
+    cancelled = 0
+    for candidate in pending:
+        reference_date = str(candidate["data_date"] or candidate["as_of_date"])
+        next_date = _next_price_date(conn, candidate["market"], candidate["ticker"], reference_date)
+        if next_date is None or next_date > as_of_date:
+            continue
+        bar = _price_bar(conn, candidate["market"], candidate["ticker"], next_date)
+        prev_bar = _price_bar(conn, candidate["market"], candidate["ticker"], reference_date)
+        if bar is None or prev_bar is None:
+            conn.execute(
+                "UPDATE candidates SET status = 'CANCELLED', confirmation_status = 'CANCELLED', confirmation_date = ?, confirmation_reason = ? WHERE id = ?",
+                (next_date or as_of_date, "次日无行情数据", int(candidate["id"])),
+            )
+            cancelled += 1
+            continue
+
+        close = float(bar["close"])
+        volume = float(bar["volume"])
+        low = float(bar["low"])
+        prev_close = float(prev_bar["close"])
+        prev_volume = float(prev_bar["volume"])
+        stop = float(candidate["stop_loss"]) if candidate["stop_loss"] else None
+
+        reasons = []
+        confirmed_ok = True
+        if close < prev_close:
+            confirmed_ok = False
+            reasons.append(f"次日收盘{close:.2f}低于候选日收盘{prev_close:.2f}")
+        if volume < prev_volume * 0.8:
+            confirmed_ok = False
+            volume_ratio = volume / prev_volume * 100 if prev_volume else 0.0
+            reasons.append(f"次日成交量{volume:.0f}缩量至候选日{volume_ratio:.0f}%")
+        if stop is not None and low <= stop:
+            confirmed_ok = False
+            reasons.append(f"次日最低{low:.2f}跌破止损{stop:.2f}")
+
+        if confirmed_ok:
+            conn.execute(
+                "UPDATE candidates SET status = 'CONFIRMED', confirmation_status = 'CONFIRMED', confirmation_date = ?, confirmation_reason = ? WHERE id = ?",
+                (next_date, "次日价格承接、未缩量、未破止损", int(candidate["id"])),
+            )
+            confirmed += 1
+        else:
+            reason_text = "；".join(reasons)
+            conn.execute(
+                "UPDATE candidates SET status = 'CANCELLED', confirmation_status = 'CANCELLED', confirmation_date = ?, confirmation_reason = ? WHERE id = ?",
+                (next_date, reason_text, int(candidate["id"])),
+            )
+            cancelled += 1
+
+    conn.commit()
+    return confirmed, cancelled

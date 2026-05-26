@@ -54,14 +54,18 @@
 - 次日不破启动日中枢或后续继续放量承接；
 - 止损位清晰。
 
-## 已入账信号
+## 当前项目中的位置
 
-Alpha Ledger 已将 2026-05-13 的兴业科技作为样本信号写入账本。
+Alpha Ledger 不再把兴业科技作为手工信号默认写入 `signals`。它现在有两个用途：
 
-运行：
+- `data/reference/xingye_002674_20260401_20260525.csv` 保留案例行情，用于测试和复盘。
+- `research_events` 保留 2026-05-06 可见的调研线索，用于让 `xingye_style_prepositioning` 筛选器在历史日期自行挖出候选。
+
+也就是说，兴业科技只有在筛选器规则于当日成立时才会进入 `candidates`，不再靠手工样本污染账本。
+
+验证命令：
 
 ```bash
-python -m alpha_ledger bootstrap --as-of 2026-05-25
+python -m alpha_ledger screen --as-of 2026-05-13
+python -m alpha_ledger evaluate-candidates --candidate-date 2026-05-13 --through 2026-05-25
 ```
-
-即可生成该样本的 T+5/T+10/T+20/T+60 评估报告。

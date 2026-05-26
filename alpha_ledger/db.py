@@ -6,6 +6,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from .metrics import DEFAULT_TRADE_COST_PCT, MARKET_TRADE_COST_PCT
+
 
 DEFAULT_DB_PATH = Path("data/alpha_ledger.sqlite")
 
@@ -33,6 +35,7 @@ SCHEMA_STATEMENTS = [
         entry_rules_json TEXT NOT NULL,
         exit_rules_json TEXT NOT NULL,
         target_horizon_days INTEGER NOT NULL DEFAULT 10,
+        version TEXT NOT NULL DEFAULT 'v1',
         status TEXT NOT NULL DEFAULT 'ACTIVE',
         weight REAL NOT NULL DEFAULT 1.0,
         created_at TEXT NOT NULL
@@ -80,7 +83,29 @@ SCHEMA_STATEMENTS = [
         amplitude_pct REAL,
         change_pct REAL,
         turnover_pct REAL,
+        adj_open REAL,
+        adj_close REAL,
+        adj_high REAL,
+        adj_low REAL,
+        adj_factor REAL,
+        adjustment_status TEXT NOT NULL DEFAULT 'UNKNOWN',
         PRIMARY KEY(market, ticker, date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS intraday_bars (
+        market TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        datetime TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time TEXT NOT NULL,
+        open REAL NOT NULL,
+        close REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        volume REAL NOT NULL,
+        amount REAL,
+        PRIMARY KEY(market, ticker, datetime)
     )
     """,
     """
@@ -107,6 +132,13 @@ SCHEMA_STATEMENTS = [
         end_date TEXT NOT NULL,
         end_close REAL NOT NULL,
         return_pct REAL NOT NULL,
+        gross_return_pct REAL NOT NULL DEFAULT 0,
+        cost_pct REAL NOT NULL DEFAULT 0,
+        net_return_pct REAL NOT NULL DEFAULT 0,
+        net_win INTEGER NOT NULL DEFAULT 0,
+        benchmark_ticker TEXT,
+        benchmark_return_pct REAL,
+        excess_return_pct REAL,
         max_gain_pct REAL NOT NULL,
         max_drawdown_pct REAL NOT NULL,
         hit_stop INTEGER NOT NULL,
@@ -203,11 +235,16 @@ SCHEMA_STATEMENTS = [
         stop_loss REAL,
         target_1 REAL,
         target_2 REAL,
+        reward_risk_ratio REAL,
         thesis TEXT NOT NULL,
         trigger_condition TEXT NOT NULL,
         risk_notes TEXT NOT NULL,
         evidence_json TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL DEFAULT 'WATCHLIST',
+        confirmation_status TEXT NOT NULL DEFAULT 'PENDING',
+        confirmation_date TEXT,
+        confirmation_reason TEXT,
+        data_date TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY(strategy_id) REFERENCES strategies(id),
         UNIQUE(as_of_date, market, ticker, strategy_id)
@@ -228,6 +265,13 @@ SCHEMA_STATEMENTS = [
         end_date TEXT NOT NULL,
         end_close REAL NOT NULL,
         return_pct REAL NOT NULL,
+        gross_return_pct REAL NOT NULL DEFAULT 0,
+        cost_pct REAL NOT NULL DEFAULT 0,
+        net_return_pct REAL NOT NULL DEFAULT 0,
+        net_win INTEGER NOT NULL DEFAULT 0,
+        benchmark_ticker TEXT,
+        benchmark_return_pct REAL,
+        excess_return_pct REAL,
         max_gain_pct REAL NOT NULL,
         max_drawdown_pct REAL NOT NULL,
         hit_stop INTEGER NOT NULL,
@@ -258,6 +302,13 @@ SCHEMA_STATEMENTS = [
         end_date TEXT NOT NULL,
         end_close REAL NOT NULL,
         return_pct REAL NOT NULL,
+        gross_return_pct REAL NOT NULL DEFAULT 0,
+        cost_pct REAL NOT NULL DEFAULT 0,
+        net_return_pct REAL NOT NULL DEFAULT 0,
+        net_win INTEGER NOT NULL DEFAULT 0,
+        benchmark_ticker TEXT,
+        benchmark_return_pct REAL,
+        excess_return_pct REAL,
         max_gain_pct REAL NOT NULL,
         max_drawdown_pct REAL NOT NULL,
         hit_stop INTEGER NOT NULL,
@@ -353,13 +404,128 @@ def estimate_financial_published_date(report_date: str) -> str:
     return (value + timedelta(days=45)).isoformat()
 
 
+def _trade_cost_case_sql(market_expr: str) -> str:
+    lines = [f"CASE {market_expr}"]
+    for market, cost in sorted(MARKET_TRADE_COST_PCT.items()):
+        lines.append(f"    WHEN '{market}' THEN {cost}")
+    lines.append(f"    ELSE {DEFAULT_TRADE_COST_PCT}")
+    lines.append("END")
+    return "\n".join(lines)
+
+
+def _backfill_net_returns(conn: sqlite3.Connection) -> None:
+    updates = [
+        (
+            "evaluations",
+            "e",
+            "(SELECT sig.market FROM signals sig WHERE sig.id = e.signal_id)",
+        ),
+        (
+            "candidate_evaluations",
+            "e",
+            "(SELECT c.market FROM candidates c WHERE c.id = e.candidate_id)",
+        ),
+        (
+            "candidate_horizon_evaluations",
+            "e",
+            "(SELECT c.market FROM candidates c WHERE c.id = e.candidate_id)",
+        ),
+    ]
+    for table, alias, market_sub in updates:
+        if not _table_exists(conn, table):
+            continue
+        cols = _table_columns(conn, table)
+        if "gross_return_pct" not in cols or "return_pct" not in cols:
+            continue
+        cost_case = _trade_cost_case_sql(market_sub)
+        conn.execute(
+            f"""
+            UPDATE {table} AS {alias}
+            SET gross_return_pct = {alias}.return_pct,
+                cost_pct = {cost_case},
+                net_return_pct = {alias}.return_pct - {cost_case},
+                net_win = CASE
+                    WHEN {alias}.return_pct - {cost_case} > 0 THEN 1
+                    ELSE 0
+                END
+            WHERE {alias}.gross_return_pct = 0 AND {alias}.return_pct != 0
+            """
+        )
+    conn.commit()
+
+
+def _backfill_adjusted_prices(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "price_bars"):
+        return
+    cols = _table_columns(conn, "price_bars")
+    required = {"adj_open", "adj_close", "adj_high", "adj_low", "adj_factor", "adjustment_status"}
+    if not required.issubset(cols):
+        return
+    conn.execute(
+        """
+        UPDATE price_bars
+        SET adj_open = COALESCE(adj_open, open),
+            adj_close = COALESCE(adj_close, close),
+            adj_high = COALESCE(adj_high, high),
+            adj_low = COALESCE(adj_low, low),
+            adj_factor = COALESCE(adj_factor, 1.0),
+            adjustment_status = CASE
+                WHEN adjustment_status IS NULL OR adjustment_status = 'UNKNOWN'
+                THEN 'RAW_FALLBACK'
+                ELSE adjustment_status
+            END
+        WHERE adj_close IS NULL
+           OR adj_open IS NULL
+           OR adj_high IS NULL
+           OR adj_low IS NULL
+           OR adj_factor IS NULL
+           OR adjustment_status IS NULL
+           OR adjustment_status = 'UNKNOWN'
+        """
+    )
+    conn.commit()
+
+
 def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, "financial_metrics") or not _table_exists(conn, "candidate_evaluations"):
         return
 
+    if not _table_exists(conn, "intraday_bars"):
+        conn.execute(
+            """
+            CREATE TABLE intraday_bars (
+                market TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                datetime TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                open REAL NOT NULL,
+                close REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                volume REAL NOT NULL,
+                amount REAL,
+                PRIMARY KEY(market, ticker, datetime)
+            )
+            """
+        )
+
+    if _table_exists(conn, "price_bars"):
+        for column, definition in (
+            ("adj_open", "REAL"),
+            ("adj_close", "REAL"),
+            ("adj_high", "REAL"),
+            ("adj_low", "REAL"),
+            ("adj_factor", "REAL"),
+            ("adjustment_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+        ):
+            _add_column_if_missing(conn, "price_bars", column, definition)
+
     strategy_columns = _table_columns(conn, "strategies") if _table_exists(conn, "strategies") else set()
     if "target_horizon_days" not in strategy_columns:
         _add_column_if_missing(conn, "strategies", "target_horizon_days", "INTEGER NOT NULL DEFAULT 10")
+    if "version" not in strategy_columns:
+        _add_column_if_missing(conn, "strategies", "version", "TEXT NOT NULL DEFAULT 'v1'")
 
     financial_columns = _table_columns(conn, "financial_metrics")
     if "published_date" not in financial_columns:
@@ -379,6 +545,14 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     ):
         _add_column_if_missing(conn, "evaluations", column, definition)
 
+    for column, definition in (
+        ("gross_return_pct", "REAL NOT NULL DEFAULT 0"),
+        ("cost_pct", "REAL NOT NULL DEFAULT 0"),
+        ("net_return_pct", "REAL NOT NULL DEFAULT 0"),
+        ("net_win", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        _add_column_if_missing(conn, "evaluations", column, definition)
+
     _add_column_if_missing(conn, "candidate_evaluations", "execution_date", "TEXT")
     _add_column_if_missing(conn, "candidate_evaluations", "execution_price", "REAL")
     _add_column_if_missing(
@@ -395,6 +569,17 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     ):
         _add_column_if_missing(conn, "candidate_evaluations", column, definition)
 
+    for column, definition in (
+        ("gross_return_pct", "REAL NOT NULL DEFAULT 0"),
+        ("cost_pct", "REAL NOT NULL DEFAULT 0"),
+        ("net_return_pct", "REAL NOT NULL DEFAULT 0"),
+        ("net_win", "INTEGER NOT NULL DEFAULT 0"),
+        ("benchmark_ticker", "TEXT"),
+        ("benchmark_return_pct", "REAL"),
+        ("excess_return_pct", "REAL"),
+    ):
+        _add_column_if_missing(conn, "candidate_evaluations", column, definition)
+
     if _table_exists(conn, "candidate_horizon_evaluations"):
         for column, definition in (
             ("exit_type", "TEXT NOT NULL DEFAULT 'HOLD'"),
@@ -403,6 +588,26 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             ("exit_note", "TEXT NOT NULL DEFAULT ''"),
         ):
             _add_column_if_missing(conn, "candidate_horizon_evaluations", column, definition)
+        for column, definition in (
+            ("gross_return_pct", "REAL NOT NULL DEFAULT 0"),
+            ("cost_pct", "REAL NOT NULL DEFAULT 0"),
+            ("net_return_pct", "REAL NOT NULL DEFAULT 0"),
+            ("net_win", "INTEGER NOT NULL DEFAULT 0"),
+            ("benchmark_ticker", "TEXT"),
+            ("benchmark_return_pct", "REAL"),
+            ("excess_return_pct", "REAL"),
+        ):
+            _add_column_if_missing(conn, "candidate_horizon_evaluations", column, definition)
+
+    if _table_exists(conn, "candidates"):
+        _add_column_if_missing(conn, "candidates", "reward_risk_ratio", "REAL")
+        _add_column_if_missing(conn, "candidates", "confirmation_status", "TEXT NOT NULL DEFAULT 'PENDING'")
+        _add_column_if_missing(conn, "candidates", "confirmation_date", "TEXT")
+        _add_column_if_missing(conn, "candidates", "confirmation_reason", "TEXT")
+        _add_column_if_missing(conn, "candidates", "data_date", "TEXT")
+
+    _backfill_adjusted_prices(conn)
+    _backfill_net_returns(conn)
 
 
 def dump_json(value: Any) -> str:
@@ -422,6 +627,18 @@ def upsert_many(
     rows = list(rows)
     if not rows:
         return 0
+    if table == "price_bars":
+        for row in rows:
+            close = float(row["close"]) if row.get("close") not in (None, 0) else 0.0
+            row.setdefault("adj_open", row.get("open"))
+            row.setdefault("adj_close", row.get("close"))
+            row.setdefault("adj_high", row.get("high"))
+            row.setdefault("adj_low", row.get("low"))
+            row.setdefault(
+                "adj_factor",
+                float(row["adj_close"]) / close if close and row.get("adj_close") is not None else 1.0,
+            )
+            row.setdefault("adjustment_status", "RAW_FALLBACK")
 
     columns = list(rows[0].keys())
     placeholders = ", ".join(["?"] * len(columns))

@@ -7,20 +7,29 @@ from pathlib import Path
 from .audit import audit_all, latest_audits
 from .db import DEFAULT_DB_PATH, connect, init_db, upsert_many
 from .event_data import fetch_events_to_db, import_events_csv
-from .ledger import add_signal, verify_signals
-from .market_data import DEFAULT_UNIVERSE_PATH, fetch_bars, parse_date, read_db_instruments, read_universe
+from .ledger import verify_signals
+from .market_data import (
+    CN_A_BENCHMARK_INSTRUMENTS,
+    DEFAULT_UNIVERSE_PATH,
+    fetch_bars,
+    fetch_intraday_bars,
+    parse_date,
+    read_db_instruments,
+    read_universe,
+)
 from .metrics import (
     apply_strategy_weight_adjustments,
-    evaluate_all,
     evaluate_candidate_horizons_for_date,
     evaluate_candidates,
-    strategy_leaderboard,
+    score_calibration,
     suggest_strategy_weight_adjustments,
 )
+from .portfolio_backtest import run_portfolio_backtest, write_portfolio_report
 from .replay import replay_candidates
-from .reporting import write_daily_plan, write_report, write_replay_report
-from .screener import latest_candidates, screen_all
+from .reporting import write_daily_plan, write_replay_report
+from .screener import confirm_candidates, latest_candidates, screen_all
 from .seed import seed_all
+from .walk_forward import run_walk_forward, write_walk_forward_report
 
 
 def _fmt_float(value: object, digits: int = 2) -> str:
@@ -38,11 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init", help="Create database schema")
     subparsers.add_parser("seed", help="Seed strategies and Xingye case")
 
-    bootstrap = subparsers.add_parser("bootstrap", help="Init, seed, evaluate, and report")
+    bootstrap = subparsers.add_parser("bootstrap", help="Init, seed, screen, audit, and daily plan")
     bootstrap.add_argument("--as-of", required=True, help="Evaluation/report date, e.g. 2026-05-25")
-
-    evaluate = subparsers.add_parser("evaluate", help="Evaluate all signals")
-    evaluate.add_argument("--as-of", required=True, help="Evaluation date")
 
     fetch_prices = subparsers.add_parser("fetch-prices", help="Fetch OHLCV bars into price_bars")
     fetch_prices.add_argument("--start", required=True, help="Start date, e.g. 2026-05-01")
@@ -67,6 +73,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated tickers/source symbols to fetch, e.g. NVDA,0700.HK,002674.SZ",
     )
     fetch_prices.add_argument(
+        "--throttle",
+        type=float,
+        default=0.15,
+        help="Seconds to sleep between remote requests",
+    )
+    fetch_prices.add_argument(
+        "--include-benchmarks",
+        action="store_true",
+        help="Include built-in market benchmarks such as CN_A:000300.SS",
+    )
+    fetch_prices.add_argument(
+        "--adjust",
+        choices=("qfq", "none"),
+        default="qfq",
+        help="Daily adjustment mode for A-share return prices; raw OHLC is still stored for execution",
+    )
+
+    fetch_intraday = subparsers.add_parser("fetch-intraday", help="Fetch A-share minute bars into intraday_bars")
+    fetch_intraday.add_argument("--start", required=True, help="Start date, e.g. 2026-05-18")
+    fetch_intraday.add_argument("--end", required=True, help="End date, e.g. 2026-05-25")
+    fetch_intraday.add_argument(
+        "--source",
+        choices=["universe", "db", "both"],
+        default="db",
+        help="Read instruments from universe CSV, database instruments, or both",
+    )
+    fetch_intraday.add_argument(
+        "--universe",
+        default=str(DEFAULT_UNIVERSE_PATH),
+        help="Universe CSV path",
+    )
+    fetch_intraday.add_argument(
+        "--symbols",
+        help="Comma-separated A-share tickers/source symbols to fetch, e.g. 002975.SZ,sz002975",
+    )
+    fetch_intraday.add_argument("--period", choices=["1", "5", "15", "30", "60"], default="5")
+    fetch_intraday.add_argument(
         "--throttle",
         type=float,
         default=0.15,
@@ -112,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--end", required=True, help="Replay end date")
     replay.add_argument("--through", required=True, help="Evaluate every candidate through this date")
     replay.add_argument("--out", help="Output markdown path")
+    replay.add_argument(
+        "--fetch-cn-a-intraday",
+        action="store_true",
+        help="Fetch 5-minute A-share bars for replay candidates before evaluation",
+    )
+    replay.add_argument("--intraday-period", choices=["1", "5", "15", "30", "60"], default="5")
+    replay.add_argument("--intraday-throttle", type=float, default=0.15)
+    replay.add_argument("--require-adjusted", action="store_true", help="Exclude CN_A evaluations without adjusted prices")
+    replay.add_argument("--benchmark", default="000300.SS", help="Benchmark ticker for CN_A alpha calculations")
 
     tune_weights = subparsers.add_parser("tune-weights", help="Suggest or apply strategy weight changes from replay")
     tune_weights.add_argument("--start", required=True, help="Replay start date")
@@ -123,38 +175,45 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit", help="Audit strategy health and decay risk")
     audit.add_argument("--as-of", required=True, help="Audit date")
 
-    report = subparsers.add_parser("report", help="Generate markdown report")
-    report.add_argument("--as-of", required=True, help="Report date")
-    report.add_argument("--through", help="Evaluate candidates through this date before writing report")
-    report.add_argument("--out", help="Output markdown path")
-
     daily_plan = subparsers.add_parser("daily-plan", help="Generate daily actionable candidate plan")
     daily_plan.add_argument("--as-of", required=True, help="Candidate date")
     daily_plan.add_argument("--out", help="Output markdown path")
 
-    subparsers.add_parser("signals", help="List signals")
     candidates = subparsers.add_parser("candidates", help="List candidates for a date")
     candidates.add_argument("--as-of", required=True, help="Candidate date")
-    subparsers.add_parser("leaderboard", help="Show strategy leaderboard")
-    subparsers.add_parser("verify", help="Verify immutable signal hashes")
+    subparsers.add_parser("verify", help="Verify optional manual signal hashes")
 
-    add = subparsers.add_parser("add-signal", help="Add a manually researched signal")
-    add.add_argument("--date", required=True)
-    add.add_argument("--ticker", required=True)
-    add.add_argument("--name", required=True)
-    add.add_argument("--market", required=True)
-    add.add_argument("--strategy-id", required=True)
-    add.add_argument("--entry-price", type=float, required=True)
-    add.add_argument("--buy-zone-low", type=float)
-    add.add_argument("--buy-zone-high", type=float)
-    add.add_argument("--stop-loss", type=float)
-    add.add_argument("--target-1", type=float)
-    add.add_argument("--target-2", type=float)
-    add.add_argument("--horizon-days", type=int, default=20)
-    add.add_argument("--confidence", default="B")
-    add.add_argument("--thesis", required=True)
-    add.add_argument("--trigger-condition", required=True)
-    add.add_argument("--risk-notes", required=True)
+    confirm = subparsers.add_parser("confirm-candidates", help="Confirm or cancel WATCH_CONFIRMATION candidates")
+    confirm.add_argument("--as-of", required=True, help="Confirmation date")
+
+    calibrate = subparsers.add_parser("score-calibration", help="Validate score predictive power")
+    calibrate.add_argument("--start", required=True)
+    calibrate.add_argument("--end", required=True)
+    calibrate.add_argument("--through", required=True)
+    calibrate.add_argument("--horizon", type=int, default=10)
+
+    portfolio = subparsers.add_parser("portfolio-backtest", help="Portfolio-level backtest")
+    portfolio.add_argument("--start", required=True)
+    portfolio.add_argument("--end", required=True)
+    portfolio.add_argument("--through", required=True)
+    portfolio.add_argument("--max-positions", type=int, default=5)
+    portfolio.add_argument("--capital", type=float, default=1_000_000)
+    portfolio.add_argument(
+        "--cost-bps",
+        type=int,
+        default=None,
+        help="Optional custom round-trip trading cost in basis points; default uses market-specific costs",
+    )
+    portfolio.add_argument("--cooldown-days", type=int, default=10)
+    portfolio.add_argument("--execution", choices=("intraday", "daily"), default="intraday")
+    portfolio.add_argument("--benchmark", default="000300.SS", help="Benchmark ticker for CN_A alpha calculations")
+    portfolio.add_argument("--require-intraday", action="store_true", help="Exclude orders that lack intraday VWAP entry data")
+    portfolio.add_argument("--out", help="Output markdown path")
+
+    walk_forward = subparsers.add_parser("walk-forward", help="Walk-forward sanity check and readiness report")
+    walk_forward.add_argument("--start", required=True)
+    walk_forward.add_argument("--end", required=True)
+    walk_forward.add_argument("--out", help="Output markdown path")
 
     return parser
 
@@ -173,8 +232,7 @@ def command_seed(db_path: str) -> None:
         "Seeded "
         f"{counts['strategies']} strategies, "
         f"{counts['price_bars']} price bars, "
-        f"{counts['research_events']} research events, "
-        f"Xingye signal #{counts['xingye_signal_id']}."
+        f"{counts['research_events']} research events."
     )
 
 
@@ -183,26 +241,17 @@ def command_bootstrap(db_path: str, as_of: str) -> None:
         init_db(conn)
         counts = seed_all(conn)
         candidate_count = screen_all(conn, as_of)
-        eval_count = evaluate_all(conn, as_of)
         audit_count = audit_all(conn, as_of)
-        report_path = write_report(conn, as_of)
+        report_path = write_daily_plan(conn, as_of)
     print(
         "Bootstrap complete: "
         f"{counts['strategies']} strategies, "
         f"{counts['price_bars']} price bars, "
         f"{counts['research_events']} research events, "
         f"{candidate_count} candidates, "
-        f"{eval_count} evaluations, "
         f"{audit_count} strategy audits, "
-        f"report={report_path}"
+        f"daily_plan={report_path}"
     )
-
-
-def command_evaluate(db_path: str, as_of: str) -> None:
-    with closing(connect(db_path)) as conn:
-        init_db(conn)
-        count = evaluate_all(conn, as_of)
-    print(f"Evaluated {count} signal horizons as of {as_of}.")
 
 
 def _split_csv(value: str | None) -> set[str] | None:
@@ -220,6 +269,8 @@ def command_fetch_prices(
     markets: str | None,
     symbols: str | None,
     throttle: float,
+    include_benchmarks: bool,
+    adjust: str,
 ) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
@@ -230,6 +281,12 @@ def command_fetch_prices(
             instruments.extend(read_universe(Path(universe_path), markets=market_filter, symbols=symbol_filter))
         if source in {"db", "both"}:
             instruments.extend(read_db_instruments(conn, markets=market_filter, symbols=symbol_filter))
+        should_include_cn_a_benchmark = (
+            (include_benchmarks or symbol_filter is None)
+            and (market_filter is None or "CN_A" in market_filter)
+        )
+        if should_include_cn_a_benchmark:
+            instruments.extend(CN_A_BENCHMARK_INSTRUMENTS)
         instruments = list({(item.market, item.ticker): item for item in instruments}.values())
         if not instruments:
             print("No active instruments matched the requested filters.")
@@ -240,6 +297,7 @@ def command_fetch_prices(
             start=parse_date(start),
             end=parse_date(end),
             throttle_seconds=throttle,
+            adjust=None if adjust == "none" else adjust,
         )
         upserted = upsert_many(conn, "price_bars", bars, ("market", "ticker", "date"))
     print(
@@ -248,6 +306,48 @@ def command_fetch_prices(
     )
     if errors:
         print("Fetch errors:")
+        for error in errors:
+            print(f"- {error}")
+
+
+def command_fetch_intraday(
+    db_path: str,
+    universe_path: str,
+    start: str,
+    end: str,
+    source: str,
+    symbols: str | None,
+    period: str,
+    throttle: float,
+) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        symbol_filter = _split_csv(symbols)
+        market_filter = {"CN_A"}
+        instruments = []
+        if source in {"universe", "both"}:
+            instruments.extend(read_universe(Path(universe_path), markets=market_filter, symbols=symbol_filter))
+        if source in {"db", "both"}:
+            instruments.extend(read_db_instruments(conn, markets=market_filter, symbols=symbol_filter))
+        instruments = list({(item.market, item.ticker): item for item in instruments}.values())
+        if not instruments:
+            print("No active CN_A instruments matched the requested filters.")
+            return
+        upsert_many(conn, "instruments", [instrument.as_row() for instrument in instruments], ("market", "ticker"))
+        bars, errors = fetch_intraday_bars(
+            instruments,
+            start=parse_date(start),
+            end=parse_date(end),
+            period=period,
+            throttle_seconds=throttle,
+        )
+        upserted = upsert_many(conn, "intraday_bars", bars, ("market", "ticker", "datetime"))
+    print(
+        f"Fetched {upserted} intraday bars for {len(instruments)} CN_A instruments "
+        f"from {start} to {end}, period={period}m."
+    )
+    if errors:
+        print("Intraday fetch errors:")
         for error in errors:
             print(f"- {error}")
 
@@ -323,15 +423,37 @@ def command_evaluate_candidates(db_path: str, candidate_date: str, through: str)
     )
 
 
-def command_replay(db_path: str, start: str, end: str, through: str, out: str | None) -> None:
+def command_replay(
+    db_path: str,
+    start: str,
+    end: str,
+    through: str,
+    out: str | None,
+    fetch_cn_a_intraday: bool,
+    intraday_period: str,
+    intraday_throttle: float,
+    require_adjusted: bool,
+    benchmark: str | None,
+) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
-        result = replay_candidates(conn, start, end, through)
+        result = replay_candidates(
+            conn,
+            start,
+            end,
+            through,
+            fetch_cn_a_intraday=fetch_cn_a_intraday,
+            intraday_period=intraday_period,
+            intraday_throttle_seconds=intraday_throttle,
+            require_adjusted=require_adjusted,
+            benchmark_ticker=benchmark,
+        )
         path = write_replay_report(conn, start, end, through, Path(out) if out else None)
     print(
         "Replay complete: "
         f"dates={result.dates}, candidates={result.candidates}, "
-        f"evaluations={result.evaluations}, horizon_evaluations={result.horizon_evaluations}, report={path}"
+        f"evaluations={result.evaluations}, horizon_evaluations={result.horizon_evaluations}, "
+        f"intraday_bars={result.intraday_bars}, intraday_errors={result.intraday_errors}, report={path}"
     )
 
 
@@ -391,43 +513,11 @@ def command_audit(db_path: str, as_of: str) -> None:
         )
 
 
-def command_report(db_path: str, as_of: str, through: str | None, out: str | None) -> None:
-    with closing(connect(db_path)) as conn:
-        init_db(conn)
-        if through:
-            evaluate_candidates(conn, as_of, through)
-            evaluate_candidate_horizons_for_date(conn, as_of, through)
-        path = write_report(conn, as_of, Path(out) if out else None)
-    print(f"Wrote report: {path}")
-
-
 def command_daily_plan(db_path: str, as_of: str, out: str | None) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
         path = write_daily_plan(conn, as_of, Path(out) if out else None)
     print(f"Wrote daily plan: {path}")
-
-
-def command_signals(db_path: str) -> None:
-    with closing(connect(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT s.id, s.signal_date, s.ticker, s.name, s.market, st.name AS strategy_name,
-                   s.entry_price, s.confidence, s.status
-            FROM signals s
-            JOIN strategies st ON st.id = s.strategy_id
-            ORDER BY s.signal_date DESC, s.id
-            """
-        ).fetchall()
-    if not rows:
-        print("No signals.")
-        return
-    for row in rows:
-        print(
-            f"#{row['id']} {row['signal_date']} {row['name']} {row['ticker']} "
-            f"{row['market']} strategy={row['strategy_name']} "
-            f"entry={row['entry_price']:.2f} confidence={row['confidence']} status={row['status']}"
-        )
 
 
 def command_candidates(db_path: str, as_of: str) -> None:
@@ -442,22 +532,6 @@ def command_candidates(db_path: str, as_of: str) -> None:
             f"{row['market']} strategy={row['strategy_name']} score={_fmt_float(row['candidate_score'], 1)} "
             f"entry={_fmt_float(row['entry_price'])} stop={_fmt_float(row['stop_loss'])} "
             f"target1={_fmt_float(row['target_1'])} action={row['action']}"
-        )
-
-
-def command_leaderboard(db_path: str) -> None:
-    with closing(connect(db_path)) as conn:
-        rows = strategy_leaderboard(conn)
-    if not rows:
-        print("No leaderboard data.")
-        return
-    for row in rows:
-        avg_5d = "-" if row["avg_return_5d"] is None else f"{row['avg_return_5d']:.2f}%"
-        avg_10d = "-" if row["avg_return_10d"] is None else f"{row['avg_return_10d']:.2f}%"
-        print(
-            f"{row['strategy_name']} ({row['strategy_id']}): "
-            f"samples={row['signal_count']} weight={row['weight']:.2f} "
-            f"T+5={avg_5d} T+10={avg_10d}"
         )
 
 
@@ -476,33 +550,81 @@ def command_verify(db_path: str) -> None:
     raise SystemExit(1)
 
 
-def command_add_signal(db_path: str, args: argparse.Namespace) -> None:
+def command_confirm_candidates(db_path: str, as_of: str) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
-        signal_id = add_signal(
-            conn,
-            {
-            "signal_date": args.date,
-            "ticker": args.ticker,
-            "name": args.name,
-            "market": args.market,
-            "strategy_id": args.strategy_id,
-            "entry_type": "BUY_CANDIDATE",
-            "entry_price": args.entry_price,
-            "buy_zone_low": args.buy_zone_low,
-            "buy_zone_high": args.buy_zone_high,
-            "stop_loss": args.stop_loss,
-            "target_1": args.target_1,
-            "target_2": args.target_2,
-            "horizon_days": args.horizon_days,
-            "confidence": args.confidence,
-            "thesis": args.thesis,
-            "trigger_condition": args.trigger_condition,
-            "risk_notes": args.risk_notes,
-            "evidence_json": [],
-            },
+        confirmed, cancelled = confirm_candidates(conn, as_of)
+    print(f"Confirmed {confirmed}, cancelled {cancelled} candidates as of {as_of}.")
+
+
+def command_score_calibration(db_path: str, start: str, end: str, through: str, horizon: int) -> None:
+    with closing(connect(db_path)) as conn:
+        rows = score_calibration(conn, start, end, through, horizon)
+    if not rows:
+        print("No calibration data.")
+        return
+    print(f"Score calibration (T+{horizon}, {start} to {end}, through {through}):")
+    print(f"{'Bucket':>10} {'Samples':>8} {'NetRet':>8} {'Bench':>8} {'Excess':>8} {'ExWR':>8} {'StopR':>8} {'TargetR':>8} {'Worst':>8}")
+    for row in rows:
+        nr = f"{float(row['avg_net_return']):.2f}%" if row['avg_net_return'] is not None else "-"
+        br = f"{float(row['avg_benchmark_return']):.2f}%" if row['avg_benchmark_return'] is not None else "-"
+        er = f"{float(row['avg_excess_return']):.2f}%" if row['avg_excess_return'] is not None else "-"
+        ewr = f"{float(row['excess_win_rate'])*100:.1f}%" if row['excess_win_rate'] is not None else "-"
+        sr = f"{float(row['stop_rate'])*100:.1f}%" if row['stop_rate'] is not None else "-"
+        tr = f"{float(row['target_rate'])*100:.1f}%" if row['target_rate'] is not None else "-"
+        wr = f"{float(row['worst_return']):.2f}%" if row['worst_return'] is not None else "-"
+        print(f"{row['score_bucket']:>10} {row['sample_count']:>8} {nr:>8} {br:>8} {er:>8} {ewr:>8} {sr:>8} {tr:>8} {wr:>8}")
+    high_bucket = rows[0] if rows else None
+    low_bucket = rows[-1] if rows else None
+    if high_bucket and low_bucket:
+        hr = (
+            high_bucket.get("avg_excess_return")
+            if high_bucket.get("avg_excess_return") is not None
+            else high_bucket.get("avg_net_return")
         )
-    print(f"Added signal #{signal_id}: {args.name} {args.ticker}")
+        lr = (
+            low_bucket.get("avg_excess_return")
+            if low_bucket.get("avg_excess_return") is not None
+            else low_bucket.get("avg_net_return")
+        )
+        if hr is not None and lr is not None and float(hr) <= float(lr):
+            print("\nWARNING: 高分桶超额收益不优于低分桶，当前打分体系可能无效或未校准。")
+
+
+def command_walk_forward(db_path: str, start: str, end: str, out: str | None) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = run_walk_forward(conn, start, end)
+        path = write_walk_forward_report(result, Path(out) if out else None)
+    print(
+        f"Walk-forward: status={result.status}, trading_days={result.trading_days}, "
+        f"candidates={result.formal_candidates}, trades={result.portfolio_trades}, report={path}"
+    )
+
+
+def command_portfolio_backtest(
+    db_path: str, start: str, end: str, through: str,
+    max_positions: int, capital: float, cost_bps: int | None, cooldown_days: int,
+    execution: str, benchmark: str | None, require_intraday: bool, out: str | None,
+) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = run_portfolio_backtest(
+            conn, start, end, through,
+            max_positions=max_positions,
+            initial_capital=capital,
+            cost_bps=cost_bps,
+            cooldown_days=cooldown_days,
+            execution_mode=execution,
+            benchmark_ticker=benchmark,
+            require_intraday=require_intraday,
+        )
+        path = write_portfolio_report(result, Path(out) if out else None)
+    print(
+        f"Portfolio backtest: capital={result.initial_capital:.0f} → {result.final_capital:.0f} "
+        f"({result.total_return_pct:.2f}%), trades={result.trade_count}, "
+        f"win_rate={result.win_rate:.1f}%, max_dd={result.max_drawdown_pct:.2f}%, report={path}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -515,8 +637,6 @@ def main(argv: list[str] | None = None) -> int:
         command_seed(args.db)
     elif args.command == "bootstrap":
         command_bootstrap(args.db, args.as_of)
-    elif args.command == "evaluate":
-        command_evaluate(args.db, args.as_of)
     elif args.command == "fetch-prices":
         command_fetch_prices(
             args.db,
@@ -526,6 +646,19 @@ def main(argv: list[str] | None = None) -> int:
             args.source,
             args.markets,
             args.symbols,
+            args.throttle,
+            args.include_benchmarks,
+            args.adjust,
+        )
+    elif args.command == "fetch-intraday":
+        command_fetch_intraday(
+            args.db,
+            args.universe,
+            args.start,
+            args.end,
+            args.source,
+            args.symbols,
+            args.period,
             args.throttle,
         )
     elif args.command == "fetch-events":
@@ -545,25 +678,40 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "evaluate-candidates":
         command_evaluate_candidates(args.db, args.candidate_date, args.through)
     elif args.command == "replay":
-        command_replay(args.db, args.start, args.end, args.through, args.out)
+        command_replay(
+            args.db,
+            args.start,
+            args.end,
+            args.through,
+            args.out,
+            args.fetch_cn_a_intraday,
+            args.intraday_period,
+            args.intraday_throttle,
+            args.require_adjusted,
+            args.benchmark,
+        )
     elif args.command == "tune-weights":
         command_tune_weights(args.db, args.start, args.end, args.through, args.min_samples, args.apply)
     elif args.command == "audit":
         command_audit(args.db, args.as_of)
-    elif args.command == "report":
-        command_report(args.db, args.as_of, args.through, args.out)
     elif args.command == "daily-plan":
         command_daily_plan(args.db, args.as_of, args.out)
-    elif args.command == "signals":
-        command_signals(args.db)
     elif args.command == "candidates":
         command_candidates(args.db, args.as_of)
-    elif args.command == "leaderboard":
-        command_leaderboard(args.db)
     elif args.command == "verify":
         command_verify(args.db)
-    elif args.command == "add-signal":
-        command_add_signal(args.db, args)
+    elif args.command == "confirm-candidates":
+        command_confirm_candidates(args.db, args.as_of)
+    elif args.command == "score-calibration":
+        command_score_calibration(args.db, args.start, args.end, args.through, args.horizon)
+    elif args.command == "portfolio-backtest":
+        command_portfolio_backtest(
+            args.db, args.start, args.end, args.through,
+            args.max_positions, args.capital, args.cost_bps, args.cooldown_days,
+            args.execution, args.benchmark, args.require_intraday, args.out,
+        )
+    elif args.command == "walk-forward":
+        command_walk_forward(args.db, args.start, args.end, args.out)
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

@@ -7,13 +7,14 @@ from .ledger import now_utc
 
 CROWDING_RISK = {
     "trend_breakout": 0.72,
-    "post_earnings_momentum": 0.68,
-    "crowded_short_reversal": 0.62,
-    "hk_value_repair": 0.58,
-    "hk_internet_trend_recovery": 0.64,
     "abnormal_volume_small_midcap": 0.55,
-    "event_catalyst_reaction": 0.48,
     "xingye_style_prepositioning": 0.38,
+    "us_sec_event_momentum": 0.50,
+    "us_news_event_momentum": 0.58,
+    "hk_buyback_recovery": 0.48,
+    "hk_southbound_recovery": 0.55,
+    "hk_news_recovery": 0.58,
+    "a_share_hard_event_catalyst": 0.46,
 }
 
 
@@ -36,19 +37,38 @@ def _rate(values: list[bool]) -> float | None:
 def _strategy_evals(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) -> list[sqlite3.Row]:
     return conn.execute(
         """
+        WITH latest AS (
+            SELECT
+                e.candidate_id,
+                e.horizon_days,
+                MAX(e.through_date) AS through_date
+            FROM candidate_horizon_evaluations e
+            JOIN candidates c ON c.id = e.candidate_id
+            WHERE c.strategy_id = ?
+              AND c.as_of_date <= ?
+              AND e.through_date <= ?
+            GROUP BY e.candidate_id, e.horizon_days
+        )
         SELECT e.*
-        FROM evaluations e
-        JOIN signals s ON s.id = e.signal_id
-        WHERE s.strategy_id = ?
-          AND e.as_of_date = ?
+        FROM candidate_horizon_evaluations e
+        JOIN latest l
+          ON l.candidate_id = e.candidate_id
+         AND l.horizon_days = e.horizon_days
+         AND l.through_date = e.through_date
         """,
-        (strategy_id, as_of_date),
+        (strategy_id, as_of_date, as_of_date),
     ).fetchall()
 
 
 def audit_strategy(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) -> dict[str, object]:
-    signal_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM signals WHERE strategy_id = ?", (strategy_id,)
+    candidate_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM candidates
+        WHERE strategy_id = ?
+          AND as_of_date <= ?
+        """,
+        (strategy_id, as_of_date),
     ).fetchone()["count"]
     evals = _strategy_evals(conn, strategy_id, as_of_date)
 
@@ -59,8 +79,8 @@ def audit_strategy(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) 
         row for row in evals if row["horizon_days"] == 10 and row["observed_days"] >= row["horizon_days"]
     ]
 
-    returns_5d = [float(row["return_pct"]) for row in completed_5d]
-    returns_10d = [float(row["return_pct"]) for row in completed_10d]
+    returns_5d = [float(row["net_return_pct"]) for row in completed_5d]
+    returns_10d = [float(row["net_return_pct"]) for row in completed_10d]
     avg_return_5d = _avg(returns_5d)
     avg_return_10d = _avg(returns_10d)
     win_rate_5d = _rate([value > 0 for value in returns_5d])
@@ -86,9 +106,9 @@ def audit_strategy(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) 
     decay_risk_score = _clamp(crowding_risk_score * 0.55 + (1.0 - sample_quality_score) * 0.45)
     edge_score = _clamp((short_edge + 1.0) * 50.0 * (0.35 + sample_quality_score * 0.65) - decay_risk_score * 20.0, 0, 100)
 
-    if signal_count == 0:
+    if candidate_count == 0:
         health_status = "NO_LIVE_SAMPLE"
-        notes = "策略尚无入账预测，不能判断有效性。"
+        notes = "策略尚无机器筛选候选，不能判断有效性。"
     elif sample_quality_score < 0.2:
         health_status = "INSUFFICIENT_SAMPLE"
         notes = "样本过少，只能作为观察策略，不能提高权重。"
@@ -108,7 +128,7 @@ def audit_strategy(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) 
     return {
         "strategy_id": strategy_id,
         "as_of_date": as_of_date,
-        "signal_count": int(signal_count),
+        "signal_count": int(candidate_count),
         "completed_5d": len(completed_5d),
         "completed_10d": len(completed_10d),
         "avg_return_5d": avg_return_5d,
@@ -128,8 +148,18 @@ def audit_strategy(conn: sqlite3.Connection, strategy_id: str, as_of_date: str) 
 
 
 def audit_all(conn: sqlite3.Connection, as_of_date: str) -> int:
-    strategies = conn.execute("SELECT id FROM strategies WHERE status != 'RETIRED' ORDER BY id").fetchall()
+    strategies = conn.execute("SELECT id FROM strategies WHERE status = 'ACTIVE' ORDER BY id").fetchall()
     rows = [audit_strategy(conn, row["id"], as_of_date) for row in strategies]
+    conn.execute(
+        """
+        DELETE FROM strategy_audits
+        WHERE as_of_date = ?
+          AND strategy_id IN (
+              SELECT id FROM strategies WHERE status != 'ACTIVE'
+          )
+        """,
+        (as_of_date,),
+    )
     for row in rows:
         conn.execute(
             """
@@ -191,7 +221,7 @@ def latest_audits(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3.Row
         FROM strategy_audits a
         JOIN strategies s ON s.id = a.strategy_id
         WHERE a.as_of_date = ?
-          AND s.status != 'RETIRED'
+          AND s.status = 'ACTIVE'
         ORDER BY a.edge_score DESC, a.strategy_id
         """,
         (as_of_date,),

@@ -1,149 +1,126 @@
 # Alpha Ledger
 
-Alpha Ledger 是一个以盈利为目标的股票预测与策略进化账本。它不追求一开始就做成复杂平台，而是先把三件事做扎实：
+Alpha Ledger 是一个以盈利验证为中心的股票策略账本。它的主线不是手工写故事，也不是自动交易机器人，而是：
 
-1. 事前预测：每个候选股必须留下当时的买入逻辑、价格、触发条件、止损、目标和风险。
-2. 事中跟踪：每天更新是否触发买点、止损、止盈、突破或失效。
-3. 事后验证：用 T+5 / T+10 / T+20 / T+60 收益、回撤、胜率、盈亏比和超额收益淘汰策略。
+1. 用策略筛选器生成候选股。
+2. 把候选的当时数据、买点、止损、目标、理由和风险写入 `candidates`。
+3. 用后续真实行情回放，记录执行价、退出路径、净收益、胜率和止损率。
+4. 让策略按样本表现竞争，保留有效策略，收紧或淘汰无效策略。
 
-系统、平台和自动化都只是手段；最终目标是让能够赚钱的策略获得更高权重，让不能赚钱的逻辑尽快暴露。
+默认账本不再种入手工信号。兴业科技只保留为案例数据和策略灵感，真正入账必须由筛选器在当日条件下挖出来。
 
-## 当前 MVP
+## 当前主线
 
-v0.1 包含：
+当前正式研究范围是 A 股（`CN_A`）。美股和港股的数据接入与策略映射仍保留为实验能力，但默认不进入每日买入清单、正式回放收益结论、策略权重建议和组合回测。
 
-- SQLite 预测账本
-- 策略库与策略权重
-- 兴业科技 `002674.SZ` 案例数据
-- 兴业科技型重估埋伏启动策略
-- A 股公告、调研、财务、资金流接入
-- 历史候选回放与候选策略胜率报告
-- 固定持有周期候选验证：T+5 / T+10 / T+20 / T+60
-- 保守退出口径：止损和止盈同日触及时，若无日内顺序数据，按止损先发生处理
-- A 股候选目标价优先使用 ATR 波动目标，美股和港股保留策略默认目标
-- 策略目标周期字段，用于区分短线异动、事件催化和中期趋势策略
-- 事后评估与 Markdown 报告
-- 账本完整性校验
+- `candidates`：策略筛选出的候选池，是当前项目的主账本。
+- `candidate_evaluations`：截至某日的后验验证。
+- `candidate_horizon_evaluations`：固定 T+5 / T+10 / T+20 / T+60 周期验证。
+- `daily-plan`：当天可操作清单，只展示确认后更接近可交易的候选。
+- `replay`：历史日期逐日筛选并用未来行情验证。
+- `portfolio-backtest`：组合层面回测，控制仓位、持仓冷却和交易成本。
+- `walk-forward`：检查当前样本是否足够做正式滚动验证；样本不足时只输出 `INSUFFICIENT_HISTORY`。
 
-## 快速运行
+A 股回放优先使用 5 分钟线：
 
-```bash
-python -m alpha_ledger bootstrap --as-of 2026-05-25
-```
+- 入场：候选日后第一个交易日开盘前 5 根 K 线 VWAP。
+- 退出：有分时数据时按分时止损/止盈顺序；没有分时时回退日线。
+- T+1：A 股买入日不允许同日退出。
+- 成本：评估收益使用净收益，默认按市场统一成本扣除；A 股往返成本为 0.18%。
+- 复权：收益统计优先使用前复权价格；成交价仍保留原始价格用于执行展示。
+- 基准：A 股默认用沪深 300（`000300.SS`）计算基准收益和超额收益。
+- 约束：组合回测会跳过零成交/停牌样本和一字涨停无法买入样本。
 
-运行后会生成：
+## 常用流程
 
-- `data/alpha_ledger.sqlite`：本地预测账本
-- `reports/alpha_report_2026-05-25.md`：策略与信号报告
-
-也可以拆开执行：
+初始化和种入策略、兴业科技参考数据：
 
 ```bash
 python -m alpha_ledger init
 python -m alpha_ledger seed
-python -m alpha_ledger fetch-prices --start 2026-04-01 --end 2026-05-25 --markets US,HK,CN_A
+```
+
+拉取行情和事件：
+
+```bash
+python -m alpha_ledger fetch-prices \
+  --start 2026-04-01 \
+  --end 2026-05-25 \
+  --markets CN_A \
+  --include-benchmarks \
+  --adjust qfq
 python -m alpha_ledger fetch-events --start 2026-04-01 --end 2026-05-15 --markets CN_A --skip-money-flow
-python -m alpha_ledger screen --as-of 2026-05-13
-python -m alpha_ledger replay --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
-python -m alpha_ledger evaluate --as-of 2026-05-25
-python -m alpha_ledger audit --as-of 2026-05-25
-python -m alpha_ledger report --as-of 2026-05-25
-python -m alpha_ledger verify
 ```
 
-## 常用命令
-
-查看信号：
+生成某天候选和每日计划：
 
 ```bash
-python -m alpha_ledger signals
+python -m alpha_ledger screen --as-of 2026-05-15
+python -m alpha_ledger confirm-candidates --as-of 2026-05-18
+python -m alpha_ledger daily-plan --as-of 2026-05-15
 ```
 
-查看策略排行榜：
-
-```bash
-python -m alpha_ledger leaderboard
-```
-
-查看某天候选股：
-
-```bash
-python -m alpha_ledger candidates --as-of 2026-05-13
-```
-
-回放一段历史区间，并把每一天的候选用后续日期验证。`through` 是本次回放可看到的最后日期；报告会同时输出两类结果：
-
-- 固定周期验证：按候选日后第一个交易日开盘价执行，分别统计 T+5 / T+10 / T+20 / T+60，只有走满周期的样本才计入正式胜率。
-- 截止日复盘：统一观察到 `through`，用于阶段复盘和查看最大浮盈/回撤。
+历史回放并为 A 股候选补充分时数据：
 
 ```bash
 python -m alpha_ledger replay \
-  --start 2026-04-01 \
+  --start 2026-05-15 \
   --end 2026-05-15 \
-  --through 2026-05-25
+  --through 2026-05-25 \
+  --benchmark 000300.SS \
+  --fetch-cn-a-intraday
 ```
 
-接入默认美股、港股、A股样本池行情：
+验证评分、审计策略、组合回测：
 
 ```bash
-python -m alpha_ledger fetch-prices --start 2026-04-01 --end 2026-05-25 --markets US,HK,CN_A
-```
-
-审计策略是否样本不足、拥挤或可能失效：
-
-```bash
+python -m alpha_ledger score-calibration --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
 python -m alpha_ledger audit --as-of 2026-05-25
+python -m alpha_ledger portfolio-backtest --start 2026-04-01 --end 2026-05-15 --through 2026-05-25 --benchmark 000300.SS
+python -m alpha_ledger walk-forward --start 2026-04-01 --end 2026-05-25
 ```
 
-校验预测账本是否被改过：
+自检：
 
 ```bash
 python -m alpha_ledger verify
-```
-
-运行测试：
-
-```bash
 python -m unittest discover -s tests -v
 ```
 
-手动添加一条新预测：
+## 当前策略
 
-```bash
-python -m alpha_ledger add-signal \
-  --date 2026-05-25 \
-  --ticker EXAMPLE \
-  --name "示例股票" \
-  --market US \
-  --strategy-id trend_breakout \
-  --entry-price 100 \
-  --buy-zone-low 98 \
-  --buy-zone-high 102 \
-  --stop-loss 94 \
-  --target-1 110 \
-  --target-2 120 \
-  --horizon-days 20 \
-  --confidence B \
-  --thesis "放量突破平台，行业强度改善" \
-  --trigger-condition "收盘价站上前高且成交量大于20日均量1.5倍" \
-  --risk-notes "跌破平台则突破失败"
-```
+只保留已经有筛选器或事件映射器的策略：
 
-## 第一批策略
+正式 A 股策略：
 
 - `trend_breakout`：强趋势突破
-- `post_earnings_momentum`：财报后动量
-- `crowded_short_reversal`：空头拥挤反转
-- `hk_value_repair`：港股低估值修复
-- `hk_internet_trend_recovery`：港股互联网龙头趋势恢复
 - `abnormal_volume_small_midcap`：中小盘异常放量异动
-- `event_catalyst_reaction`：公告调研事件催化
+- `a_share_hard_event_catalyst`：A 股硬事件催化
 - `xingye_style_prepositioning`：兴业科技型重估埋伏启动
 
-兴业科技案例已经沉淀为一个统一策略：旧标签公司出现新增长叙事，事件后不立即高潮，而是在平台内吸筹整理并放量首阳启动。
+实验保留策略，不进入当前正式收益结论：
 
-## 重要原则
+- `us_sec_event_momentum`：美股 SEC 重大披露后动量
+- `us_news_event_momentum`：美股新闻评级事件动量
+- `hk_buyback_recovery`：港股回购修复
+- `hk_southbound_recovery`：港股南向资金修复
+- `hk_news_recovery`：港股业绩新闻修复
 
-Alpha Ledger 不是投资建议生成器，也不会保证任何单只股票盈利。它的价值在于把每次判断变成可验证样本，让真实收益决定策略权重。
+未实现筛选器的旧设想不进入默认策略库，避免“看起来有策略，实际上没产出”的污染。
 
-常见策略名不是 alpha。强趋势、财报动量、估值修复这类名字市场上人人都知道，所以系统默认把它们视为“待验证假设”，而不是可直接信任的赚钱机器。每个策略都必须经过样本外跟踪、拥挤风险审计和失效降权。
+## 数据和输出
+
+- `data/universe/default_universe.csv`：默认股票池。
+- `data/reference/xingye_002674_20260401_20260525.csv`：兴业科技案例行情参考。
+- `data/events/us_hk_events_template.csv`：美股/港股事件导入模板。
+- `data/alpha_ledger.sqlite`：本地运行账本，属于可再生成/可更新数据。
+- `reports/*.md`：报告输出物，不作为源文档维护。
+
+## 原则
+
+Alpha Ledger 不保证任何股票上涨。它的价值是把每次候选变成可复盘样本，并用净收益、回撤、止损率、目标命中率和评分校准结果逼迫策略进化。
+
+名字不是 alpha。只有在回放和样本外表现里持续赚钱的筛选逻辑，才值得提高权重。
+
+当前最重要的判断口径是组合层面的净收益、最大回撤、换手率、止损率和分数校准，而不是候选数量。
+在复权覆盖率和基准覆盖率不足时，报告会生成，但不能视为正式 alpha 结论。

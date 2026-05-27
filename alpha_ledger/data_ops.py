@@ -450,8 +450,10 @@ def audit_data_coverage(
     if latest_price_date is None or latest_price_date < end_date:
         notes.append("行情未覆盖到审计截止日。")
     if adjusted_pct < 95.0:
-        if ignore_adjustment_for_short_term:
-            notes.append(f"复权覆盖不足：{adjusted_pct:.1f}%，当前按未复权短线研究口径处理，置信度最高为 MEDIUM_CONFIDENCE。")
+        if ignore_adjustment_for_short_term and adjusted_pct >= 50.0:
+            notes.append(f"复权覆盖部分：{adjusted_pct:.1f}%，短期策略可用，中长期回测建议补全前复权。")
+        elif ignore_adjustment_for_short_term:
+            notes.append(f"复权覆盖不足：{adjusted_pct:.1f}%，当前按未复权短线研究口径处理。")
         else:
             notes.append(f"复权覆盖不足：{adjusted_pct:.1f}%。")
     if benchmark_pct < 95.0:
@@ -463,11 +465,13 @@ def audit_data_coverage(
         confidence = CONFIDENCE_RESEARCH
     elif adjusted_pct >= 95.0 and benchmark_pct >= 95.0 and intraday_symbol_count > 0:
         confidence = CONFIDENCE_HIGH
+    elif ignore_adjustment_for_short_term and adjusted_pct >= 50.0 and benchmark_pct >= 95.0 and intraday_symbol_count > 0:
+        confidence = CONFIDENCE_HIGH
     elif benchmark_pct >= 80.0 and (adjusted_pct >= 95.0 or ignore_adjustment_for_short_term):
         confidence = CONFIDENCE_MEDIUM
     else:
         confidence = CONFIDENCE_LOW
-    allow_formal_daily = confidence == CONFIDENCE_HIGH
+    allow_formal_daily = confidence == CONFIDENCE_HIGH and adjusted_pct >= 95.0
 
     result = DataAuditResult(
         market=market,

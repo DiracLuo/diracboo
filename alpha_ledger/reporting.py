@@ -217,6 +217,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append(f"- 最新完整行情仅到 `{latest_date}`，本报告不生成“今日可买”。")
     if confidence_level != CONFIDENCE_HIGH:
         lines.append("- 数据审计未达到 HIGH_CONFIDENCE，本报告不输出强买入结论。")
+    if confidence_level == CONFIDENCE_HIGH and audit.adjustment_coverage_pct < 95.0:
+        lines.append(f"- adjustment_note: 复权覆盖 {audit.adjustment_coverage_pct:.1f}%，短期策略可用，中长期回测建议补全前复权（`python scripts/backfill_qfq.py`）。")
+    elif confidence_level == CONFIDENCE_HIGH and audit.adjustment_coverage_pct >= 95.0:
+        lines.append(f"- adjustment_note: 全量复权数据（{audit.adjustment_coverage_pct:.1f}%），回测结论可靠。")
     for note in audit.notes:
         lines.append(f"- data_note: {note}")
     lines.append(f"- 正式交易范围：{FORMAL_MARKET_LABEL}。美股/港股暂为实验数据，不进入今日买入清单。")

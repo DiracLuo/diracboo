@@ -508,9 +508,10 @@ def command_daily_events(db_path: str, as_of: str, throttle: float) -> None:
         update = data_update(
             conn, as_of, "CN_A",
             throttle_seconds=throttle,
-            adjust="qfq",
+            adjust=None,
             fetch_events=True,
             fetch_intraday=True,
+            price_mode="none",
         )
         candidate_count = screen_all(conn, as_of)
         confirmed = confirm_candidates(conn, as_of)

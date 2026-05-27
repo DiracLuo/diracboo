@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,6 +11,26 @@ from .metrics import DEFAULT_TRADE_COST_PCT, MARKET_TRADE_COST_PCT
 
 
 DEFAULT_DB_PATH = Path("data/alpha_ledger.sqlite")
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+_VALID_TABLES: frozenset[str] = frozenset({
+    "instruments", "strategies", "signals", "price_bars", "intraday_bars",
+    "tracking_events", "evaluations", "research_events", "corporate_events",
+    "financial_metrics", "money_flows", "candidates", "candidate_evaluations",
+    "candidate_horizon_evaluations", "strategy_audits", "data_fetch_runs",
+    "data_fetch_errors", "data_coverage_daily", "data_source_health",
+})
+
+
+def _validate_identifier(name: str, label: str = "identifier") -> None:
+    if not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid {label}: {name!r}")
+
+
+def _validate_table_name(table: str) -> None:
+    if table not in _VALID_TABLES:
+        raise ValueError(f"Unknown table: {table!r}")
 
 
 SCHEMA_STATEMENTS = [
@@ -89,6 +110,7 @@ SCHEMA_STATEMENTS = [
         adj_low REAL,
         adj_factor REAL,
         adjustment_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+        adjustment_error TEXT,
         PRIMARY KEY(market, ticker, date)
     )
     """,
@@ -236,6 +258,9 @@ SCHEMA_STATEMENTS = [
         target_1 REAL,
         target_2 REAL,
         reward_risk_ratio REAL,
+        expected_value_score REAL,
+        trailing_stop_pct REAL,
+        trailing_activation_pct REAL,
         thesis TEXT NOT NULL,
         trigger_condition TEXT NOT NULL,
         risk_notes TEXT NOT NULL,
@@ -344,6 +369,68 @@ SCHEMA_STATEMENTS = [
         UNIQUE(strategy_id, as_of_date)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS data_fetch_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_type TEXT NOT NULL,
+        market TEXT NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        requested_symbols INTEGER NOT NULL DEFAULT 0,
+        price_bars INTEGER NOT NULL DEFAULT 0,
+        intraday_bars INTEGER NOT NULL DEFAULT 0,
+        corporate_events INTEGER NOT NULL DEFAULT 0,
+        financial_metrics INTEGER NOT NULL DEFAULT 0,
+        money_flows INTEGER NOT NULL DEFAULT 0,
+        error_count INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS data_fetch_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        market TEXT NOT NULL,
+        ticker TEXT,
+        source TEXT NOT NULL,
+        error_message TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES data_fetch_runs(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS data_coverage_daily (
+        market TEXT NOT NULL,
+        date TEXT NOT NULL,
+        instrument_count INTEGER NOT NULL DEFAULT 0,
+        price_bar_count INTEGER NOT NULL DEFAULT 0,
+        adjusted_bar_count INTEGER NOT NULL DEFAULT 0,
+        benchmark_count INTEGER NOT NULL DEFAULT 0,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        financial_count INTEGER NOT NULL DEFAULT 0,
+        intraday_symbol_count INTEGER NOT NULL DEFAULT 0,
+        confidence_level TEXT NOT NULL DEFAULT 'RESEARCH_ONLY',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(market, date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS data_source_health (
+        source TEXT NOT NULL,
+        market TEXT NOT NULL,
+        last_success_at TEXT,
+        last_failure_at TEXT,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        paused INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(source, market)
+    )
+    """,
 ]
 
 
@@ -366,6 +453,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    _validate_table_name(table)
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
@@ -378,6 +466,8 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    _validate_table_name(table)
+    _validate_identifier(column, "column name")
     if column in _table_columns(conn, table):
         return
     try:
@@ -490,6 +580,10 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, "financial_metrics") or not _table_exists(conn, "candidate_evaluations"):
         return
 
+    for statement in SCHEMA_STATEMENTS:
+        if "data_fetch_" in statement or "data_coverage_daily" in statement or "data_source_health" in statement:
+            conn.execute(statement)
+
     if not _table_exists(conn, "intraday_bars"):
         conn.execute(
             """
@@ -518,6 +612,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             ("adj_low", "REAL"),
             ("adj_factor", "REAL"),
             ("adjustment_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+            ("adjustment_error", "TEXT"),
         ):
             _add_column_if_missing(conn, "price_bars", column, definition)
 
@@ -601,6 +696,9 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
 
     if _table_exists(conn, "candidates"):
         _add_column_if_missing(conn, "candidates", "reward_risk_ratio", "REAL")
+        _add_column_if_missing(conn, "candidates", "expected_value_score", "REAL")
+        _add_column_if_missing(conn, "candidates", "trailing_stop_pct", "REAL")
+        _add_column_if_missing(conn, "candidates", "trailing_activation_pct", "REAL")
         _add_column_if_missing(conn, "candidates", "confirmation_status", "TEXT NOT NULL DEFAULT 'PENDING'")
         _add_column_if_missing(conn, "candidates", "confirmation_date", "TEXT")
         _add_column_if_missing(conn, "candidates", "confirmation_reason", "TEXT")
@@ -624,6 +722,7 @@ def upsert_many(
     rows: Iterable[dict[str, Any]],
     conflict_columns: tuple[str, ...],
 ) -> int:
+    _validate_table_name(table)
     rows = list(rows)
     if not rows:
         return 0
@@ -639,8 +738,13 @@ def upsert_many(
                 float(row["adj_close"]) / close if close and row.get("adj_close") is not None else 1.0,
             )
             row.setdefault("adjustment_status", "RAW_FALLBACK")
+            row.setdefault("adjustment_error", None)
 
     columns = list(rows[0].keys())
+    for col in columns:
+        _validate_identifier(col, "column name")
+    for col in conflict_columns:
+        _validate_identifier(col, "conflict column name")
     placeholders = ", ".join(["?"] * len(columns))
     column_sql = ", ".join(columns)
     conflict_sql = ", ".join(conflict_columns)

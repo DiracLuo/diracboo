@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import math
 import sqlite3
+
+from .benchmarks import benchmark_for_asset
+from .trading_rules import is_one_price_limit_down_from_values
 
 from .execution import intraday_exit_path, open_5min_vwap_entry
 from .ledger import now_utc
@@ -16,6 +20,12 @@ MARKET_TRADE_COST_PCT = {
     "HK": 0.15,
 }
 DEFAULT_TRADE_COST_PCT = 0.18
+MARKET_SLIPPAGE_BPS = {
+    "CN_A": 5,
+    "US": 3,
+    "HK": 5,
+}
+DEFAULT_SLIPPAGE_BPS = 5
 DEFAULT_BENCHMARKS = {
     "CN_A": "000300.SS",
 }
@@ -25,8 +35,43 @@ def trade_cost_pct(market: str) -> float:
     return MARKET_TRADE_COST_PCT.get(market, DEFAULT_TRADE_COST_PCT)
 
 
+def slippage_pct(market: str) -> float:
+    return MARKET_SLIPPAGE_BPS.get(market, DEFAULT_SLIPPAGE_BPS) / 100.0
+
+
+def compute_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.0, annualize_factor: float = 252.0) -> float:
+    if len(returns) < 2:
+        return 0.0
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    std = math.sqrt(variance) if variance > 0 else 0.0
+    if std == 0:
+        return 0.0
+    return (mean - risk_free_rate) / std * math.sqrt(annualize_factor)
+
+
+def compute_sortino_ratio(returns: list[float], risk_free_rate: float = 0.0, annualize_factor: float = 252.0) -> float:
+    if len(returns) < 2:
+        return 0.0
+    mean = sum(returns) / len(returns)
+    downside_returns = [r for r in returns if r < risk_free_rate]
+    if len(downside_returns) < 2:
+        return 0.0
+    downside_variance = sum((r - risk_free_rate) ** 2 for r in downside_returns) / (len(downside_returns) - 1)
+    downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0.0
+    if downside_std == 0:
+        return 0.0
+    return (mean - risk_free_rate) / downside_std * math.sqrt(annualize_factor)
+
+
 def benchmark_ticker_for_market(market: str, benchmark_ticker: str | None = None) -> str | None:
+    if benchmark_ticker == "auto":
+        return DEFAULT_BENCHMARKS.get(market)
     return benchmark_ticker or DEFAULT_BENCHMARKS.get(market)
+
+
+def benchmark_ticker_for_asset(market: str, ticker: str, benchmark_ticker: str | None = None) -> str | None:
+    return benchmark_for_asset(market, ticker, benchmark_ticker) or benchmark_ticker_for_market(market, benchmark_ticker)
 
 
 def pct_change(start: float, end: float) -> float:
@@ -176,6 +221,10 @@ def _long_trade_path(
     target_2: float | None,
     market: str = "",
     entry_return_price: float | None = None,
+    ticker: str = "",
+    name: str = "",
+    trailing_stop_pct: float | None = None,
+    trailing_activation_pct: float | None = None,
 ) -> dict[str, object]:
     stop = stop_loss
     first_target = target_1
@@ -186,12 +235,20 @@ def _long_trade_path(
     exit_price = float(bars[-1]["close"])
     exit_bar = bars[-1]
     exit_note = "未触发止损/目标，按观察窗口最后收盘价计。"
+    trailing_active = False
+    trailing_stop_price = 0.0
+    highest_since_entry = entry_price
 
     for bar in bars:
         observed_bars.append(bar)
         open_price = float(bar["open"])
         low = float(bar["low"])
         high = float(bar["high"])
+
+        if market == "CN_A" and len(observed_bars) >= 2:
+            prev_close = float(observed_bars[-2]["close"])
+            if is_one_price_limit_down_from_values(prev_close, open_price, high, low, ticker, name):
+                continue
 
         if stop is not None and open_price <= stop:
             exit_type = "STOP_LOSS"
@@ -246,6 +303,32 @@ def _long_trade_path(
             exit_bar = bar
             exit_note = "盘中触及目标2。"
             break
+
+        if trailing_stop_pct is not None and trailing_activation_pct is not None:
+            if high > highest_since_entry:
+                highest_since_entry = high
+            activation_price = entry_price * (1.0 + trailing_activation_pct / 100.0)
+            if not trailing_active and highest_since_entry >= activation_price:
+                trailing_active = True
+                trailing_stop_price = highest_since_entry * (1.0 - trailing_stop_pct / 100.0)
+            if trailing_active:
+                new_trailing = highest_since_entry * (1.0 - trailing_stop_pct / 100.0)
+                if new_trailing > trailing_stop_price:
+                    trailing_stop_price = new_trailing
+                if open_price <= trailing_stop_price:
+                    exit_type = "TRAILING_STOP"
+                    exit_date = bar["date"]
+                    exit_price = open_price
+                    exit_bar = bar
+                    exit_note = f"追踪止损触发：最高价 {highest_since_entry:.2f}，止损线 {trailing_stop_price:.2f}，开盘跌破。"
+                    break
+                if low <= trailing_stop_price:
+                    exit_type = "TRAILING_STOP"
+                    exit_date = bar["date"]
+                    exit_price = trailing_stop_price
+                    exit_bar = bar
+                    exit_note = f"追踪止损触发：最高价 {highest_since_entry:.2f}，止损线 {trailing_stop_price:.2f}，盘中触及。"
+                    break
 
     entry_return = entry_return_price if entry_return_price is not None else entry_price
     exit_return = adjusted_price_from_raw(exit_bar, exit_price)
@@ -419,10 +502,14 @@ def _evaluate_candidate_window(
             target_2,
             market,
             entry_return_price=entry_return_price,
+            ticker=ticker,
+            name=str(candidate["name"]),
         )
         path = _override_risk_with_observed_bars(path, execution_price, window, entry_return_price)
 
     benchmark_ticker_value = benchmark_ticker_for_market(market, benchmark_ticker)
+    if benchmark_ticker in (None, "auto"):
+        benchmark_ticker_value = benchmark_ticker_for_asset(market, ticker, benchmark_ticker)
     benchmark = benchmark_return_pct(
         conn,
         market,
@@ -813,6 +900,56 @@ def candidate_strategy_leaderboard(
     ).fetchall()
 
 
+def strategy_risk_adjusted_metrics(
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    through_date: str | None = None,
+    *,
+    markets: tuple[str, ...] = FORMAL_MARKETS,
+) -> dict[str, dict[str, float]]:
+    filters: list[str] = []
+    params: list[object] = []
+    if start_date is not None:
+        filters.append("c.as_of_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        filters.append("c.as_of_date <= ?")
+        params.append(end_date)
+    if markets:
+        filters.append(f"c.market IN ({', '.join('?' for _ in markets)})")
+        params.extend(markets)
+    if through_date is not None:
+        filters.append("e.through_date <= ?")
+        params.append(through_date)
+    where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+    rows = conn.execute(
+        f"""
+        SELECT c.strategy_id, e.net_return_pct
+        FROM candidates c
+        JOIN candidate_evaluations e ON e.candidate_id = c.id
+        JOIN strategies st ON st.id = c.strategy_id
+        {where_sql}
+        {"AND" if where_sql else "WHERE"} st.status != 'RETIRED'
+        ORDER BY c.strategy_id
+        """,
+        tuple(params),
+    ).fetchall()
+    by_strategy: dict[str, list[float]] = {}
+    for row in rows:
+        sid = str(row["strategy_id"])
+        ret = float(row["net_return_pct"])
+        by_strategy.setdefault(sid, []).append(ret)
+    result: dict[str, dict[str, float]] = {}
+    for sid, returns in by_strategy.items():
+        result[sid] = {
+            "sharpe_ratio": compute_sharpe_ratio(returns),
+            "sortino_ratio": compute_sortino_ratio(returns),
+            "sample_count": len(returns),
+        }
+    return result
+
+
 def candidate_horizon_strategy_leaderboard(
     conn: sqlite3.Connection,
     start_date: str | None = None,
@@ -1124,6 +1261,7 @@ def apply_strategy_weight_adjustments(
     *,
     min_samples: int = MIN_WEIGHT_SUGGESTION_SAMPLES,
     markets: tuple[str, ...] = FORMAL_MARKETS,
+    allow_upweight: bool = False,
 ) -> int:
     suggestions = suggest_strategy_weight_adjustments(
         conn,
@@ -1135,15 +1273,24 @@ def apply_strategy_weight_adjustments(
     )
     changed = 0
     for item in suggestions:
-        if item["recommendation"] != "DOWN_WEIGHT":
-            continue
-        if float(item["suggested_weight"]) == float(item["current_weight"]):
-            continue
-        conn.execute(
-            "UPDATE strategies SET weight = ? WHERE id = ?",
-            (item["suggested_weight"], item["strategy_id"]),
-        )
-        changed += 1
+        if item["recommendation"] == "DOWN_WEIGHT":
+            if float(item["suggested_weight"]) == float(item["current_weight"]):
+                continue
+            conn.execute(
+                "UPDATE strategies SET weight = ? WHERE id = ?",
+                (item["suggested_weight"], item["strategy_id"]),
+            )
+            changed += 1
+        elif allow_upweight and item["recommendation"] == "KEEP_OR_UP_WEIGHT":
+            if float(item["suggested_weight"]) == float(item["current_weight"]):
+                continue
+            if int(item["evaluated_count"]) < 10:
+                continue
+            conn.execute(
+                "UPDATE strategies SET weight = ? WHERE id = ?",
+                (item["suggested_weight"], item["strategy_id"]),
+            )
+            changed += 1
     conn.commit()
     return changed
 

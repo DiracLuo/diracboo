@@ -20,6 +20,8 @@ Alpha Ledger 是一个以盈利验证为中心的股票策略账本。它的主�
 - `replay`：历史日期逐日筛选并用未来行情验证。
 - `portfolio-backtest`：组合层面回测，控制仓位、持仓冷却和交易成本。
 - `walk-forward`：检查当前样本是否足够做正式滚动验证；样本不足时只输出 `INSUFFICIENT_HISTORY`。
+- `data-update` / `data-audit`：维护本地 A 股增量数据仓库，并审计数据是否足以支持正式结论。
+- `loss-review`：复盘亏损样本，把失败模式转成后续过滤器。
 
 A 股回放优先使用 5 分钟线：
 
@@ -29,7 +31,16 @@ A 股回放优先使用 5 分钟线：
 - 成本：评估收益使用净收益，默认按市场统一成本扣除；A 股往返成本为 0.18%。
 - 复权：收益统计优先使用前复权价格；成交价仍保留原始价格用于执行展示。
 - 基准：A 股默认用沪深 300（`000300.SS`）计算基准收益和超额收益。
-- 约束：组合回测会跳过零成交/停牌样本和一字涨停无法买入样本。
+- 分层基准：候选级评估支持按板块映射沪深300、中证500、中证1000、创业板指、科创50、北证50。
+- 约束：组合回测会跳过零成交/停牌样本和一字涨停无法买入样本；跌停无法退出时延期到下一可卖日。
+- 风控：支持 ATR 动态止损、盈亏比过滤、按市值盯市回撤和 `portfolio-backtest --sizing-mode risk-parity` 风险平价仓位。
+
+日报时间点：
+
+- `daily-plan --as-of` 表示数据截止日，不是自然日今天。
+- 若 `as_of` 晚于 `price_bars` 最新行情日，日报标记 `STALE_DATA`，不生成“今日可买”。
+- 若数据审计不是 `HIGH_CONFIDENCE`，日报只展示观察/确认候选，不输出强买入结论。
+- A 股审计优先用沪深300行情日作为交易日历，避免把春节、五一等休市日误判为缺口。
 
 ## 常用流程
 
@@ -50,6 +61,45 @@ python -m alpha_ledger fetch-prices \
   --include-benchmarks \
   --adjust qfq
 python -m alpha_ledger fetch-events --start 2026-04-01 --end 2026-05-15 --markets CN_A --skip-money-flow
+```
+
+每日增量数据仓库和审计：
+
+```bash
+python -m alpha_ledger data-update --as-of 2026-05-27 --markets CN_A --adjust none
+python -m alpha_ledger data-audit --start 2026-04-01 --end 2026-05-27 --markets CN_A
+python -m alpha_ledger daily-run --as-of 2026-05-27
+```
+
+修复已有历史库里的覆盖缺口时，显式使用 `--repair-coverage`。默认 `--repair-scope benchmarks` 只补分层基准，避免误触发全市场复权重拉：
+
+```bash
+python -m alpha_ledger data-update \
+  --as-of 2026-05-27 \
+  --markets CN_A \
+  --repair-coverage \
+  --repair-scope benchmarks \
+  --skip-events \
+  --skip-intraday
+```
+
+复权接口是否可用先用小样本探测，不要直接假设“拿不到”：
+
+```bash
+python -m alpha_ledger data-audit \
+  --start 2026-04-01 \
+  --end 2026-05-26 \
+  --markets CN_A \
+  --probe-adjustment \
+  --ignore-adjustment-for-short-term
+```
+
+短线 T+5/T+10 研究允许 `RAW_FALLBACK`，但只能作为未复权短线研究口径，置信度最高为 `MEDIUM_CONFIDENCE`，不能进入正式升权或长期 walk-forward 结论。
+
+历史补库按批次运行，避免每次回测临时拉接口：
+
+```bash
+python -m alpha_ledger data-backfill --start 2025-12-01 --end 2026-05-26 --markets CN_A --batch-days 180 --adjust none --throttle 0.3
 ```
 
 生成某天候选和每日计划：
@@ -78,6 +128,7 @@ python -m alpha_ledger score-calibration --start 2026-04-01 --end 2026-05-15 --t
 python -m alpha_ledger audit --as-of 2026-05-25
 python -m alpha_ledger portfolio-backtest --start 2026-04-01 --end 2026-05-15 --through 2026-05-25 --benchmark 000300.SS
 python -m alpha_ledger walk-forward --start 2026-04-01 --end 2026-05-25
+python -m alpha_ledger loss-review --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
 ```
 
 自检：

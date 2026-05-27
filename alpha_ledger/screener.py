@@ -60,6 +60,17 @@ def _next_price_date(conn: sqlite3.Connection, market: str, ticker: str, after_d
     return str(row["d"]) if row and row["d"] else None
 
 
+MIN_DAILY_AMOUNT = 5_000_000.0
+MIN_EVENT_IMPORTANCE = 0.75
+
+
+def _passes_liquidity_filter(bar: sqlite3.Row) -> bool:
+    amount = bar["amount"]
+    if amount is None:
+        return True
+    return float(amount) >= MIN_DAILY_AMOUNT
+
+
 def _market_regime(conn: sqlite3.Connection, market: str, as_of_date: str) -> str:
     index_map = {
         "CN_A": ("CN_A", "000300.SS"),
@@ -71,11 +82,28 @@ def _market_regime(conn: sqlite3.Connection, market: str, as_of_date: str) -> st
         return "NEUTRAL"
     idx_market, idx_ticker = entry
     bars = conn.execute(
-        "SELECT close FROM price_bars WHERE market = ? AND ticker = ? AND date <= ? ORDER BY date DESC LIMIT 20",
+        "SELECT close FROM price_bars WHERE market = ? AND ticker = ? AND date <= ? ORDER BY date DESC LIMIT 60",
         (idx_market, idx_ticker, as_of_date),
     ).fetchall()
-    if len(bars) >= 20:
+    if len(bars) >= 60:
         closes = [float(row["close"]) for row in bars]
+        ma20 = sum(closes[:20]) / 20.0
+        ma60 = sum(closes[:60]) / 60.0
+        current = closes[0]
+        if current > ma20 and ma20 > ma60:
+            return "BULL"
+        if current < ma20 and ma20 < ma60:
+            return "BEAR"
+        return "NEAR_MA"
+    elif len(bars) >= 20:
+        closes = [float(row["close"]) for row in bars]
+        ma20 = sum(closes[:20]) / 20.0
+        current = closes[0]
+        if current > ma20 * 1.01:
+            return "BULL"
+        if current < ma20 * 0.99:
+            return "BEAR"
+        return "NEAR_MA"
     else:
         proxy_rows = conn.execute(
             """
@@ -232,8 +260,6 @@ CN_HARD_EVENT_KEYWORDS = (
     "业绩预告",
     "净利润",
     "收入增长",
-    "调研",
-    "投资者关系",
     "重组",
     "收购",
     "并购",
@@ -243,6 +269,25 @@ CN_HARD_EVENT_KEYWORDS = (
     "产能",
     "项目",
     "新产品",
+)
+GENERIC_RESEARCH_KEYWORDS = (
+    "调研",
+    "投资者关系",
+    "投资者关系活动",
+    "业绩说明会",
+    "路演",
+)
+CORE_HARD_EVENT_KEYWORDS = (
+    "订单",
+    "合同",
+    "回购",
+    "增持",
+    "业绩预告",
+    "净利润",
+    "收入增长",
+    "重组",
+    "收购",
+    "并购",
 )
 
 
@@ -279,7 +324,7 @@ def _event_strategy_id(event: sqlite3.Row) -> str | None:
         event_dict = dict(event)
         if _is_weak_xingye_event(event_dict):
             return None
-        if any(keyword in text for keyword in CN_HARD_EVENT_KEYWORDS):
+        if _is_strong_cn_event(event_dict, []):
             return "a_share_hard_event_catalyst"
     return None
 
@@ -312,8 +357,8 @@ def _event_strategy_profile(strategy_id: str) -> tuple[str, str, str]:
             "WATCH_CONFIRMATION",
         ),
         "a_share_hard_event_catalyst": (
-            "硬公告或调研线索能够映射到业绩/估值变化，且价格没有破位，进入事件候选池。",
-            "剔除普通会议、担保授信和弱公告；若跌破事件窗口低点，应快速降级。",
+            "硬公告能够映射到业绩/估值变化，且价格没有破位，进入事件候选池。",
+            "普通调研只作辅助证据；若跌破事件窗口低点，应快速降级。",
             "WATCH_OR_BUY_ON_CONFIRMATION",
         ),
     }
@@ -341,6 +386,21 @@ def _has_revaluation_mapping(event: dict[str, object], financial_flags: list[str
     if len(financial_flags) >= 2 and any(flag.startswith(("净利润增长", "收入增长")) for flag in financial_flags):
         return True
     return False
+
+
+def _is_generic_research_event(event: dict[str, object]) -> bool:
+    text = _event_text(event)
+    return any(keyword in text for keyword in GENERIC_RESEARCH_KEYWORDS)
+
+
+def _is_strong_cn_event(event: dict[str, object], financial_flags: list[str]) -> bool:
+    text = _event_text(event)
+    if _is_generic_research_event(event):
+        return any(keyword in text for keyword in CORE_HARD_EVENT_KEYWORDS) and _has_revaluation_mapping(event, financial_flags)
+    if any(keyword in text for keyword in CN_HARD_EVENT_KEYWORDS):
+        return True
+    importance = float(event.get("importance_score") or 0.0)
+    return importance >= 0.88 and _has_revaluation_mapping(event, financial_flags)
 
 
 def _recent_high(rows: list[sqlite3.Row]) -> float:
@@ -386,6 +446,17 @@ def _target_prices(
     return close + atr * 2.0, close + atr * 3.5
 
 
+def _dynamic_cn_a_stop(close: float, structural_stop: float, recent_rows: list[sqlite3.Row]) -> float:
+    atr = _average_true_range(recent_rows[:15])
+    if atr is None or atr <= 0:
+        raw_stop = structural_stop
+    else:
+        raw_stop = max(structural_stop, close - 2.0 * atr)
+    min_stop = close * 0.90
+    max_stop = close * 0.97
+    return min(max(raw_stop, min_stop), max_stop)
+
+
 def _candidate(
     *,
     as_of_date: str,
@@ -404,15 +475,20 @@ def _candidate(
     risk_notes: str,
     evidence: list[dict[str, object]],
     data_date: str = "",
+    trailing_stop_pct: float | None = None,
+    trailing_activation_pct: float | None = None,
 ) -> dict[str, object]:
     reward_risk = round((target_1 - close) / (close - stop_loss), 2) if stop_loss > 0 and close > stop_loss else 0.0
+    effective_score = min(score, 100.0)
+    if reward_risk < 1.0:
+        effective_score = min(effective_score, 70.0)
     return {
         "as_of_date": as_of_date,
         "market": market,
         "ticker": ticker,
         "name": name,
         "strategy_id": strategy_id,
-        "candidate_score": min(score, 100.0),
+        "candidate_score": effective_score,
         "action": action,
         "entry_price": close,
         "buy_zone_low": round(close * 0.985, 2),
@@ -421,6 +497,8 @@ def _candidate(
         "target_1": round(target_1, 2),
         "target_2": round(target_2, 2),
         "reward_risk_ratio": reward_risk,
+        "trailing_stop_pct": trailing_stop_pct,
+        "trailing_activation_pct": trailing_activation_pct,
         "thesis": thesis,
         "trigger_condition": trigger_condition,
         "risk_notes": risk_notes,
@@ -444,10 +522,10 @@ def _event_rows(conn: sqlite3.Connection, as_of_date: str, lookback_days: int = 
         FROM corporate_events
         WHERE event_date >= ?
           AND event_date <= ?
-          AND importance_score >= 0.68
+          AND importance_score >= ?
         ORDER BY importance_score DESC, event_date DESC
         """,
-        (_date_minus(as_of_date, lookback_days), as_of_date),
+        (_date_minus(as_of_date, lookback_days), as_of_date, MIN_EVENT_IMPORTANCE),
     ).fetchall()
 
 
@@ -588,6 +666,8 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
         bar = _latest_price_bar(conn, event["market"], event["ticker"], as_of_date)
         if bar is None:
             continue
+        if not _passes_liquidity_filter(bar):
+            continue
         prior = _prior_bars(conn, event["market"], event["ticker"], bar["date"], 10)
         if len(prior) < 5:
             continue
@@ -598,6 +678,8 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
             continue
         low_10 = _recent_low(prior[:10])
         financial_flags = _latest_financial_flags(conn, event["market"], event["ticker"], as_of_date)
+        if event["market"] == "CN_A" and not _is_strong_cn_event(dict(event), financial_flags):
+            continue
         flow = _latest_money_flow(conn, event["market"], event["ticker"], as_of_date)
         flow_bonus = 0.0
         flow_text = ""
@@ -609,7 +691,7 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
             43.0
             + float(event["importance_score"]) * 30.0
             + min(max(change_pct, 0.0) * 1.8, 8.0)
-            + min(max(volume_ratio - 1.0, 0.0) * 7.0, 10.0)
+            + min(max(volume_ratio - 1.0, 0.0) * 4.0, 10.0)
             + min(len(financial_flags) * 3.0, 9.0)
             + flow_bonus
         )
@@ -623,10 +705,13 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
         title = event["title"]
         flags_text = f"；财务支持：{', '.join(financial_flags)}" if financial_flags else ""
         target_1, target_2 = _target_prices(event["market"], close, prior, close * 1.06, close * 1.13)
-        reward_risk = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        stop_loss = max(low_10, close * 0.9)
+        if event["market"] == "CN_A":
+            stop_loss = _dynamic_cn_a_stop(close, stop_loss, prior)
+        reward_risk = (target_1 - close) / (close - stop_loss) if close > stop_loss else 0
         if reward_risk < 1.0:
-            score -= 15
-        elif reward_risk < 1.5:
+            continue
+        if reward_risk < 1.5:
             score -= 5
         candidates.append(
             _candidate(
@@ -638,7 +723,7 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                 score=score,
                 action=action,
                 close=close,
-                stop_loss=max(low_10, close * 0.9),
+                stop_loss=stop_loss,
                 target_1=target_1,
                 target_2=target_2,
                 thesis=thesis,
@@ -676,6 +761,8 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
             continue
         bar = _latest_price_bar(conn, market, ticker, as_of_date)
         if bar is None:
+            continue
+        if not _passes_liquidity_filter(bar):
             continue
         prior = _prior_bars(conn, market, ticker, bar["date"], 20)
         if len(prior) < 10:
@@ -741,10 +828,11 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
         flags_text = f"；财务支持：{', '.join(financial_flags)}" if financial_flags else ""
         title = str(event["title"])
         target_1, target_2 = _target_prices(market, close, prior, close * 1.07, close * 1.16)
-        reward_risk = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        stop_loss = _dynamic_cn_a_stop(close, max(low_10, low, close * 0.91), prior)
+        reward_risk = (target_1 - close) / (close - stop_loss) if close > stop_loss else 0
         if reward_risk < 1.0:
-            score -= 15
-        elif reward_risk < 1.5:
+            continue
+        if reward_risk < 1.5:
             score -= 5
         candidates.append(
             _candidate(
@@ -756,7 +844,7 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
                 score=score,
                 action=action,
                 close=close,
-                stop_loss=max(low_10, low, close * 0.91),
+                stop_loss=stop_loss,
                 target_1=target_1,
                 target_2=target_2,
                 thesis=(
@@ -787,6 +875,8 @@ def screen_xingye_style_prepositioning(conn: sqlite3.Connection, as_of_date: str
                     },
                 ],
                 data_date=str(bar["date"]),
+                trailing_stop_pct=3.0,
+                trailing_activation_pct=8.0,
             )
         )
     return candidates
@@ -799,6 +889,8 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
             continue
         bar = _latest_price_bar(conn, item["market"], item["ticker"], as_of_date)
         if bar is None:
+            continue
+        if not _passes_liquidity_filter(bar):
             continue
         prior = _prior_bars(conn, item["market"], item["ticker"], bar["date"], 30)
         if len(prior) < 20:
@@ -817,15 +909,17 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
         regime = _market_regime(conn, item["market"], as_of_date)
         if regime == "BEAR":
             continue
-        score = 52.0 + min(volume_ratio * 9.0, 18.0) + min(max((close / high_20 - 1.0) * 500.0, 0), 10.0)
+        volume_bonus = min(volume_ratio * 9.0, 18.0) if volume_ratio <= 2.5 else max(18.0 - (volume_ratio - 2.5) * 12.0, 0.0)
+        score = 52.0 + volume_bonus + min(max((close / high_20 - 1.0) * 500.0, 0), 10.0)
         if regime == "NEAR_MA":
             score *= 0.8
         action = "WATCH_PULLBACK" if change_pct >= 8.5 else "BUY_CANDIDATE"
         target_1, target_2 = _target_prices(item["market"], close, prior, close * 1.08, close * 1.16)
-        reward_risk_val = (target_1 - close) / (close - max(low_10, close * 0.92)) if close > max(low_10, close * 0.92) else 0
+        stop_loss = _dynamic_cn_a_stop(close, max(low_10, close * 0.92), prior)
+        reward_risk_val = (target_1 - close) / (close - stop_loss) if close > stop_loss else 0
         if reward_risk_val < 1.0:
-            score -= 15
-        elif reward_risk_val < 1.5:
+            continue
+        if reward_risk_val < 1.5:
             score -= 5
         candidates.append(
             _candidate(
@@ -837,7 +931,7 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                 score=score,
                 action=action,
                 close=close,
-                stop_loss=max(low_10, close * 0.92),
+                stop_loss=stop_loss,
                 target_1=target_1,
                 target_2=target_2,
                 thesis="收盘价突破近20日高位区，且成交量放大，趋势可能进入延续段。",
@@ -851,6 +945,8 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                 ),
                 evidence=[{"type": "price_action", "title": "20日突破与放量确认", "url": None}],
                 data_date=str(bar["date"]),
+                trailing_stop_pct=3.0,
+                trailing_activation_pct=8.0,
             )
         )
     return candidates
@@ -863,6 +959,8 @@ def screen_abnormal_volume(conn: sqlite3.Connection, as_of_date: str) -> list[di
             continue
         bar = _latest_price_bar(conn, item["market"], item["ticker"], as_of_date)
         if bar is None:
+            continue
+        if not _passes_liquidity_filter(bar):
             continue
         prior = _prior_bars(conn, item["market"], item["ticker"], bar["date"], 20)
         if len(prior) < 10:
@@ -878,14 +976,16 @@ def screen_abnormal_volume(conn: sqlite3.Connection, as_of_date: str) -> list[di
         regime = _market_regime(conn, item["market"], as_of_date)
         if regime == "BEAR":
             continue
-        score = 45.0 + min(volume_ratio * 12.0, 30.0) + min(change_pct * 2.0, 15.0)
+        volume_bonus = min(volume_ratio * 12.0, 20.0) if volume_ratio <= 2.5 else max(20.0 - (volume_ratio - 2.5) * 15.0, 0.0)
+        score = 45.0 + volume_bonus + min(change_pct * 2.0, 15.0)
         if regime == "NEAR_MA":
             score *= 0.8
         target_1, target_2 = _target_prices(item["market"], close, prior, close * 1.07, close * 1.14)
-        reward_risk_val = (target_1 - close) / (close - max(low_10, close * 0.9)) if close > max(low_10, close * 0.9) else 0
+        stop_loss = _dynamic_cn_a_stop(close, max(low_10, close * 0.9), prior)
+        reward_risk_val = (target_1 - close) / (close - stop_loss) if close > stop_loss else 0
         if reward_risk_val < 1.0:
-            score -= 15
-        elif reward_risk_val < 1.5:
+            continue
+        if reward_risk_val < 1.5:
             score -= 5
         candidates.append(
             _candidate(
@@ -897,7 +997,7 @@ def screen_abnormal_volume(conn: sqlite3.Connection, as_of_date: str) -> list[di
                 score=score,
                 action="WATCH_OR_BUY_ON_CONFIRMATION",
                 close=close,
-                stop_loss=max(low_10, close * 0.9),
+                stop_loss=stop_loss,
                 target_1=target_1,
                 target_2=target_2,
                 thesis="价格出现非极端放量中阳，可能反映资金开始试探或新催化被交易。",
@@ -937,6 +1037,18 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
         + screen_trend_breakout(conn, as_of_date)
         + screen_abnormal_volume(conn, as_of_date)
     )
+    candidates.sort(key=lambda c: float(c.get("candidate_score", 0)), reverse=True)
+    sector_counts: dict[str, int] = {}
+    filtered: list[dict[str, object]] = []
+    for c in candidates:
+        ticker = str(c.get("ticker", ""))
+        sector_key = ticker[:3] if c.get("market") == "CN_A" and len(ticker) >= 3 else ticker
+        count = sector_counts.get(sector_key, 0)
+        if count >= 2:
+            continue
+        sector_counts[sector_key] = count + 1
+        filtered.append(c)
+    candidates = filtered
     with conn:
         if replace_existing:
             clear_candidates_for_date(conn, as_of_date)
@@ -946,10 +1058,11 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                 INSERT INTO candidates (
                     as_of_date, market, ticker, name, strategy_id, candidate_score,
                     action, entry_price, buy_zone_low, buy_zone_high, stop_loss,
-                    target_1, target_2, reward_risk_ratio, thesis, trigger_condition, risk_notes,
+                    target_1, target_2, reward_risk_ratio, trailing_stop_pct, trailing_activation_pct,
+                    thesis, trigger_condition, risk_notes,
                     evidence_json, status, confirmation_status, data_date, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(as_of_date, market, ticker, strategy_id) DO UPDATE SET
                     candidate_score=excluded.candidate_score,
                     action=excluded.action,
@@ -960,6 +1073,8 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     target_1=excluded.target_1,
                     target_2=excluded.target_2,
                     reward_risk_ratio=excluded.reward_risk_ratio,
+                    trailing_stop_pct=excluded.trailing_stop_pct,
+                    trailing_activation_pct=excluded.trailing_activation_pct,
                     thesis=excluded.thesis,
                     trigger_condition=excluded.trigger_condition,
                     risk_notes=excluded.risk_notes,
@@ -984,6 +1099,8 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     row["target_1"],
                     row["target_2"],
                     row["reward_risk_ratio"],
+                    row.get("trailing_stop_pct"),
+                    row.get("trailing_activation_pct"),
                     row["thesis"],
                     row["trigger_condition"],
                     row["risk_notes"],

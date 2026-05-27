@@ -81,6 +81,8 @@ def intraday_exit_path(
     through_date: str,
     *,
     max_exit_bars: int | None = None,
+    trailing_stop_pct: float | None = None,
+    trailing_activation_pct: float | None = None,
 ) -> ExitExecution | None:
     start_operator = ">" if market == "CN_A" else ">="
     rows = conn.execute(
@@ -101,6 +103,9 @@ def intraday_exit_path(
     first_target = target_1
     second_target = target_2
     last = rows[-1]
+    trailing_active = False
+    trailing_stop_price = 0.0
+    highest_since_entry = entry_price
     for row in rows:
         open_price = float(row["open"])
         low = float(row["low"])
@@ -126,5 +131,21 @@ def intraday_exit_path(
             return ExitExecution(date, first_target, "TARGET_1", f"{time} 盘中触及目标1。")
         if target_2_hit:
             return ExitExecution(date, second_target, "TARGET_2", f"{time} 盘中触及目标2。")
+
+        if trailing_stop_pct is not None and trailing_activation_pct is not None:
+            if high > highest_since_entry:
+                highest_since_entry = high
+            activation_price = entry_price * (1.0 + trailing_activation_pct / 100.0)
+            if not trailing_active and highest_since_entry >= activation_price:
+                trailing_active = True
+                trailing_stop_price = highest_since_entry * (1.0 - trailing_stop_pct / 100.0)
+            if trailing_active:
+                new_trailing = highest_since_entry * (1.0 - trailing_stop_pct / 100.0)
+                if new_trailing > trailing_stop_price:
+                    trailing_stop_price = new_trailing
+                if open_price <= trailing_stop_price:
+                    return ExitExecution(date, open_price, "TRAILING_STOP", f"{time} 追踪止损触发：最高 {highest_since_entry:.2f}，止损线 {trailing_stop_price:.2f}。")
+                if low <= trailing_stop_price:
+                    return ExitExecution(date, trailing_stop_price, "TRAILING_STOP", f"{time} 追踪止损触发：最高 {highest_since_entry:.2f}，止损线 {trailing_stop_price:.2f}。")
 
     return ExitExecution(str(last["date"]), float(last["close"]), "HOLD", "分时窗口未触发止损/目标，按最后一根分时收盘。")

@@ -140,6 +140,70 @@ python -m alpha_ledger walk-forward \
   --end 2026-05-25
 ```
 
+## 增量数据仓库
+
+正式研究优先维护本地 A 股数据池，不依赖每次回放临时拉接口。
+
+每日收盘后运行：
+
+```bash
+python -m alpha_ledger data-update --as-of 2026-05-27 --markets CN_A --adjust none
+python -m alpha_ledger data-audit --start 2026-04-01 --end 2026-05-27 --markets CN_A
+python -m alpha_ledger daily-run --as-of 2026-05-27
+```
+
+已有历史行情不缺日期、但缺分层基准或复权覆盖时，使用覆盖修复模式。默认只修分层基准，不重拉全市场复权：
+
+```bash
+python -m alpha_ledger data-update \
+  --as-of 2026-05-27 \
+  --markets CN_A \
+  --repair-coverage \
+  --repair-scope benchmarks \
+  --skip-events \
+  --skip-intraday
+```
+
+该模式会重新检查已有日期范围内的覆盖缺口：
+
+- 分层基准缺失时补沪深300、中证500、中证1000、创业板指、科创50、北证50。
+- 仅当使用 `--repair-scope adjustments` 或 `--repair-scope all` 时，才尝试把已有 A 股 `RAW_FALLBACK` 日线重新拉取为前复权。
+- 修复结果继续写入 `data_fetch_runs` 和 `data_fetch_errors`。
+
+复权接口可用性先用小样本探测：
+
+```bash
+python -m alpha_ledger data-audit \
+  --start 2026-04-01 \
+  --end 2026-05-26 \
+  --markets CN_A \
+  --probe-adjustment \
+  --ignore-adjustment-for-short-term
+```
+
+如果探测成功率较高，应补库修复复权；如果多源持续失败，短线 T+5/T+10 研究可临时使用 `RAW_FALLBACK`，但正式升权、长周期结论和 walk-forward 仍需复权覆盖达标。
+
+短线忽略复权时，系统会标记“未复权短线研究口径”，并把置信度上限限制在 `MEDIUM_CONFIDENCE`；正式买入清单仍要求 `HIGH_CONFIDENCE`。
+
+历史补库按批次运行，避免长时间连续请求：
+
+```bash
+python -m alpha_ledger data-backfill --start 2025-12-01 --end 2026-05-26 --markets CN_A --batch-days 180 --adjust none --throttle 0.3
+```
+
+当前补库主线使用 `--adjust none`，只维护原始价格短线研究库。需要修复复权时单独使用 `--adjust qfq` 或 `--repair-scope adjustments`，不要和日常补库混跑。
+
+新增数据任务表：
+
+- `data_fetch_runs`：每次数据任务的范围、状态、写入数量和错误数。
+- `data_fetch_errors`：接口失败和错误原因。
+- `data_coverage_daily`：日线、复权、基准、事件、财报、分时覆盖率。
+- `data_source_health`：数据源成功/失败状态。
+
+日报使用数据审计结果生成 `confidence_level`。未达到 `HIGH_CONFIDENCE` 时，日报不输出强买入结论。
+
+A 股审计优先使用沪深300行情日作为交易日历；缺沪深300时退回已有市场行情日期，再缺才使用普通工作日并在审计备注中标记日历不可靠。这样不会把五一等休市日误判为行情缺口。
+
 ```bash
 python -m alpha_ledger tune-weights \
   --start 2026-04-01 \
@@ -169,4 +233,4 @@ Tushare 适合后续补充结构化 A股基础数据、财务指标、行情和�
 - 历史资金流暂未可靠接入，避免产生未来函数。
 - 美股和港股当前只有日线执行口径，A 股优先使用分时执行口径。
 - 如果 `price_bars.adjustment_status` 仍为 `RAW_FALLBACK`，收益会使用原始价格回退，但不能作为高置信正式收益结论。
-- 如果缺少 `000300.SS` 基准行情，报告不能判断 alpha，策略权重建议也不会基于该段数据升权。
+- 如果缺少分层基准行情，报告不能可靠判断 alpha，策略权重建议也不会基于该段数据升权。

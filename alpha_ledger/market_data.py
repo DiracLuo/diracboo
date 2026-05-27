@@ -221,6 +221,33 @@ def _akshare():
     return ak
 
 
+_baostock_logged_in = False
+
+
+def _ensure_baostock_login() -> None:
+    global _baostock_logged_in
+    if not _baostock_logged_in:
+        try:
+            import baostock as bs  # type: ignore
+        except ImportError as exc:
+            raise MarketDataError("BaoStock is not installed. Run: python -m pip install baostock") from exc
+        result = bs.login()
+        if result.error_code != "0":
+            raise MarketDataError(f"BaoStock login failed: {result.error_msg}")
+        _baostock_logged_in = True
+
+
+def _baostock_logout() -> None:
+    global _baostock_logged_in
+    if _baostock_logged_in:
+        try:
+            import baostock as bs  # type: ignore
+            bs.logout()
+        except Exception:
+            pass
+        _baostock_logged_in = False
+
+
 def _is_missing(value: object) -> bool:
     if value is None:
         return True
@@ -248,6 +275,17 @@ def _cn_a_plain_symbol(instrument: Instrument) -> str:
     if match:
         return match.group(1)
     raise MarketDataError(f"Could not derive A-share symbol from {instrument.ticker}")
+
+
+def _cn_a_to_baostock_symbol(ticker: str) -> str:
+    match = re.match(r"(\d{6})\.(SZ|SS|BJ)", ticker, re.IGNORECASE)
+    if not match:
+        raise MarketDataError(f"Cannot convert {ticker} to BaoStock format")
+    code, suffix = match.group(1), match.group(2).upper()
+    if suffix == "BJ":
+        raise MarketDataError(f"BaoStock does not support BJ stocks: {ticker}")
+    prefix_map = {"SZ": "sz", "SS": "sh"}
+    return f"{prefix_map[suffix]}.{code}"
 
 
 def _coerce_intraday_datetime(value: object) -> datetime:
@@ -345,7 +383,7 @@ def _row_to_bar(
     }
 
 
-def _mark_raw_fallback(bar: dict[str, object]) -> dict[str, object]:
+def _mark_raw_fallback(bar: dict[str, object], reason: str | None = None) -> dict[str, object]:
     close = float(bar["close"])
     bar.setdefault("adj_open", bar["open"])
     bar.setdefault("adj_close", bar["close"])
@@ -353,6 +391,8 @@ def _mark_raw_fallback(bar: dict[str, object]) -> dict[str, object]:
     bar.setdefault("adj_low", bar["low"])
     bar.setdefault("adj_factor", float(bar["adj_close"]) / close if close else 1.0)
     bar.setdefault("adjustment_status", "RAW_FALLBACK")
+    if reason:
+        bar["adjustment_error"] = reason[:500]
     return bar
 
 
@@ -517,6 +557,51 @@ def fetch_akshare_cn_adjusted_daily_map(
     return rows
 
 
+def fetch_baostock_cn_adjusted_daily_map(
+    instrument: Instrument,
+    start: date,
+    end: date,
+    adjust: str = "qfq",
+) -> dict[str, dict[str, float]]:
+    if instrument.market != "CN_A":
+        return {}
+    if "index" in instrument.tags or "benchmark" in instrument.tags:
+        return {}
+    try:
+        bs_symbol = _cn_a_to_baostock_symbol(instrument.ticker)
+    except MarketDataError:
+        return {}
+    _ensure_baostock_login()
+    import baostock as bs  # type: ignore
+
+    rs = bs.query_history_k_data_plus(
+        bs_symbol,
+        "date,open,high,low,close",
+        start_date=start.isoformat(),
+        end_date=end.isoformat(),
+        frequency="d",
+        adjustflag="2",
+    )
+    if rs.error_code != "0":
+        raise MarketDataError(f"BaoStock query error for {bs_symbol}: {rs.error_msg}")
+    rows: dict[str, dict[str, float]] = {}
+    while rs.error_code == "0" and rs.next():
+        row = rs.get_row_data()
+        row_date = row[0]
+        if not _within_range(row_date, start, end):
+            continue
+        try:
+            rows[row_date] = {
+                "adj_open": float(row[1]),
+                "adj_high": float(row[2]),
+                "adj_low": float(row[3]),
+                "adj_close": float(row[4]),
+            }
+        except (ValueError, IndexError):
+            continue
+    return rows
+
+
 def fetch_cn_a_bars(
     instrument: Instrument,
     start: date,
@@ -536,17 +621,23 @@ def fetch_cn_a_bars(
             bar["adjustment_status"] = "ADJUSTED"
         return bars
     if adjust not in {"qfq"}:
-        return [_mark_raw_fallback(bar) for bar in bars]
+        return [_mark_raw_fallback(bar, f"unsupported adjust={adjust}") for bar in bars]
+    adjusted: dict[str, dict[str, float]] = {}
     try:
-        adjusted = fetch_akshare_cn_adjusted_daily_map(instrument, start, end, adjust=adjust)
+        adjusted = fetch_baostock_cn_adjusted_daily_map(instrument, start, end, adjust=adjust)
     except MarketDataError:
-        return [_mark_raw_fallback(bar) for bar in bars]
+        pass
     if not adjusted:
-        return [_mark_raw_fallback(bar) for bar in bars]
+        try:
+            adjusted = fetch_akshare_cn_adjusted_daily_map(instrument, start, end, adjust=adjust)
+        except MarketDataError as exc:
+            return [_mark_raw_fallback(bar, str(exc)) for bar in bars]
+    if not adjusted:
+        return [_mark_raw_fallback(bar, "all adjusted sources returned no rows") for bar in bars]
     for bar in bars:
         values = adjusted.get(str(bar["date"]))
         if values is None:
-            _mark_raw_fallback(bar)
+            _mark_raw_fallback(bar, "missing adjusted row for date")
             continue
         close = float(bar["close"])
         bar.update(values)
@@ -655,13 +746,16 @@ def fetch_bars(
 ) -> tuple[list[dict[str, object]], list[str]]:
     all_bars: list[dict[str, object]] = []
     errors: list[str] = []
-    for instrument in instruments:
-        try:
-            all_bars.extend(fetch_instrument_bars(instrument, start, end, adjust=adjust))
-        except MarketDataError as exc:
-            errors.append(f"{instrument.ticker} {instrument.source_symbol}: {exc}")
-        if throttle_seconds > 0:
-            time.sleep(throttle_seconds)
+    try:
+        for instrument in instruments:
+            try:
+                all_bars.extend(fetch_instrument_bars(instrument, start, end, adjust=adjust))
+            except MarketDataError as exc:
+                errors.append(f"{instrument.ticker} {instrument.source_symbol}: {exc}")
+            if throttle_seconds > 0:
+                time.sleep(throttle_seconds)
+    finally:
+        _baostock_logout()
     return all_bars, errors
 
 

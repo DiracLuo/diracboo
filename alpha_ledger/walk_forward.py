@@ -150,7 +150,10 @@ def run_walk_forward(
 
 def render_walk_forward_report(result: WalkForwardResult) -> str:
     lines: list[str] = []
-    lines.append(f"# Walk-forward Readiness - {result.start_date} to {result.end_date}")
+    lines.append(f"# Walk-forward 数据充分性检查 - {result.start_date} to {result.end_date}")
+    lines.append("")
+    lines.append("> 注意：本报告仅检查数据量是否满足正式 walk-forward 参数验证的前提条件。")
+    lines.append("> 它不是 walk-forward 参数优化结果，不包含样本外收益或参数拟合。")
     lines.append("")
     lines.append(f"- Status: `{result.status}`")
     lines.append(f"- Trading days: {result.trading_days}/{result.min_trading_days}")

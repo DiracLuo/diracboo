@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from .data_ops import CONFIDENCE_HIGH, audit_data_coverage
 from .metrics import (
     FORMAL_MARKETS,
     candidate_action_leaderboard,
@@ -10,6 +12,7 @@ from .metrics import (
     candidate_market_leaderboard,
     candidate_strategy_leaderboard,
     score_calibration,
+    strategy_risk_adjusted_metrics,
     suggest_strategy_weight_adjustments,
 )
 
@@ -36,15 +39,57 @@ MAX_ACTIONABLE_CANDIDATES = 5
 FORMAL_MARKET_LABEL = ", ".join(FORMAL_MARKETS)
 
 
+def _latest_price_date(conn: sqlite3.Connection, market: str = "CN_A") -> str | None:
+    row = conn.execute(
+        "SELECT MAX(date) AS max_date FROM price_bars WHERE market = ?",
+        (market,),
+    ).fetchone()
+    return str(row["max_date"]) if row and row["max_date"] else None
+
+
+def _next_business_day(date_value: str) -> str:
+    day = datetime.strptime(date_value, "%Y-%m-%d").date()
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day.isoformat()
+
+
 def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        WITH scored AS (
+        WITH strategy_perf AS (
+            SELECT
+                c.strategy_id,
+                AVG(e.net_return_pct) AS avg_net_return,
+                AVG(e.excess_return_pct) AS avg_excess_return,
+                AVG(CASE WHEN e.net_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
+                AVG(CASE WHEN e.net_return_pct > 0 THEN e.net_return_pct END) AS avg_win,
+                ABS(AVG(CASE WHEN e.net_return_pct <= 0 THEN e.net_return_pct END)) AS avg_loss
+            FROM candidates c
+            JOIN candidate_evaluations e ON e.candidate_id = c.id
+            WHERE c.market = 'CN_A'
+              AND c.as_of_date >= date(?, '-60 day')
+              AND c.as_of_date < ?
+            GROUP BY c.strategy_id
+        ),
+        scored AS (
         SELECT
             c.*,
             st.name AS strategy_name,
             st.version AS strategy_version,
             st.weight,
+            COALESCE(
+                c.expected_value_score,
+                (
+                    COALESCE(sp.win_rate, 0.50) * COALESCE(sp.avg_win, 4.0)
+                    - (1.0 - COALESCE(sp.win_rate, 0.50)) * COALESCE(sp.avg_loss, 4.0)
+                    - 0.18
+                    + COALESCE(sp.avg_excess_return, 0.0)
+                    + COALESCE(c.reward_risk_ratio, 0.0) * 0.5
+                    + c.candidate_score / 100.0
+                )
+            ) AS expected_value_rank,
             CASE
                 WHEN COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
                      AND c.confirmation_date = ?
@@ -86,16 +131,35 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
                 END, 0) AS reward_risk
         FROM candidates c
         JOIN strategies st ON st.id = c.strategy_id
+        LEFT JOIN strategy_perf sp ON sp.strategy_id = c.strategy_id
         WHERE (c.as_of_date = ? OR c.confirmation_date = ?)
           AND c.market = 'CN_A'
           AND st.status != 'RETIRED'
+          AND NOT (
+              c.strategy_id = 'a_share_hard_event_catalyst'
+              AND (
+                  c.trigger_condition LIKE '%调研%'
+                  OR c.trigger_condition LIKE '%投资者关系%'
+                  OR c.trigger_condition LIKE '%业绩说明会%'
+              )
+              AND c.trigger_condition NOT LIKE '%订单%'
+              AND c.trigger_condition NOT LIKE '%合同%'
+              AND c.trigger_condition NOT LIKE '%回购%'
+              AND c.trigger_condition NOT LIKE '%增持%'
+              AND c.trigger_condition NOT LIKE '%业绩预告%'
+              AND c.trigger_condition NOT LIKE '%净利润%'
+              AND c.trigger_condition NOT LIKE '%收入增长%'
+              AND c.trigger_condition NOT LIKE '%重组%'
+              AND c.trigger_condition NOT LIKE '%收购%'
+              AND c.trigger_condition NOT LIKE '%并购%'
+          )
         ),
         planned AS (
             SELECT
                 *,
                 ROW_NUMBER() OVER (
                     PARTITION BY market, ticker
-                    ORDER BY candidate_score * weight DESC, id ASC
+                    ORDER BY expected_value_rank DESC, candidate_score * weight DESC, id ASC
                 ) AS rn
             FROM scored
         )
@@ -110,10 +174,13 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
                 WHEN '等确认' THEN 3
                 ELSE 4
             END,
+            expected_value_rank DESC,
             candidate_score * weight DESC,
             ticker
         """,
         (
+            as_of_date,
+            as_of_date,
             as_of_date,
             as_of_date,
             as_of_date,
@@ -126,43 +193,68 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
 
 def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     rows = daily_action_plan(conn, as_of_date)
+    latest_date = _latest_price_date(conn, "CN_A")
+    stale = latest_date is not None and as_of_date > latest_date
+    data_status = "STALE_DATA" if stale else "FRESH"
+    audit = audit_data_coverage(
+        conn,
+        as_of_date,
+        as_of_date,
+        "CN_A",
+        write=False,
+        ignore_adjustment_for_short_term=True,
+    )
+    confidence_level = audit.confidence_level
+    trade_plan_date = _next_business_day(as_of_date if not stale else latest_date or as_of_date)
     lines: list[str] = []
     lines.append(f"# Alpha Ledger Daily Plan - {as_of_date}")
     lines.append("")
+    lines.append(f"- data_as_of_date: `{as_of_date}`")
+    lines.append(f"- trade_plan_date: `{trade_plan_date}`")
+    lines.append(f"- data_status: `{data_status}`")
+    lines.append(f"- confidence_level: `{confidence_level}`")
+    if stale:
+        lines.append(f"- 最新完整行情仅到 `{latest_date}`，本报告不生成“今日可买”。")
+    if confidence_level != CONFIDENCE_HIGH:
+        lines.append("- 数据审计未达到 HIGH_CONFIDENCE，本报告不输出强买入结论。")
+    for note in audit.notes:
+        lines.append(f"- data_note: {note}")
     lines.append(f"- 正式交易范围：{FORMAL_MARKET_LABEL}。美股/港股暂为实验数据，不进入今日买入清单。")
     lines.append("")
     if not rows:
         lines.append("暂无可操作候选。")
         return "\n".join(lines).rstrip() + "\n"
 
-    actionable = [r for r in rows if r["plan_bucket"] == "今日可买"]
+    actionable = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日可买"]
     confirmation = [r for r in rows if r["plan_bucket"] in ("重点等确认", "等确认")]
     observation = [r for r in rows if r["plan_bucket"] == "观察"]
 
     if actionable:
         lines.append(f"## 可操作买入清单（最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | 分数 | 入场 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场 | 禁追价 | 止损 | 目标1 | 风报比 | 最晚退出 | 失效条件 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in actionable[:MAX_ACTIONABLE_CANDIDATES]:
-            trigger = str(row["trigger_condition"]).replace("|", "/")
-            if len(trigger) > 80:
-                trigger = trigger[:77] + "..."
-            data_date = row["confirmation_date"] or row["data_date"] or "-"
+            stop = float(row["stop_loss"] or 0.0)
+            entry = float(row["entry_price"] or 0.0)
+            position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
+            latest_exit = _next_business_day(_next_business_day(_next_business_day(as_of_date)))
+            invalid = f"跌破 {fmt_price(stop)} 或高开超过禁追价放弃"
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {position_pct:.1f}% | "
+                f"{fmt_price(row['entry_price'])} | {fmt_price(entry * 1.03)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
-                f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
+                f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"
             )
         lines.append("")
 
     if confirmation:
         lines.append("## 等确认候选")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | 分数 | 入场 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
         for row in confirmation[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 80:
@@ -171,7 +263,7 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
                 f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
             )
@@ -484,6 +576,121 @@ def replay_data_quality_summary(
     ).fetchone()
 
 
+def replay_first_signal_strategy_summary(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    through_date: str,
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        WITH latest AS (
+            SELECT candidate_id, MAX(through_date) AS through_date
+            FROM candidate_evaluations
+            WHERE through_date <= ?
+            GROUP BY candidate_id
+        ),
+        eval AS (
+            SELECT e.*
+            FROM candidate_evaluations e
+            JOIN latest l
+              ON l.candidate_id = e.candidate_id
+             AND l.through_date = e.through_date
+        ),
+        ranked AS (
+            SELECT
+                c.*,
+                st.name AS strategy_name,
+                st.version AS strategy_version,
+                e.net_return_pct,
+                e.benchmark_return_pct,
+                e.excess_return_pct,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.market, c.ticker, c.strategy_id
+                    ORDER BY c.as_of_date, c.id
+                ) AS first_signal_rank
+            FROM candidates c
+            JOIN strategies st ON st.id = c.strategy_id
+            LEFT JOIN eval e ON e.candidate_id = c.id
+            WHERE c.as_of_date >= ?
+              AND c.as_of_date <= ?
+              AND c.market IN ('CN_A')
+        )
+        SELECT
+            strategy_id,
+            strategy_name,
+            strategy_version,
+            COUNT(*) AS candidate_count,
+            SUM(CASE WHEN net_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS evaluated_count,
+            AVG(candidate_score) AS avg_candidate_score,
+            AVG(net_return_pct) AS avg_net_return_pct,
+            AVG(benchmark_return_pct) AS avg_benchmark_return_pct,
+            AVG(excess_return_pct) AS avg_excess_return_pct,
+            AVG(CASE WHEN excess_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS excess_win_rate,
+            AVG(CASE WHEN net_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS net_win_rate
+        FROM ranked
+        WHERE first_signal_rank = 1
+        GROUP BY strategy_id, strategy_name, strategy_version
+        ORDER BY avg_excess_return_pct IS NULL, avg_excess_return_pct DESC, evaluated_count DESC
+        """,
+        (through_date, start_date, end_date),
+    ).fetchall()
+
+
+def replay_event_quality_summary(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    through_date: str,
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        WITH latest AS (
+            SELECT candidate_id, MAX(through_date) AS through_date
+            FROM candidate_evaluations
+            WHERE through_date <= ?
+            GROUP BY candidate_id
+        ),
+        eval AS (
+            SELECT e.*
+            FROM candidate_evaluations e
+            JOIN latest l
+              ON l.candidate_id = e.candidate_id
+             AND l.through_date = e.through_date
+        )
+        SELECT
+            CASE
+                WHEN c.trigger_condition LIKE '%调研%'
+                  OR c.trigger_condition LIKE '%投资者关系%'
+                  OR c.trigger_condition LIKE '%业绩说明会%'
+                THEN '泛调研/IR'
+                ELSE '硬事件/其他'
+            END AS segment,
+            COUNT(*) AS candidate_count,
+            SUM(CASE WHEN e.net_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS evaluated_count,
+            AVG(c.candidate_score) AS avg_candidate_score,
+            AVG(e.net_return_pct) AS avg_net_return_pct,
+            AVG(e.benchmark_return_pct) AS avg_benchmark_return_pct,
+            AVG(e.excess_return_pct) AS avg_excess_return_pct,
+            AVG(CASE WHEN e.excess_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS excess_win_rate,
+            AVG(CASE WHEN e.net_return_pct > 0 THEN 1.0 ELSE 0.0 END) AS net_win_rate,
+            NULL AS target_1_rate,
+            NULL AS stop_rate,
+            NULL AS avg_max_gain_pct,
+            NULL AS avg_max_drawdown_pct
+        FROM candidates c
+        LEFT JOIN eval e ON e.candidate_id = c.id
+        WHERE c.as_of_date >= ?
+          AND c.as_of_date <= ?
+          AND c.market = 'CN_A'
+          AND c.strategy_id IN ('a_share_hard_event_catalyst', 'xingye_style_prepositioning')
+        GROUP BY segment
+        ORDER BY avg_excess_return_pct IS NULL, avg_excess_return_pct DESC
+        """,
+        (through_date, start_date, end_date),
+    ).fetchall()
+
+
 def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: str, through_date: str) -> str:
     leaderboard = candidate_strategy_leaderboard(conn, start_date, end_date, through_date)
     deduped_leaderboard = candidate_strategy_leaderboard(
@@ -496,20 +703,30 @@ def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: st
     horizon_matrix = replay_horizon_strategy_matrix(conn, start_date, end_date, through_date, dedupe=True)
     market_leaderboard = candidate_market_leaderboard(conn, start_date, end_date, through_date)
     action_leaderboard = candidate_action_leaderboard(conn, start_date, end_date, through_date)
+    first_signal_leaderboard = replay_first_signal_strategy_summary(conn, start_date, end_date, through_date)
+    event_quality = replay_event_quality_summary(conn, start_date, end_date, through_date)
     weight_suggestions = suggest_strategy_weight_adjustments(conn, start_date, end_date, through_date)
     calibration = score_calibration(conn, start_date, end_date, through_date, 10)
+    risk_metrics = strategy_risk_adjusted_metrics(conn, start_date, end_date, through_date)
     data_quality = replay_data_quality_summary(conn, start_date, end_date, through_date)
     daily = replay_daily_summary(conn, start_date, end_date)
     winners = replay_samples(conn, start_date, end_date, order="best")
     losers = replay_samples(conn, start_date, end_date, order="worst")
     total_candidates = sum(int(row["candidate_count"]) for row in daily)
     total_evaluated = sum(int(row["evaluated_count"]) for row in daily)
-    price_bar_count = int(data_quality["price_bar_count"] or 0)
-    adjusted_price_bar_count = int(data_quality["adjusted_price_bar_count"] or 0)
-    raw_fallback_price_bar_count = int(data_quality["raw_fallback_price_bar_count"] or 0)
+    if data_quality is not None:
+        price_bar_count = int(data_quality["price_bar_count"] or 0)
+        adjusted_price_bar_count = int(data_quality["adjusted_price_bar_count"] or 0)
+        raw_fallback_price_bar_count = int(data_quality["raw_fallback_price_bar_count"] or 0)
+        benchmark_day_count = int(data_quality["benchmark_day_count"] or 0)
+        trading_day_count = int(data_quality["trading_day_count"] or 0)
+    else:
+        price_bar_count = 0
+        adjusted_price_bar_count = 0
+        raw_fallback_price_bar_count = 0
+        benchmark_day_count = 0
+        trading_day_count = 0
     adjusted_coverage = adjusted_price_bar_count / price_bar_count * 100.0 if price_bar_count else 0.0
-    benchmark_day_count = int(data_quality["benchmark_day_count"] or 0)
-    trading_day_count = int(data_quality["trading_day_count"] or 0)
     benchmark_coverage = benchmark_day_count / trading_day_count * 100.0 if trading_day_count else 0.0
 
     lines: list[str] = []
@@ -531,6 +748,7 @@ def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: st
         lines.append(f"- WARNING: 沪深300基准覆盖率仅 {benchmark_coverage:.1f}%，不能可靠判断 alpha。")
     lines.append("- 固定周期榜只统计完整走满 T+5/T+10/T+20/T+60 的样本；未走满的候选继续等待，不计入正式胜率。")
     lines.append("- 策略榜同时展示原始候选和去重候选；去重规则为同一日期同一股票只保留分数最高的策略。")
+    lines.append("- 首信号口径只保留同一股票同一策略窗口的第一次正式信号，避免连续上涨股票重复放大胜率。")
     lines.append("")
 
     lines.append("## 固定持有周期策略榜")
@@ -552,16 +770,20 @@ def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: st
         lines.append("暂无固定周期候选回放数据。")
     lines.append("")
 
-    def append_strategy_table(title: str, rows: list[sqlite3.Row]) -> None:
+    def append_strategy_table(title: str, rows: list[sqlite3.Row], risk_metrics: dict[str, dict[str, float]] | None = None) -> None:
         lines.append(title)
         lines.append("")
         if not rows:
             lines.append("暂无策略回放数据。")
             lines.append("")
             return
-        lines.append("| 策略 | 候选数 | 已验证 | 均分 | 平均净收益 | 平均基准 | 平均超额 | 超额胜率 | 净胜率 | 目标1率 | 目标2率 | 止损率 | MFE | MAE |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("| 策略 | 候选数 | 已验证 | 均分 | 平均净收益 | 平均基准 | 平均超额 | 超额胜率 | 净胜率 | 目标1率 | 目标2率 | 止损率 | 夏普 | 索提诺 | MFE | MAE |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in rows:
+            sid = str(row["strategy_id"])
+            rm = (risk_metrics or {}).get(sid, {})
+            sharpe = rm.get("sharpe_ratio", 0.0)
+            sortino = rm.get("sortino_ratio", 0.0)
             lines.append(
                 "| "
                 f"{row['strategy_name']} `{row['strategy_id']}@{row['strategy_version']}` | {row['candidate_count']} | "
@@ -570,13 +792,32 @@ def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: st
                 f"{fmt_pct(row['avg_excess_return_pct'])} | {fmt_rate(row['excess_win_rate'])} | "
                 f"{fmt_rate(row['net_win_rate'])} | "
                 f"{fmt_rate(row['target_1_rate'])} | {fmt_rate(row['target_2_rate'])} | "
-                f"{fmt_rate(row['stop_rate'])} | {fmt_pct(row['avg_max_gain_pct'])} | "
+                f"{fmt_rate(row['stop_rate'])} | {sharpe:.2f} | {sortino:.2f} | "
+                f"{fmt_pct(row['avg_max_gain_pct'])} | "
                 f"{fmt_pct(row['avg_max_drawdown_pct'])} |"
             )
         lines.append("")
 
-    append_strategy_table("## 截止日候选策略胜率", leaderboard)
-    append_strategy_table("## 截止日去重后策略胜率", deduped_leaderboard)
+    append_strategy_table("## 截止日候选策略胜率", leaderboard, risk_metrics)
+    append_strategy_table("## 截止日去重后策略胜率", deduped_leaderboard, risk_metrics)
+
+    lines.append("## 同股同策略首信号胜率")
+    lines.append("")
+    if first_signal_leaderboard:
+        lines.append("| 策略 | 候选数 | 已验证 | 均分 | 平均净收益 | 平均基准 | 平均超额 | 超额胜率 | 净胜率 |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for row in first_signal_leaderboard:
+            lines.append(
+                "| "
+                f"{row['strategy_name']} `{row['strategy_id']}@{row['strategy_version']}` | {row['candidate_count']} | "
+                f"{row['evaluated_count']} | {fmt_price(row['avg_candidate_score'])} | "
+                f"{fmt_pct(row['avg_net_return_pct'])} | {fmt_pct(row['avg_benchmark_return_pct'])} | "
+                f"{fmt_pct(row['avg_excess_return_pct'])} | {fmt_rate(row['excess_win_rate'])} | "
+                f"{fmt_rate(row['net_win_rate'])} |"
+            )
+    else:
+        lines.append("暂无首信号回放数据。")
+    lines.append("")
 
     def append_segment_table(title: str, rows: list[sqlite3.Row], segment_name: str) -> None:
         lines.append(title)
@@ -601,6 +842,7 @@ def render_replay_report(conn: sqlite3.Connection, start_date: str, end_date: st
 
     append_segment_table("## 分市场表现", market_leaderboard, "市场")
     append_segment_table("## 触发类型表现", action_leaderboard, "触发类型")
+    append_segment_table("## 事件质量表现", event_quality, "事件质量")
 
     lines.append("## 分数校准（T+10净收益）")
     lines.append("")

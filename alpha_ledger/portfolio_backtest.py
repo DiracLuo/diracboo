@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .execution import intraday_exit_path, open_5min_vwap_entry
+from .benchmarks import benchmark_for_asset
 from .ledger import now_utc
 from .metrics import (
     FORMAL_MARKETS,
@@ -15,7 +16,14 @@ from .metrics import (
     adjusted_trade_return_pct,
     benchmark_max_drawdown_pct,
     benchmark_return_pct,
+    compute_sharpe_ratio,
+    compute_sortino_ratio,
+    slippage_pct,
     trade_cost_pct,
+)
+from .trading_rules import (
+    is_one_price_limit_down_from_values,
+    is_one_price_limit_up_from_values,
 )
 
 
@@ -35,6 +43,7 @@ class TradeRecord:
     benchmark_return_pct: float | None
     excess_return_pct: float | None
     cost_pct: float
+    slippage_pct: float
     pnl: float
     position_size: float
 
@@ -66,6 +75,8 @@ class PortfolioResult:
     win_vs_benchmark_rate: float | None
     require_intraday: bool
     market_scope: tuple[str, ...]
+    sharpe_ratio: float
+    sortino_ratio: float
     daily_equity: list[tuple[str, float]]
     trades: list[TradeRecord]
 
@@ -92,6 +103,8 @@ class _OpenPosition:
     benchmark_return_pct: float | None
     excess_return_pct: float | None
     cost: float
+    slippage_cost: float = 0.0
+    exit_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,8 @@ class _PendingOrder:
     stop_loss: float | None
     target_1: float | None
     target_2: float | None
+    trailing_stop_pct: float | None = None
+    trailing_activation_pct: float | None = None
 
 
 def _get_trading_days(conn: sqlite3.Connection, start: str, end: str) -> list[str]:
@@ -130,6 +145,14 @@ def _previous_close(conn: sqlite3.Connection, market: str, ticker: str, before_d
         (market, ticker, before_date),
     ).fetchone()
     return float(row["close"]) if row and row["close"] is not None else None
+
+
+def _instrument_name(conn: sqlite3.Connection, market: str, ticker: str) -> str:
+    row = conn.execute(
+        "SELECT name FROM instruments WHERE market = ? AND ticker = ?",
+        (market, ticker),
+    ).fetchone()
+    return str(row["name"]) if row and row["name"] is not None else ""
 
 
 def _is_suspended_or_illiquid(bar: sqlite3.Row) -> bool:
@@ -156,7 +179,26 @@ def _is_one_price_limit_up(
     open_price = float(bar["open"])
     high = float(bar["high"])
     low = float(bar["low"])
-    return open_price >= previous * 1.095 and abs(high - low) <= max(open_price * 0.001, 0.01)
+    name = _instrument_name(conn, market, ticker)
+    return is_one_price_limit_up_from_values(previous, open_price, high, low, ticker, name)
+
+
+def _is_one_price_limit_down(
+    conn: sqlite3.Connection,
+    market: str,
+    ticker: str,
+    bar: sqlite3.Row,
+) -> bool:
+    if market != "CN_A":
+        return False
+    previous = _previous_close(conn, market, ticker, str(bar["date"]))
+    if previous is None or previous <= 0:
+        return False
+    open_price = float(bar["open"])
+    high = float(bar["high"])
+    low = float(bar["low"])
+    name = _instrument_name(conn, market, ticker)
+    return is_one_price_limit_down_from_values(previous, open_price, high, low, ticker, name)
 
 
 def _get_next_trading_day(
@@ -178,6 +220,71 @@ def _get_next_trading_day(
         tuple(params),
     ).fetchone()
     return str(row["d"]) if row and row["d"] else None
+
+
+def _atr_pct(conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str, period: int = 14) -> float | None:
+    rows = conn.execute(
+        """
+        SELECT high, low, close FROM price_bars
+        WHERE market = ? AND ticker = ? AND date <= ?
+        ORDER BY date DESC LIMIT ?
+        """,
+        (market, ticker, as_of_date, period + 1),
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+    trs: list[float] = []
+    for i in range(len(rows) - 1):
+        h = float(rows[i]["high"])
+        l = float(rows[i]["low"])
+        prev_c = float(rows[i + 1]["close"])
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+    if not trs:
+        return None
+    atr = sum(trs) / len(trs)
+    close = float(rows[0]["close"])
+    if close <= 0:
+        return None
+    return atr / close * 100.0
+
+
+def _mark_to_market_equity(
+    conn: sqlite3.Connection,
+    positions: list[_OpenPosition],
+    capital: float,
+    day: str,
+) -> float:
+    equity = capital
+    for pos in positions:
+        bar = _get_price_bar(conn, pos.market, pos.ticker, day)
+        if bar is None or pos.entry_return_price <= 0:
+            equity += pos.position_size
+            continue
+        close = adjusted_bar_price(bar, "adj_close", "close")
+        equity += pos.position_size * (close / pos.entry_return_price)
+    return equity
+
+
+def _risk_parity_position_size(
+    *,
+    capital: float,
+    entry_price: float,
+    stop_loss: float | None,
+    remaining_slots: int,
+    initial_capital: float,
+    risk_budget_pct: float,
+    max_position_pct: float,
+) -> float:
+    fallback = capital / remaining_slots if remaining_slots > 0 else 0.0
+    max_position_cash = initial_capital * max_position_pct / 100.0
+    if stop_loss is None or stop_loss <= 0 or stop_loss >= entry_price:
+        return min(fallback, max_position_cash, capital)
+    risk_per_cash = (entry_price - stop_loss) / entry_price
+    if risk_per_cash <= 0:
+        return min(fallback, max_position_cash, capital)
+    risk_budget_cash = initial_capital * risk_budget_pct / 100.0
+    return min(risk_budget_cash / risk_per_cash, max_position_cash, capital)
 
 
 def _get_price_bar(
@@ -266,6 +373,8 @@ def _pending_order_from_candidate(row: sqlite3.Row) -> _PendingOrder:
         stop_loss=float(row["stop_loss"]) if row["stop_loss"] is not None else None,
         target_1=float(row["target_1"]) if row["target_1"] is not None else None,
         target_2=float(row["target_2"]) if row["target_2"] is not None else None,
+        trailing_stop_pct=float(row["trailing_stop_pct"]) if row["trailing_stop_pct"] is not None else None,
+        trailing_activation_pct=float(row["trailing_activation_pct"]) if row["trailing_activation_pct"] is not None else None,
     )
 
 
@@ -281,6 +390,8 @@ def _compute_exit(
     horizon_days: int,
     through_date: str,
     execution_mode: str = "intraday",
+    trailing_stop_pct: float | None = None,
+    trailing_activation_pct: float | None = None,
 ) -> tuple[str, str, float] | None:
     start_operator = ">" if market == "CN_A" else ">="
     bars = conn.execute(
@@ -306,13 +417,18 @@ def _compute_exit(
             target_1,
             target_2,
             intraday_through,
+            trailing_stop_pct=trailing_stop_pct,
+            trailing_activation_pct=trailing_activation_pct,
         )
         if intraday_exit is not None:
             exit_type = intraday_exit.exit_type
             if exit_type == "HOLD":
                 exit_type = "HORIZON"
             return intraday_exit.date, exit_type, intraday_exit.price
-    path = _long_trade_path(truncated, entry_price, stop_loss, target_1, target_2, market)
+    path = _long_trade_path(
+        truncated, entry_price, stop_loss, target_1, target_2, market, ticker=ticker,
+        trailing_stop_pct=trailing_stop_pct, trailing_activation_pct=trailing_activation_pct,
+    )
     exit_type = path["exit_type"]
     if exit_type == "HOLD":
         exit_type = "HORIZON"
@@ -320,21 +436,61 @@ def _compute_exit(
 
 
 def _close_due_positions(
+    conn: sqlite3.Connection,
     positions: list[_OpenPosition],
     day: str,
     capital: float,
     closed_trades: list[TradeRecord],
     cooldown_days: int,
+    benchmark_ticker: str | None,
 ) -> tuple[list[_OpenPosition], float, dict[tuple[str, str], int]]:
     cooldowns: dict[tuple[str, str], int] = {}
     still_open: list[_OpenPosition] = []
     for pos in positions:
         if pos.exit_date <= day:
+            bar = _get_price_bar(conn, pos.market, pos.ticker, day)
+            if bar and _is_one_price_limit_down(conn, pos.market, pos.ticker, bar):
+                next_day = _get_next_trading_day(conn, day, pos.market, pos.ticker)
+                if next_day:
+                    pos.exit_date = next_day
+                    pos.exit_deferred = True
+                    still_open.append(pos)
+                    continue
+            if pos.exit_deferred and bar is not None:
+                exit_price = float(bar["open"])
+                gross_return_pct = adjusted_trade_return_pct(
+                    conn,
+                    pos.market,
+                    pos.ticker,
+                    pos.entry_date,
+                    pos.entry_price,
+                    day,
+                    exit_price,
+                )
+                trade_benchmark_return = benchmark_return_pct(
+                    conn,
+                    pos.market,
+                    pos.entry_date,
+                    day,
+                    benchmark_ticker=benchmark_for_asset(pos.market, pos.ticker, benchmark_ticker),
+                )
+                cost_pct = pos.cost / pos.position_size * 100.0 if pos.position_size else 0.0
+                pos.exit_date = day
+                pos.exit_price = exit_price
+                pos.exit_type = f"{pos.exit_type}_LIMIT_DOWN_DEFERRED"
+                pos.return_pct = gross_return_pct
+                pos.benchmark_return_pct = trade_benchmark_return
+                pos.excess_return_pct = (
+                    gross_return_pct - cost_pct - trade_benchmark_return
+                    if trade_benchmark_return is not None
+                    else None
+                )
             gross_value = pos.position_size * (1.0 + pos.return_pct / 100.0)
-            capital += gross_value - pos.cost
-            pnl = gross_value - pos.cost - pos.position_size
+            capital += gross_value - pos.cost - pos.slippage_cost
+            pnl = gross_value - pos.cost - pos.slippage_cost - pos.position_size
             net_return_pct = pnl / pos.position_size * 100.0 if pos.position_size else 0.0
             cost_pct = pos.cost / pos.position_size * 100.0 if pos.position_size else 0.0
+            slip_pct = pos.slippage_cost / pos.position_size * 100.0 if pos.position_size else 0.0
             closed_trades.append(
                 TradeRecord(
                     ticker=pos.ticker,
@@ -351,6 +507,7 @@ def _close_due_positions(
                     benchmark_return_pct=pos.benchmark_return_pct,
                     excess_return_pct=pos.excess_return_pct,
                     cost_pct=cost_pct,
+                    slippage_pct=slip_pct,
                     pnl=pnl,
                     position_size=pos.position_size,
                 )
@@ -375,6 +532,12 @@ def run_portfolio_backtest(
     markets: tuple[str, ...] = FORMAL_MARKETS,
     benchmark_ticker: str | None = "000300.SS",
     require_intraday: bool = False,
+    drawdown_reduce_threshold: float = 10.0,
+    drawdown_halt_threshold: float = 20.0,
+    max_per_sector: int = 2,
+    sizing_mode: str = "equal",
+    risk_budget_pct: float = 2.0,
+    max_position_pct: float = 25.0,
 ) -> PortfolioResult:
     trading_days = _get_trading_days(conn, start_date, through_date)
     if not trading_days:
@@ -404,6 +567,8 @@ def run_portfolio_backtest(
             win_vs_benchmark_rate=None,
             require_intraday=require_intraday,
             market_scope=markets,
+            sharpe_ratio=0.0,
+            sortino_ratio=0.0,
             daily_equity=[],
             trades=[],
         )
@@ -415,13 +580,33 @@ def run_portfolio_backtest(
     exclude_tickers: dict[tuple[str, str], int] = {}
     pending_orders: dict[str, list[_PendingOrder]] = {}
     cost_model = f"custom:{cost_bps}bps" if cost_bps is not None else "market-cost-by-symbol"
+    if sizing_mode != "equal":
+        cost_model += f"+{sizing_mode}"
     max_concurrent = 0
     skipped_orders = 0
+    peak_equity = initial_capital
+    consecutive_losses = 0
+    consecutive_loss_cooldown_until: str | None = None
 
     for day in trading_days:
+        prev_trade_count = len(closed_trades)
         open_positions, capital, new_cooldowns = _close_due_positions(
-            open_positions, day, capital, closed_trades, cooldown_days
+            conn, open_positions, day, capital, closed_trades, cooldown_days, benchmark_ticker
         )
+        for trade in closed_trades[prev_trade_count:]:
+            if trade.net_return_pct < 0:
+                consecutive_losses += 1
+                if consecutive_losses >= 5:
+                    next_day = _get_next_trading_day(conn, day)
+                    if next_day:
+                        consecutive_loss_cooldown_until = next_day
+            else:
+                consecutive_losses = 0
+                consecutive_loss_cooldown_until = None
+
+        total_equity = _mark_to_market_equity(conn, open_positions, capital, day)
+        if total_equity > peak_equity:
+            peak_equity = total_equity
 
         to_remove: list[tuple[str, str]] = []
         for k in exclude_tickers:
@@ -436,10 +621,24 @@ def run_portfolio_backtest(
         todays_orders = pending_orders.pop(day, [])
         todays_orders.sort(key=lambda order: order.candidate_score * order.strategy_weight, reverse=True)
         for order in todays_orders:
-            if len(open_positions) >= max_positions:
+            effective_max = max_positions
+            if consecutive_loss_cooldown_until and day <= consecutive_loss_cooldown_until:
+                effective_max = 0
+            current_equity = _mark_to_market_equity(conn, open_positions, capital, day)
+            current_drawdown = (peak_equity - current_equity) / peak_equity * 100.0 if peak_equity > 0 else 0.0
+            if current_drawdown >= drawdown_halt_threshold:
+                effective_max = 0
+            elif current_drawdown >= drawdown_reduce_threshold:
+                effective_max = max(1, max_positions - 1)
+            if len(open_positions) >= effective_max:
                 break
             key = (order.market, order.ticker)
             if key in exclude_tickers or any((pos.market, pos.ticker) == key for pos in open_positions):
+                continue
+            sector_key = order.ticker[:3] if order.market == "CN_A" and len(order.ticker) >= 3 else order.ticker
+            sector_count = sum(1 for p in open_positions if (p.ticker[:3] if p.market == "CN_A" and len(p.ticker) >= 3 else p.ticker) == sector_key)
+            if sector_count >= max_per_sector:
+                skipped_orders += 1
                 continue
             bar = _get_price_bar(conn, order.market, order.ticker, day)
             if not bar:
@@ -464,7 +663,19 @@ def run_portfolio_backtest(
                 continue
             entry_return_price = adjusted_price_from_raw(bar, entry_price)
             remaining_slots = max_positions - len(open_positions)
-            position_size = capital / remaining_slots if remaining_slots > 0 else 0.0
+            if sizing_mode == "risk_parity" and remaining_slots > 0:
+                position_size = _risk_parity_position_size(
+                    capital=capital,
+                    entry_price=entry_price,
+                    stop_loss=order.stop_loss,
+                    remaining_slots=remaining_slots,
+                    initial_capital=initial_capital,
+                    risk_budget_pct=risk_budget_pct,
+                    max_position_pct=max_position_pct,
+                )
+            else:
+                equal_size = capital / remaining_slots if remaining_slots > 0 else 0.0
+                position_size = min(equal_size, initial_capital * max_position_pct / 100.0)
             if position_size <= 0:
                 break
             shares = position_size / entry_price
@@ -480,6 +691,8 @@ def run_portfolio_backtest(
                 order.target_horizon_days,
                 through_date,
                 execution_mode,
+                trailing_stop_pct=order.trailing_stop_pct,
+                trailing_activation_pct=order.trailing_activation_pct,
             )
             if exit_result is None:
                 skipped_orders += 1
@@ -499,12 +712,14 @@ def run_portfolio_backtest(
                 order.market,
                 day,
                 exit_date,
-                benchmark_ticker=benchmark_ticker,
+                benchmark_ticker=benchmark_for_asset(order.market, order.ticker, benchmark_ticker),
             )
             cost_pct = (cost_bps / 100.0) if cost_bps is not None else trade_cost_pct(order.market)
+            slip_rate = slippage_pct(order.market)
             cost_rate = cost_pct / 100.0
             round_trip_cost = position_size * cost_rate
-            net_return_pct = gross_return_pct - cost_pct
+            slip_cost = position_size * slip_rate
+            net_return_pct = gross_return_pct - cost_pct - slip_rate * 100.0
             excess_return_pct = (
                 net_return_pct - trade_benchmark_return
                 if trade_benchmark_return is not None
@@ -533,11 +748,12 @@ def run_portfolio_backtest(
                     benchmark_return_pct=trade_benchmark_return,
                     excess_return_pct=excess_return_pct,
                     cost=round_trip_cost,
+                    slippage_cost=slip_cost,
                 )
             )
 
         open_positions, capital, same_day_cooldowns = _close_due_positions(
-            open_positions, day, capital, closed_trades, cooldown_days
+            conn, open_positions, day, capital, closed_trades, cooldown_days, benchmark_ticker
         )
         exclude_tickers.update(same_day_cooldowns)
 
@@ -583,10 +799,11 @@ def run_portfolio_backtest(
 
     for pos in open_positions:
         gross_value = pos.position_size * (1.0 + pos.return_pct / 100.0)
-        capital += gross_value - pos.cost
-        pnl = gross_value - pos.cost - pos.position_size
+        capital += gross_value - pos.cost - pos.slippage_cost
+        pnl = gross_value - pos.cost - pos.slippage_cost - pos.position_size
         net_return_pct = pnl / pos.position_size * 100.0 if pos.position_size else 0.0
         cost_pct = pos.cost / pos.position_size * 100.0 if pos.position_size else 0.0
+        slip_pct = pos.slippage_cost / pos.position_size * 100.0 if pos.position_size else 0.0
         closed_trades.append(TradeRecord(
             ticker=pos.ticker,
             name=pos.name,
@@ -602,6 +819,7 @@ def run_portfolio_backtest(
             benchmark_return_pct=pos.benchmark_return_pct,
             excess_return_pct=pos.excess_return_pct,
             cost_pct=cost_pct,
+            slippage_pct=slip_pct,
             pnl=pnl,
             position_size=pos.position_size,
         ))
@@ -656,6 +874,15 @@ def run_portfolio_backtest(
         else None
     )
 
+    daily_returns = []
+    for i in range(1, len(daily_equity)):
+        prev_eq = daily_equity[i - 1][1]
+        curr_eq = daily_equity[i][1]
+        if prev_eq > 0:
+            daily_returns.append((curr_eq - prev_eq) / prev_eq)
+    sharpe = compute_sharpe_ratio(daily_returns) if len(daily_returns) >= 2 else 0.0
+    sortino = compute_sortino_ratio(daily_returns) if len(daily_returns) >= 2 else 0.0
+
     return PortfolioResult(
         start_date=start_date,
         end_date=end_date,
@@ -682,6 +909,8 @@ def run_portfolio_backtest(
         win_vs_benchmark_rate=win_vs_benchmark_rate,
         require_intraday=require_intraday,
         market_scope=markets,
+        sharpe_ratio=sharpe,
+        sortino_ratio=sortino,
         daily_equity=daily_equity,
         trades=closed_trades,
     )
@@ -697,11 +926,13 @@ def render_portfolio_report(result: PortfolioResult) -> str:
     lines.append(f"- Initial Capital: {result.initial_capital:,.2f}")
     lines.append(f"- Final Capital: {result.final_capital:,.2f}")
     lines.append(f"- Total Return: {result.total_return_pct:.2f}%")
+    lines.append(f"- Sharpe Ratio: {result.sharpe_ratio:.2f}")
+    lines.append(f"- Sortino Ratio: {result.sortino_ratio:.2f}")
     if result.benchmark_ticker and result.benchmark_return_pct is not None:
         lines.append(f"- Benchmark ({result.benchmark_ticker}) Return: {result.benchmark_return_pct:.2f}%")
-        lines.append(f"- Active Return: {result.active_return_pct:.2f}%")
-        lines.append(f"- Benchmark Max Drawdown: {result.benchmark_max_drawdown_pct:.2f}%")
-        lines.append(f"- Win Rate vs Benchmark: {result.win_vs_benchmark_rate:.1f}%")
+        lines.append(f"- Active Return: {result.active_return_pct:.2f}%" if result.active_return_pct is not None else "- Active Return: -")
+        lines.append(f"- Benchmark Max Drawdown: {result.benchmark_max_drawdown_pct:.2f}%" if result.benchmark_max_drawdown_pct is not None else "- Benchmark Max Drawdown: -")
+        lines.append(f"- Win Rate vs Benchmark: {result.win_vs_benchmark_rate:.1f}%" if result.win_vs_benchmark_rate is not None else "- Win Rate vs Benchmark: -")
     elif result.benchmark_ticker:
         lines.append(f"- Benchmark ({result.benchmark_ticker}) Return: missing; cannot judge alpha.")
     lines.append(f"- Max Drawdown: {result.max_drawdown_pct:.2f}%")

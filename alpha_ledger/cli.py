@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from datetime import timedelta
 from pathlib import Path
 
 from .audit import audit_all, latest_audits
+from .benchmarks import CN_A_BENCHMARKS
+from .data_ops import REPAIR_SCOPES, audit_data_coverage, data_update, probe_adjustment_sources
 from .db import DEFAULT_DB_PATH, connect, init_db, upsert_many
 from .event_data import fetch_events_to_db, import_events_csv
 from .ledger import verify_signals
+from .loss_review import write_loss_review
 from .market_data import (
-    CN_A_BENCHMARK_INSTRUMENTS,
     DEFAULT_UNIVERSE_PATH,
     fetch_bars,
     fetch_intraday_bars,
@@ -82,6 +85,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-benchmarks",
         action="store_true",
         help="Include built-in market benchmarks such as CN_A:000300.SS",
+    )
+
+    data_update_parser = subparsers.add_parser("data-update", help="Incrementally update local A-share data warehouse")
+    data_update_parser.add_argument("--as-of", required=True)
+    data_update_parser.add_argument("--markets", default="CN_A")
+    data_update_parser.add_argument("--throttle", type=float, default=0.15)
+    data_update_parser.add_argument(
+        "--adjust",
+        choices=("none", "qfq"),
+        default="qfq",
+        help="Daily adjustment mode for fetched A-share stock bars; default uses forward-adjusted (qfq) prices",
+    )
+    data_update_parser.add_argument("--skip-events", action="store_true")
+    data_update_parser.add_argument("--skip-intraday", action="store_true")
+    data_update_parser.add_argument(
+        "--repair-coverage",
+        action="store_true",
+        help="Repair existing CN_A coverage gaps such as missing layered benchmarks and RAW_FALLBACK bars",
+    )
+    data_update_parser.add_argument(
+        "--repair-scope",
+        choices=REPAIR_SCOPES,
+        default="benchmarks",
+        help="Coverage repair target. benchmarks avoids full-market adjustment retries.",
+    )
+
+    data_audit = subparsers.add_parser("data-audit", help="Audit local data coverage and confidence")
+    data_audit.add_argument("--start", required=True)
+    data_audit.add_argument("--end", required=True)
+    data_audit.add_argument("--markets", default="CN_A")
+    data_audit.add_argument("--probe-adjustment", action="store_true", help="Probe A-share qfq adjustment source availability")
+    data_audit.add_argument("--probe-sample-size", type=int, default=10)
+    data_audit.add_argument(
+        "--ignore-adjustment-for-short-term",
+        action="store_true",
+        help="Allow RAW_FALLBACK for short-term research while capping confidence below HIGH_CONFIDENCE",
+    )
+    data_audit.add_argument("--throttle", type=float, default=0.15)
+
+    daily_run_parser = subparsers.add_parser("daily-run", help="Run local daily data, screen, confirm, and report flow")
+    daily_run_parser.add_argument("--as-of", required=True)
+    daily_run_parser.add_argument("--throttle", type=float, default=0.15)
+    daily_run_parser.add_argument("--fast", action="store_true", help="Fast mode: prices + screening + report only, skip slow event fetching")
+
+    daily_events_parser = subparsers.add_parser("daily-events", help="Fetch events, re-screen with fresh data, and update report")
+    daily_events_parser.add_argument("--as-of", required=True)
+    daily_events_parser.add_argument("--throttle", type=float, default=0.15)
+
+    data_backfill = subparsers.add_parser("data-backfill", help="Backfill local A-share daily bars in batches")
+    data_backfill.add_argument("--start", required=True)
+    data_backfill.add_argument("--end", required=True)
+    data_backfill.add_argument("--markets", default="CN_A")
+    data_backfill.add_argument("--batch-days", type=int, default=20)
+    data_backfill.add_argument("--throttle", type=float, default=0.15)
+    data_backfill.add_argument(
+        "--adjust",
+        choices=("none", "qfq"),
+        default="qfq",
+        help="Daily adjustment mode for fetched A-share stock bars; default uses forward-adjusted (qfq) prices",
     )
     fetch_prices.add_argument(
         "--adjust",
@@ -163,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--intraday-period", choices=["1", "5", "15", "30", "60"], default="5")
     replay.add_argument("--intraday-throttle", type=float, default=0.15)
     replay.add_argument("--require-adjusted", action="store_true", help="Exclude CN_A evaluations without adjusted prices")
-    replay.add_argument("--benchmark", default="000300.SS", help="Benchmark ticker for CN_A alpha calculations")
+    replay.add_argument("--benchmark", default="auto", help="Benchmark ticker or auto for CN_A layered benchmarks")
 
     tune_weights = subparsers.add_parser("tune-weights", help="Suggest or apply strategy weight changes from replay")
     tune_weights.add_argument("--start", required=True, help="Replay start date")
@@ -206,14 +268,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     portfolio.add_argument("--cooldown-days", type=int, default=10)
     portfolio.add_argument("--execution", choices=("intraday", "daily"), default="intraday")
-    portfolio.add_argument("--benchmark", default="000300.SS", help="Benchmark ticker for CN_A alpha calculations")
+    portfolio.add_argument("--benchmark", default="auto", help="Benchmark ticker or auto for CN_A layered benchmarks")
     portfolio.add_argument("--require-intraday", action="store_true", help="Exclude orders that lack intraday VWAP entry data")
+    portfolio.add_argument("--drawdown-reduce-threshold", type=float, default=10.0)
+    portfolio.add_argument("--drawdown-halt-threshold", type=float, default=20.0)
+    portfolio.add_argument("--max-per-sector", type=int, default=2)
+    portfolio.add_argument("--sizing-mode", choices=("equal", "risk-parity"), default="equal")
+    portfolio.add_argument("--risk-budget-pct", type=float, default=2.0)
+    portfolio.add_argument("--max-position-pct", type=float, default=25.0)
     portfolio.add_argument("--out", help="Output markdown path")
 
     walk_forward = subparsers.add_parser("walk-forward", help="Walk-forward sanity check and readiness report")
     walk_forward.add_argument("--start", required=True)
     walk_forward.add_argument("--end", required=True)
     walk_forward.add_argument("--out", help="Output markdown path")
+
+    loss_review = subparsers.add_parser("loss-review", help="Review losing samples and tag recurring failure modes")
+    loss_review.add_argument("--start", required=True)
+    loss_review.add_argument("--end", required=True)
+    loss_review.add_argument("--through", required=True)
+    loss_review.add_argument("--out", help="Output markdown path")
 
     return parser
 
@@ -286,7 +360,7 @@ def command_fetch_prices(
             and (market_filter is None or "CN_A" in market_filter)
         )
         if should_include_cn_a_benchmark:
-            instruments.extend(CN_A_BENCHMARK_INSTRUMENTS)
+            instruments.extend(CN_A_BENCHMARKS)
         instruments = list({(item.market, item.ticker): item for item in instruments}.values())
         if not instruments:
             print("No active instruments matched the requested filters.")
@@ -308,6 +382,215 @@ def command_fetch_prices(
         print("Fetch errors:")
         for error in errors:
             print(f"- {error}")
+
+
+def command_data_update(
+    db_path: str,
+    as_of: str,
+    markets: str,
+    throttle: float,
+    adjust: str,
+    skip_events: bool,
+    skip_intraday: bool,
+    repair_coverage: bool,
+    repair_scope: str,
+) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = data_update(
+            conn,
+            as_of,
+            markets,
+            throttle_seconds=throttle,
+            fetch_events=not skip_events,
+            fetch_intraday=not skip_intraday,
+            repair_coverage=repair_coverage,
+            repair_scope=repair_scope,
+            adjust=None if adjust == "none" else adjust,
+        )
+    print(
+        f"Data update #{result.run_id}: status={result.status}, range={result.start_date}..{result.end_date}, "
+        f"symbols={result.requested_symbols}, price_bars={result.price_bars}, intraday_bars={result.intraday_bars}, "
+        f"events={result.corporate_events}, financials={result.financial_metrics}, money_flows={result.money_flows}, "
+        f"errors={result.error_count}"
+    )
+
+
+def command_data_audit(
+    db_path: str,
+    start: str,
+    end: str,
+    markets: str,
+    probe_adjustment: bool,
+    probe_sample_size: int,
+    ignore_adjustment_for_short_term: bool,
+    throttle: float,
+) -> None:
+    selected = _split_csv(markets) or {"CN_A"}
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        for market in sorted(selected):
+            result = audit_data_coverage(
+                conn,
+                start,
+                end,
+                market,
+                write=True,
+                ignore_adjustment_for_short_term=ignore_adjustment_for_short_term,
+            )
+            print(f"Data audit {market} {start}..{end}: confidence={result.confidence_level}")
+            print(f"- latest_price_date={result.latest_price_date}, trading_days={result.trading_days}")
+            print(f"- price_bars={result.price_bar_count}, adjusted={result.adjusted_bar_count} ({result.adjustment_coverage_pct:.1f}%)")
+            print(f"- layered_benchmark_coverage={result.benchmark_coverage_pct:.1f}%, events={result.event_count}, financials={result.financial_count}, intraday_symbols={result.intraday_symbol_count}")
+            print(f"- allow_formal_daily={'yes' if result.allow_formal_daily else 'no'}")
+            if result.missing_dates:
+                print(f"- missing_dates={', '.join(result.missing_dates[:10])}")
+            for note in result.notes:
+                print(f"- NOTE: {note}")
+            if probe_adjustment and market == "CN_A":
+                probe = probe_adjustment_sources(
+                    conn,
+                    start,
+                    end,
+                    market,
+                    sample_size=probe_sample_size,
+                    throttle_seconds=throttle,
+                )
+                print(
+                    f"- adjustment_probe: samples={probe.sample_count}, success={probe.success_count}, "
+                    f"partial={probe.partial_count}, failed={probe.failed_count}, "
+                    f"success_rate={probe.success_rate_pct:.1f}%"
+                )
+                for sample in probe.samples:
+                    detail = f" error={sample.error}" if sample.error else ""
+                    print(
+                        f"  - {sample.ticker}: {sample.status}, adjusted_rows={sample.adjusted_rows}, "
+                        f"raw_rows={sample.raw_rows}{detail}"
+                    )
+
+
+def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = False) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        update = data_update(
+            conn, as_of, "CN_A",
+            throttle_seconds=throttle,
+            adjust=None if fast else "qfq",
+            fetch_events=not fast,
+            fetch_intraday=not fast,
+            price_mode="full",
+        )
+        audit = audit_data_coverage(
+            conn,
+            as_of,
+            as_of,
+            "CN_A",
+            write=True,
+            ignore_adjustment_for_short_term=True,
+        )
+        candidate_count = screen_all(conn, as_of)
+        confirmed = confirm_candidates(conn, as_of)
+        report_path = write_daily_plan(conn, as_of)
+        start = (parse_date(as_of) - timedelta(days=20)).isoformat()
+        portfolio = run_portfolio_backtest(conn, start, as_of, as_of, benchmark_ticker="auto")
+        portfolio_path = write_portfolio_report(portfolio, Path("reports") / f"portfolio_backtest_latest_{as_of}.md")
+    phase_label = "fast" if fast else "full"
+    print(
+        f"Daily run ({phase_label}) {as_of}: update={update.status}, confidence={audit.confidence_level}, "
+        f"candidates={candidate_count}, confirmed={confirmed[0]}, cancelled={confirmed[1]}, "
+        f"daily_plan={report_path}, portfolio={portfolio_path}"
+    )
+
+
+def command_daily_events(db_path: str, as_of: str, throttle: float) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        update = data_update(
+            conn, as_of, "CN_A",
+            throttle_seconds=throttle,
+            adjust="qfq",
+            fetch_events=True,
+            fetch_intraday=True,
+        )
+        candidate_count = screen_all(conn, as_of)
+        confirmed = confirm_candidates(conn, as_of)
+        report_path = write_daily_plan(conn, as_of)
+        start = (parse_date(as_of) - timedelta(days=20)).isoformat()
+        portfolio = run_portfolio_backtest(conn, start, as_of, as_of, benchmark_ticker="auto")
+        portfolio_path = write_portfolio_report(portfolio, Path("reports") / f"portfolio_backtest_latest_{as_of}.md")
+    print(
+        f"Daily events {as_of}: update={update.status}, candidates={candidate_count}, "
+        f"confirmed={confirmed[0]}, cancelled={confirmed[1]}, "
+        f"daily_plan={report_path}, portfolio={portfolio_path}"
+    )
+
+
+def command_data_backfill(
+    db_path: str,
+    start: str,
+    end: str,
+    markets: str,
+    batch_days: int,
+    throttle: float,
+    adjust: str,
+) -> None:
+    selected = _split_csv(markets) or {"CN_A"}
+    if selected != {"CN_A"}:
+        raise SystemExit("data-backfill v1 only supports CN_A")
+    start_day = parse_date(start)
+    end_day = parse_date(end)
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        instruments = []
+        instruments.extend(read_universe(DEFAULT_UNIVERSE_PATH, markets={"CN_A"}))
+        instruments.extend(read_db_instruments(conn, markets={"CN_A"}))
+        instruments.extend(CN_A_BENCHMARKS)
+        instruments = list({(item.market, item.ticker): item for item in instruments}.values())
+        upsert_many(conn, "instruments", [item.as_row() for item in instruments], ("market", "ticker"))
+        cursor = start_day
+        total_bars = 0
+        total_errors = 0
+        while cursor <= end_day:
+            batch_end = min(cursor + timedelta(days=max(batch_days - 1, 0)), end_day)
+            run = conn.execute(
+                """
+                INSERT INTO data_fetch_runs (run_type, market, start_date, end_date, status, requested_symbols, started_at)
+                VALUES ('data-backfill', 'CN_A', ?, ?, 'RUNNING', ?, datetime('now'))
+                """,
+                (cursor.isoformat(), batch_end.isoformat(), len(instruments)),
+            )
+            run_id = int(run.lastrowid)
+            bars, errors = fetch_bars(
+                instruments,
+                cursor,
+                batch_end,
+                throttle_seconds=throttle,
+                adjust=None if adjust == "none" else adjust,
+            )
+            count = upsert_many(conn, "price_bars", bars, ("market", "ticker", "date"))
+            total_bars += count
+            total_errors += len(errors)
+            for error in errors:
+                conn.execute(
+                    """
+                    INSERT INTO data_fetch_errors (run_id, market, ticker, source, error_message, created_at)
+                    VALUES (?, 'CN_A', ?, 'price_bars', ?, datetime('now'))
+                    """,
+                    (run_id, error.split(" ", 1)[0], error),
+                )
+            status = "SUCCESS" if not errors else ("PARTIAL_SUCCESS" if count else "FAILED")
+            conn.execute(
+                """
+                UPDATE data_fetch_runs
+                SET status = ?, price_bars = ?, error_count = ?, finished_at = datetime('now')
+                WHERE id = ?
+                """,
+                (status, count, len(errors), run_id),
+            )
+            conn.commit()
+            print(f"Backfill batch {cursor.isoformat()}..{batch_end.isoformat()}: status={status}, bars={count}, errors={len(errors)}")
+            cursor = batch_end + timedelta(days=1)
+    print(f"Backfill complete: bars={total_bars}, errors={total_errors}")
 
 
 def command_fetch_intraday(
@@ -605,7 +888,10 @@ def command_walk_forward(db_path: str, start: str, end: str, out: str | None) ->
 def command_portfolio_backtest(
     db_path: str, start: str, end: str, through: str,
     max_positions: int, capital: float, cost_bps: int | None, cooldown_days: int,
-    execution: str, benchmark: str | None, require_intraday: bool, out: str | None,
+    execution: str, benchmark: str | None, require_intraday: bool,
+    drawdown_reduce_threshold: float, drawdown_halt_threshold: float,
+    max_per_sector: int, sizing_mode: str, risk_budget_pct: float,
+    max_position_pct: float, out: str | None,
 ) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
@@ -618,6 +904,12 @@ def command_portfolio_backtest(
             execution_mode=execution,
             benchmark_ticker=benchmark,
             require_intraday=require_intraday,
+            drawdown_reduce_threshold=drawdown_reduce_threshold,
+            drawdown_halt_threshold=drawdown_halt_threshold,
+            max_per_sector=max_per_sector,
+            sizing_mode=sizing_mode.replace("-", "_"),
+            risk_budget_pct=risk_budget_pct,
+            max_position_pct=max_position_pct,
         )
         path = write_portfolio_report(result, Path(out) if out else None)
     print(
@@ -650,6 +942,35 @@ def main(argv: list[str] | None = None) -> int:
             args.include_benchmarks,
             args.adjust,
         )
+    elif args.command == "data-update":
+        command_data_update(
+            args.db,
+            args.as_of,
+            args.markets,
+            args.throttle,
+            args.adjust,
+            args.skip_events,
+            args.skip_intraday,
+            args.repair_coverage,
+            args.repair_scope,
+        )
+    elif args.command == "data-audit":
+        command_data_audit(
+            args.db,
+            args.start,
+            args.end,
+            args.markets,
+            args.probe_adjustment,
+            args.probe_sample_size,
+            args.ignore_adjustment_for_short_term,
+            args.throttle,
+        )
+    elif args.command == "daily-run":
+        command_daily_run(args.db, args.as_of, args.throttle, fast=args.fast)
+    elif args.command == "daily-events":
+        command_daily_events(args.db, args.as_of, args.throttle)
+    elif args.command == "data-backfill":
+        command_data_backfill(args.db, args.start, args.end, args.markets, args.batch_days, args.throttle, args.adjust)
     elif args.command == "fetch-intraday":
         command_fetch_intraday(
             args.db,
@@ -708,10 +1029,18 @@ def main(argv: list[str] | None = None) -> int:
         command_portfolio_backtest(
             args.db, args.start, args.end, args.through,
             args.max_positions, args.capital, args.cost_bps, args.cooldown_days,
-            args.execution, args.benchmark, args.require_intraday, args.out,
+            args.execution, args.benchmark, args.require_intraday,
+            args.drawdown_reduce_threshold, args.drawdown_halt_threshold,
+            args.max_per_sector, args.sizing_mode, args.risk_budget_pct,
+            args.max_position_pct, args.out,
         )
     elif args.command == "walk-forward":
         command_walk_forward(args.db, args.start, args.end, args.out)
+    elif args.command == "loss-review":
+        with closing(connect(args.db)) as conn:
+            init_db(conn)
+            path = write_loss_review(conn, args.start, args.end, args.through, Path(args.out) if args.out else None)
+        print(f"Wrote loss review: {path}")
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

@@ -424,6 +424,7 @@ def _candidate_future_bars(
     candidate: sqlite3.Row,
     through_date: str,
 ) -> list[sqlite3.Row]:
+    start_date = candidate["confirmation_date"] or candidate["as_of_date"]
     return conn.execute(
         """
         SELECT *
@@ -431,7 +432,7 @@ def _candidate_future_bars(
         WHERE market = ? AND ticker = ? AND date > ? AND date <= ?
         ORDER BY date
         """,
-        (candidate["market"], candidate["ticker"], candidate["as_of_date"], through_date),
+        (candidate["market"], candidate["ticker"], start_date, through_date),
     ).fetchall()
 
 

@@ -101,21 +101,21 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
                 ELSE 0
             END AS data_is_fresh,
             CASE
-                WHEN (c.action = 'BUY_CANDIDATE'
-                       OR COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
-                       OR c.status = 'CONFIRMED')
+                WHEN c.data_date IS NOT NULL AND c.data_date != ''
+                     AND c.market = 'CN_A'
+                     AND c.data_date = ?
+                     AND (c.action = 'BUY_CANDIDATE'
+                          OR COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
+                          OR c.status = 'CONFIRMED')
                      AND c.candidate_score >= 78
                      AND COALESCE(c.confirmation_status, 'PENDING') != 'CANCELLED'
                      AND COALESCE(c.reward_risk_ratio, 0) >= 1.5
-                     AND (
-                         (COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED' AND c.confirmation_date = ?)
-                         OR (
-                                 c.data_date IS NOT NULL AND c.data_date != ''
-                             AND c.market = 'CN_A'
-                             AND c.data_date = ?
-                         )
-                     )
-                THEN '今日可买'
+                THEN '今日新信号'
+                WHEN COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
+                     AND c.confirmation_date = ?
+                     AND c.candidate_score >= 78
+                     AND COALESCE(c.reward_risk_ratio, 0) >= 1.5
+                THEN '今日确认'
                 WHEN c.candidate_score >= 82
                      AND COALESCE(c.confirmation_status, 'PENDING') != 'CANCELLED'
                      AND COALESCE(c.reward_risk_ratio, 0) >= 1.5
@@ -229,16 +229,17 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append("暂无可操作候选。")
         return "\n".join(lines).rstrip() + "\n"
 
-    actionable = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日可买"]
+    fresh = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日新信号"]
+    confirmed_today = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日确认"]
     confirmation = [r for r in rows if r["plan_bucket"] in ("重点等确认", "等确认")]
     observation = [r for r in rows if r["plan_bucket"] == "观察"]
 
-    if actionable:
-        lines.append(f"## 可操作买入清单（最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
+    if fresh:
+        lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场 | 禁追价 | 止损 | 目标1 | 风报比 | 最晚退出 | 失效条件 |")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场参考 | 禁追价 | 止损 | 目标1 | 风报比 | 最晚退出 | 失效条件 |")
         lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
-        for row in actionable[:MAX_ACTIONABLE_CANDIDATES]:
+        for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             entry = float(row["entry_price"] or 0.0)
             position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
@@ -251,6 +252,33 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 f"{fmt_price(row['entry_price'])} | {fmt_price(entry * 1.03)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
                 f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"
+            )
+        lines.append("")
+
+    if confirmed_today:
+        lines.append(f"## 今日确认信号（往日信号 + {as_of_date} 确认，执行价以确认日次日为准）")
+        lines.append("")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 信号日 | 信号收盘 | 确认日收盘 | 止损 | 目标1 | 风报比 | 失效条件 |")
+        lines.append("|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---|")
+        for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
+            stop = float(row["stop_loss"] or 0.0)
+            signal_date = str(row["as_of_date"])
+            signal_close = float(row["entry_price"] or 0.0)
+            # Get confirmation day's close
+            confirm_close_row = conn.execute(
+                "SELECT close FROM price_bars WHERE market=? AND ticker=? AND date=?",
+                (row["market"], row["ticker"], as_of_date),
+            ).fetchone()
+            confirm_close = float(confirm_close_row[0]) if confirm_close_row else None
+            confirm_display = fmt_price(confirm_close) if confirm_close else "-"
+            invalid = f"跌破 {fmt_price(stop)} 放弃"
+            lines.append(
+                "| "
+                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
+                f"{signal_date} | {fmt_price(signal_close)} | {confirm_display} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{float(row['reward_risk']):.2f} | {invalid} |"
             )
         lines.append("")
 

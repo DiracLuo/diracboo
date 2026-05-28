@@ -943,7 +943,9 @@ def screen_trend_breakout(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                     "强趋势策略容易拥挤；单日涨幅过大时不追高，优先等待回踩或次日不破突破位确认。"
                     "若跌回突破位或成交量无法延续，应快速降级。"
                 ),
-                evidence=[{"type": "price_action", "title": "20日突破与放量确认", "url": None}],
+                evidence=[{"type": "price_action", "title": "20日突破与放量确认", "url": None},
+                          {"type": "breakout_reference", "breakout_volume": float(bar["volume"]),
+                           "breakout_close": close, "avg_volume_10d": _volume_average(recent_10)}],
                 data_date=str(bar["date"]),
                 trailing_stop_pct=3.0,
                 trailing_activation_pct=8.0,
@@ -1185,9 +1187,12 @@ def confirm_candidates(conn: sqlite3.Connection, as_of_date: str) -> tuple[int, 
             reasons.append(f"次日最低{low:.2f}跌破止损{stop:.2f}")
 
         if confirmed_ok:
+            target_1 = float(candidate["target_1"]) if candidate["target_1"] else 0.0
+            actual_rrr = (target_1 - close) / (close - stop) if stop and close > stop else 0.0
             conn.execute(
-                "UPDATE candidates SET status = 'CONFIRMED', confirmation_status = 'CONFIRMED', confirmation_date = ?, confirmation_reason = ? WHERE id = ?",
-                (next_date, "次日价格承接、未缩量、未破止损", int(candidate["id"])),
+                "UPDATE candidates SET status = 'CONFIRMED', confirmation_status = 'CONFIRMED', "
+                "confirmation_date = ?, confirmation_reason = ?, entry_price = ?, reward_risk_ratio = ? WHERE id = ?",
+                (next_date, "次日价格承接、未缩量、未破止损", close, round(actual_rrr, 2), int(candidate["id"])),
             )
             confirmed += 1
         else:
@@ -1200,3 +1205,140 @@ def confirm_candidates(conn: sqlite3.Connection, as_of_date: str) -> tuple[int, 
 
     conn.commit()
     return confirmed, cancelled
+
+
+def _count_trading_days(conn: sqlite3.Connection, market: str, ticker: str, start_date: str, end_date: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT date) as cnt FROM price_bars WHERE market=? AND ticker=? AND date > ? AND date <= ?",
+        (market, ticker, start_date, end_date),
+    ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def _extract_breakout_volume(evidence_json: str) -> float | None:
+    try:
+        import json
+        evidence = json.loads(evidence_json)
+        for item in evidence:
+            if item.get("type") == "breakout_reference":
+                return float(item.get("breakout_volume", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _bars_for_candidate(conn: sqlite3.Connection, candidate: sqlite3.Row, as_of_date: str) -> list[sqlite3.Row]:
+    data_date = str(candidate["data_date"] or candidate["as_of_date"])
+    return conn.execute(
+        "SELECT date, open, close, high, low, volume FROM price_bars "
+        "WHERE market=? AND ticker=? AND date > ? AND date <= ? ORDER BY date",
+        (str(candidate["market"]), str(candidate["ticker"]), data_date, as_of_date),
+    ).fetchall()
+
+
+def confirm_pullback_candidates(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    *,
+    pullback_min_pct: float = 5.0,
+    pullback_max_pct: float = 10.0,
+    volume_shrink_ratio: float = 0.50,
+    window_days: int = 10,
+) -> tuple[int, int, int]:
+    pending = conn.execute(
+        """
+        SELECT c.* FROM candidates c
+        JOIN strategies st ON st.id = c.strategy_id
+        WHERE c.action = 'WATCH_PULLBACK'
+          AND COALESCE(c.confirmation_status, 'PENDING') = 'PENDING'
+          AND c.status = 'WATCHLIST'
+          AND st.status != 'RETIRED'
+        """,
+    ).fetchall()
+
+    confirmed = 0
+    cancelled = 0
+    waiting = 0
+
+    for candidate in pending:
+        data_date = str(candidate["data_date"] or candidate["as_of_date"])
+        entry_price = float(candidate["entry_price"])
+        stop_loss = float(candidate["stop_loss"]) if candidate["stop_loss"] else 0.0
+        breakout_volume = _extract_breakout_volume(str(candidate["evidence_json"]))
+
+        days_since = _count_trading_days(
+            conn, str(candidate["market"]), str(candidate["ticker"]),
+            data_date, as_of_date,
+        )
+
+        if days_since > window_days:
+            conn.execute(
+                "UPDATE candidates SET status='CANCELLED', confirmation_status='CANCELLED', "
+                "confirmation_date=?, confirmation_reason=? WHERE id=?",
+                (as_of_date, f"回调确认超时：{days_since}个交易日未满足三日确认形态", int(candidate["id"])),
+            )
+            cancelled += 1
+            continue
+
+        bars = _bars_for_candidate(conn, candidate, as_of_date)
+        if len(bars) < 3:
+            waiting += 1
+            continue
+
+        found = False
+        for i in range(len(bars) - 2):
+            day_t = bars[i]
+            day_t1 = bars[i + 1]
+            day_t2 = bars[i + 2]
+
+            t_close = float(day_t["close"])
+            t_low = float(day_t["low"])
+            t_volume = float(day_t["volume"] or 0)
+            t1_open = float(day_t1["open"])
+            t1_close = float(day_t1["close"])
+            t1_low = float(day_t1["low"])
+            t1_high = float(day_t1["high"])
+            t2_close = float(day_t2["close"])
+
+            pullback_pct = (entry_price - t_close) / entry_price * 100.0 if entry_price > 0 else 0.0
+            if not (pullback_min_pct <= pullback_pct <= pullback_max_pct):
+                continue
+
+            if breakout_volume and breakout_volume > 0:
+                if t_volume >= breakout_volume * volume_shrink_ratio:
+                    continue
+
+            if stop_loss > 0 and t_low <= stop_loss:
+                continue
+
+            if day_t1["low"] < day_t["low"]:
+                continue
+            if t1_close < t1_open:
+                continue
+
+            if t2_close <= t1_close:
+                continue
+
+            confirm_date = str(day_t2["date"])
+            target_1 = float(candidate["target_1"]) if candidate["target_1"] else 0.0
+            actual_rrr = (target_1 - t2_close) / (t2_close - stop_loss) if stop_loss > 0 and t2_close > stop_loss else 0.0
+            conn.execute(
+                "UPDATE candidates SET action='BUY_CANDIDATE', confirmation_status='CONFIRMED', "
+                "confirmation_date=?, confirmation_reason=?, entry_price=?, reward_risk_ratio=? WHERE id=?",
+                (
+                    confirm_date,
+                    f"三日确认：T日回调{pullback_pct:.1f}%缩量，T+1企稳不创新低，T+2回升收盘{t2_close:.2f}>{t1_close:.2f}",
+                    t2_close,
+                    round(actual_rrr, 2),
+                    int(candidate["id"]),
+                ),
+            )
+            confirmed += 1
+            found = True
+            break
+
+        if not found:
+            waiting += 1
+
+    conn.commit()
+    return confirmed, cancelled, waiting

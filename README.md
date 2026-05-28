@@ -16,9 +16,10 @@ Alpha Ledger 是一个以盈利验证为中心的股票策略账本。它的主�
 - `candidates`：策略筛选出的候选池，是当前项目的主账本。
 - `candidate_evaluations`：截至某日的后验验证。
 - `candidate_horizon_evaluations`：固定 T+5 / T+10 / T+20 / T+60 周期验证。
-- `daily-plan`：当天可操作清单，只展示确认后更接近可交易的候选。
+- `daily-plan`：当天可操作清单，分为"今日新信号"（当天数据筛选）、"今日确认"（往日信号+当天确认）、"等确认"和"观察池"。
 - `replay`：历史日期逐日筛选并用未来行情验证。
-- `portfolio-backtest`：组合层面回测，控制仓位、持仓冷却和交易成本。
+- `portfolio-backtest`：组合层面回测，控制仓位、持仓冷却和交易成本。确认类候选跳过 RRR 过滤。
+- `validate`：统计验证，含 Monte Carlo 置换检验、Bootstrap Sharpe 置信区间、Walk-Forward 窗口分析。
 - `walk-forward`：检查当前样本是否足够做正式滚动验证；样本不足时只输出 `INSUFFICIENT_HISTORY`。
 - `data-update` / `data-audit`：维护本地 A 股增量数据仓库，并审计数据是否足以支持正式结论。
 - `loss-review`：复盘亏损样本，把失败模式转成后续过滤器。
@@ -37,8 +38,9 @@ A 股回放优先使用 5 分钟线：
 
 日报时间点：
 
-- `daily-plan --as-of` 表示数据截止日，不是自然日今天。
-- 若 `as_of` 晚于 `price_bars` 最新行情日，日报标记 `STALE_DATA`，不生成“今日可买”。
+- `daily-run --as-of` 表示数据截止日，收盘后运行。数据拉取、筛选、确认、报告均基于截止日数据。
+- 日报候选分四类：”今日新信号”（当天筛选的 BUY_CANDIDATE）、”今日确认”（往日信号当天确认）、”等确认”（高分待确认）、”观察池”。
+- 若 `as_of` 晚于 `price_bars` 最新行情日，日报标记 `STALE_DATA`，不生成可操作清单。
 - 若数据审计不是 `HIGH_CONFIDENCE`，日报只展示观察/确认候选，不输出强买入结论。
 - A 股审计优先用沪深300行情日作为交易日历，避免把春节、五一等休市日误判为缺口。
 
@@ -121,12 +123,13 @@ python -m alpha_ledger replay \
   --fetch-cn-a-intraday
 ```
 
-验证评分、审计策略、组合回测：
+验证评分、审计策略、组合回测、统计验证：
 
 ```bash
 python -m alpha_ledger score-calibration --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
 python -m alpha_ledger audit --as-of 2026-05-25
 python -m alpha_ledger portfolio-backtest --start 2026-04-01 --end 2026-05-15 --through 2026-05-25 --benchmark 000300.SS
+python -m alpha_ledger validate --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
 python -m alpha_ledger walk-forward --start 2026-04-01 --end 2026-05-25
 python -m alpha_ledger loss-review --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
 ```
@@ -157,7 +160,36 @@ python -m unittest discover -s tests -v
 - `hk_southbound_recovery`：港股南向资金修复
 - `hk_news_recovery`：港股业绩新闻修复
 
-未实现筛选器的旧设想不进入默认策略库，避免“看起来有策略，实际上没产出”的污染。
+未实现筛选器的旧设想不进入默认策略库，避免”看起来有策略，实际上没产出”的污染。
+
+## 量价因子
+
+`screener.py` 在筛选后调用 `alpha_factors.py` 对候选做跨截面因子排名，调整候选分数（+/-8 分）。当前 6 个因子：
+
+- `breakout_20d`：close / max(close, 20)，越高越接近突破
+- `volume_ratio_10d`：volume / avg(volume, 10)，越高越活跃
+- `momentum_5d`：5 日收益率
+- `momentum_20d`：20 日收益率
+- `volatility_20d`：20 日收益标准差（越低越好）
+- `price_to_ma20`：close / MA(20)，越高越强势
+
+## 回调确认机制
+
+`trend_breakout` 筛选出涨幅 >=8.5% 的强势股时，标记为 `WATCH_PULLBACK`（暂缓买入）。回调确认机制通过三日形态判断是否可以买入：
+
+1. **回调日（Day T）**：价格回调 5-10%，成交量 < 突破日 50%
+2. **企稳日（Day T+1）**：不破 T 日最低价，收阳线
+3. **反转日（Day T+2）**：收盘 > T+1 日收盘
+
+三日形态全部满足后，候选升级为 `BUY_CANDIDATE`，entry_price 更新为确认日收盘价。
+
+## 统计验证
+
+`validate` 命令对组合回测结果做三项独立检验：
+
+- **Monte Carlo 置换检验**：打乱交易顺序 1000 次，检验 Sharpe 和最大回撤是否显著优于随机
+- **Bootstrap Sharpe 置信区间**：重采样日收益 1000 次，估计 Sharpe 的 95% CI
+- **Walk-Forward 窗口分析**：将权益曲线切分为 5 个窗口，计算一致性和跨窗口 Sharpe
 
 ## 数据和输出
 

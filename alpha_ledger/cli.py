@@ -31,7 +31,7 @@ from .portfolio_backtest import run_portfolio_backtest, write_portfolio_report
 from .replay import replay_candidates
 from .validation import write_validation_report
 from .reporting import write_daily_plan, write_replay_report
-from .screener import confirm_candidates, latest_candidates, screen_all
+from .screener import confirm_candidates, confirm_pullback_candidates, latest_candidates, screen_all
 from .seed import seed_all
 from .walk_forward import run_walk_forward, write_walk_forward_report
 
@@ -505,6 +505,7 @@ def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = Fa
         )
         candidate_count = screen_all(conn, as_of)
         confirmed = confirm_candidates(conn, as_of)
+        confirmed_pb = confirm_pullback_candidates(conn, as_of)
         report_path = write_daily_plan(conn, as_of)
         start = (parse_date(as_of) - timedelta(days=20)).isoformat()
         portfolio = run_portfolio_backtest(conn, start, as_of, as_of, benchmark_ticker="auto")
@@ -530,6 +531,7 @@ def command_daily_events(db_path: str, as_of: str, throttle: float) -> None:
         )
         candidate_count = screen_all(conn, as_of)
         confirmed = confirm_candidates(conn, as_of)
+        confirmed_pb = confirm_pullback_candidates(conn, as_of)
         report_path = write_daily_plan(conn, as_of)
         start = (parse_date(as_of) - timedelta(days=20)).isoformat()
         portfolio = run_portfolio_backtest(conn, start, as_of, as_of, benchmark_ticker="auto")
@@ -853,7 +855,9 @@ def command_confirm_candidates(db_path: str, as_of: str) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
         confirmed, cancelled = confirm_candidates(conn, as_of)
+        confirmed_pb, cancelled_pb, waiting_pb = confirm_pullback_candidates(conn, as_of)
     print(f"Confirmed {confirmed}, cancelled {cancelled} candidates as of {as_of}.")
+    print(f"Pullback: confirmed {confirmed_pb}, cancelled {cancelled_pb}, waiting {waiting_pb}.")
 
 
 def command_score_calibration(db_path: str, start: str, end: str, through: str, horizon: int) -> None:

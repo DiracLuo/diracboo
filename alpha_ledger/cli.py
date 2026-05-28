@@ -29,6 +29,7 @@ from .metrics import (
 )
 from .portfolio_backtest import run_portfolio_backtest, write_portfolio_report
 from .replay import replay_candidates
+from .validation import write_validation_report
 from .reporting import write_daily_plan, write_replay_report
 from .screener import confirm_candidates, latest_candidates, screen_all
 from .seed import seed_all
@@ -282,6 +283,20 @@ def build_parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--start", required=True)
     walk_forward.add_argument("--end", required=True)
     walk_forward.add_argument("--out", help="Output markdown path")
+
+    validate = subparsers.add_parser("validate", help="Statistical validation of portfolio backtest (Monte Carlo, Bootstrap, Walk-Forward)")
+    validate.add_argument("--start", required=True)
+    validate.add_argument("--end", required=True)
+    validate.add_argument("--through", required=True)
+    validate.add_argument("--max-positions", type=int, default=5)
+    validate.add_argument("--capital", type=float, default=1_000_000)
+    validate.add_argument("--cooldown-days", type=int, default=10)
+    validate.add_argument("--execution", choices=["intraday", "daily"], default="intraday")
+    validate.add_argument("--benchmark", default="auto")
+    validate.add_argument("--mc-permutations", type=int, default=1000, help="Monte Carlo permutation count")
+    validate.add_argument("--bootstrap-samples", type=int, default=1000, help="Bootstrap resample count")
+    validate.add_argument("--wf-windows", type=int, default=5, help="Walk-forward window count")
+    validate.add_argument("--out", help="Output markdown path")
 
     loss_review = subparsers.add_parser("loss-review", help="Review losing samples and tag recurring failure modes")
     loss_review.add_argument("--start", required=True)
@@ -1037,6 +1052,26 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "walk-forward":
         command_walk_forward(args.db, args.start, args.end, args.out)
+    elif args.command == "validate":
+        with closing(connect(args.db)) as conn:
+            init_db(conn)
+            result = run_portfolio_backtest(
+                conn, args.start, args.end, args.through,
+                max_positions=args.max_positions,
+                initial_capital=args.capital,
+                cooldown_days=args.cooldown_days,
+                execution_mode=args.execution,
+                benchmark_ticker=args.benchmark,
+            )
+            from .validation import monte_carlo_permutation, bootstrap_sharpe_ci, walk_forward_windows, render_validation_report
+            mc = monte_carlo_permutation(result, permutations=args.mc_permutations)
+            bs = bootstrap_sharpe_ci(result, samples=args.bootstrap_samples)
+            wf = walk_forward_windows(result, n_windows=args.wf_windows)
+            report = render_validation_report(result, mc, bs, wf)
+            path = Path(args.out) if args.out else Path("reports") / f"validation_{args.start}_{args.end}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(report, encoding="utf-8")
+        print(f"Validation: trades={result.trade_count}, mc_sharpe_p={mc.sharpe_p_value:.4f}, bootstrap_ci=[{bs.ci_lower:.4f}, {bs.ci_upper:.4f}], wf_consistency={wf.consistency_rate:.2%}, report={path}")
     elif args.command == "loss-review":
         with closing(connect(args.db)) as conn:
             init_db(conn)

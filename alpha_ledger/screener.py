@@ -1037,6 +1037,11 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
         + screen_trend_breakout(conn, as_of_date)
         + screen_abnormal_volume(conn, as_of_date)
     )
+    try:
+        from .alpha_factors import adjust_candidate_scores
+        candidates = adjust_candidate_scores(conn, as_of_date, candidates)
+    except Exception:
+        pass  # Factor adjustment is optional; screener works without it
     candidates.sort(key=lambda c: float(c.get("candidate_score", 0)), reverse=True)
     sector_counts: dict[str, int] = {}
     filtered: list[dict[str, object]] = []

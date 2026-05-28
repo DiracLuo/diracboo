@@ -242,8 +242,8 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
-            entry = float(row["entry_price"] or 0.0)
-            bz_low = float(row["buy_zone_low"] or 0.0)
+            sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
+            bz_low = round(sig_close * 0.985, 2)
             position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
             latest_exit = _next_business_day(_next_business_day(_next_business_day(as_of_date)))
             invalid = f"跌破 {fmt_price(stop)} 或高开超过禁追价放弃"
@@ -251,7 +251,7 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {position_pct:.1f}% | "
-                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | {fmt_price(entry * 1.03)} | "
+                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | {fmt_price(sig_close * 1.03)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"
             )
@@ -297,12 +297,13 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             if len(trigger) > 80:
                 trigger = trigger[:77] + "..."
             data_date = row["data_date"] or "-"
-            bz_low = float(row["buy_zone_low"] or 0.0)
+            sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
+            bz_low = round(sig_close * 0.985, 2)
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | "
+                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
             )
@@ -318,12 +319,13 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             if len(trigger) > 80:
                 trigger = trigger[:77] + "..."
             data_date = row["data_date"] or "-"
-            bz_low = float(row["buy_zone_low"] or 0.0)
+            sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
+            bz_low = round(sig_close * 0.985, 2)
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | "
+                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
             )

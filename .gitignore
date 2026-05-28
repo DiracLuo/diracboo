@@ -6,3 +6,4 @@ data/*.sqlite
 reports/*.md
 .DS_Store
 
+data/alpha_ledger.sqlite

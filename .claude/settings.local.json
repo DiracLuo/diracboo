@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python -m pytest tests/test_alpha_ledger.py -v)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m alpha_ledger replay --start 2026-04-01 --end 2026-05-15 --through 2026-05-25)",
+      "Bash(python -m alpha_ledger score-calibration --start 2026-04-01 --end 2026-05-15 --through 2026-05-25)",
+      "Bash(python -m alpha_ledger leaderboard --start 2026-04-01 --end 2026-05-15 --through 2026-05-25)",
+      "Bash(python -c ' *)",
+      "Bash(python -m alpha_ledger fetch-prices --start 2026-05-26 --end 2026-05-27 --markets CN_A)",
+      "Bash(python -m alpha_ledger fetch-events --start 2026-05-26 --end 2026-05-27 --markets CN_A --skip-money-flow)",
+      "Bash(python -m alpha_ledger screen --as-of 2026-05-27)",
+      "Bash(python -m alpha_ledger daily-plan --as-of 2026-05-27)",
+      "Bash(timeout 60 python -m alpha_ledger fetch-events --start 2026-05-26 --end 2026-05-26 --markets CN_A --skip-money-flow)",
+      "Bash(python -m alpha_ledger fetch-events --start 2026-05-26 --end 2026-05-26 --markets CN_A --skip-money-flow)",
+      "Bash(python -m alpha_ledger screen --as-of 2026-05-26)",
+      "Bash(python -m alpha_ledger daily-plan --as-of 2026-05-26)",
+      "Bash(python -m alpha_ledger fetch-prices --start 2026-05-26 --end 2026-05-26 --markets CN_A)",
+      "Bash(python -m alpha_ledger fetch-prices --start 2026-05-26 --end 2026-05-26 --markets CN_A --source db)",
+      "WebSearch",
+      "Bash(pip install *)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(sqlite3 *)"
+    ]
+  }
+}

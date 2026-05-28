@@ -238,11 +238,12 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if fresh:
         lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场参考 | 禁追价 | 止损 | 目标1 | 风报比 | 最晚退出 | 失效条件 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场参考 | 建议入手 | 禁追价 | 止损 | 目标1 | 目标2 | 风报比 | 最晚退出 | 失效条件 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             entry = float(row["entry_price"] or 0.0)
+            bz_low = float(row["buy_zone_low"] or 0.0)
             position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
             latest_exit = _next_business_day(_next_business_day(_next_business_day(as_of_date)))
             invalid = f"跌破 {fmt_price(stop)} 或高开超过禁追价放弃"
@@ -250,8 +251,8 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {position_pct:.1f}% | "
-                f"{fmt_price(row['entry_price'])} | {fmt_price(entry * 1.03)} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | {fmt_price(entry * 1.03)} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"
             )
         lines.append("")
@@ -259,12 +260,13 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if confirmed_today:
         lines.append(f"## 今日确认信号（往日信号 + {as_of_date} 确认，执行价以确认日次日为准）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 信号日 | 信号收盘 | 确认日收盘 | 止损 | 目标1 | 风报比 | 失效条件 |")
-        lines.append("|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 信号日 | 信号收盘 | 确认日收盘 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 失效条件 |")
+        lines.append("|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
         for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             signal_date = str(row["as_of_date"])
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
+            bz_low = float(row["buy_zone_low"] or 0.0)
             confirm_close_row = conn.execute(
                 "SELECT close FROM price_bars WHERE market=? AND ticker=? AND date=?",
                 (row["market"], row["ticker"], as_of_date),
@@ -276,8 +278,8 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{signal_date} | {fmt_price(sig_close)} | {confirm_display} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{signal_date} | {fmt_price(sig_close)} | {confirm_display} | {fmt_price(bz_low)} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {invalid} |"
             )
         lines.append("")
@@ -288,18 +290,20 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if high_priority:
         lines.append("## 重点等确认（高分 WATCH_PULLBACK，等待回调企稳确认）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 数据日 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in high_priority[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 80:
                 trigger = trigger[:77] + "..."
             data_date = row["data_date"] or "-"
+            bz_low = float(row["buy_zone_low"] or 0.0)
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
+                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
             )
         lines.append("")
@@ -307,18 +311,20 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if normal_confirmation:
         lines.append("## 等确认（WATCH_OR_BUY_ON_CONFIRMATION，等待次日确认）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 数据日 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in normal_confirmation[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 80:
                 trigger = trigger[:77] + "..."
             data_date = row["data_date"] or "-"
+            bz_low = float(row["buy_zone_low"] or 0.0)
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
+                f"{fmt_price(row['entry_price'])} | {fmt_price(bz_low)} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
             )
         lines.append("")

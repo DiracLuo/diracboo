@@ -114,6 +114,7 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
                 WHEN COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
                      AND c.confirmation_date = ?
                      AND c.candidate_score >= 78
+                     AND COALESCE(c.reward_risk_ratio, 0) >= 1.0
                 THEN '今日确认'
                 WHEN c.candidate_score >= 82
                      AND COALESCE(c.confirmation_status, 'PENDING') != 'CANCELLED'
@@ -165,7 +166,7 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
         SELECT *
         FROM planned
         WHERE rn = 1
-          AND (reward_risk >= 1.0 OR plan_bucket = '今日确认')
+          AND reward_risk >= 1.0
         ORDER BY
             CASE plan_bucket
                 WHEN '今日新信号' THEN 1

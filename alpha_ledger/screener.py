@@ -1187,12 +1187,22 @@ def confirm_candidates(conn: sqlite3.Connection, as_of_date: str) -> tuple[int, 
             reasons.append(f"次日最低{low:.2f}跌破止损{stop:.2f}")
 
         if confirmed_ok:
-            target_1 = float(candidate["target_1"]) if candidate["target_1"] else 0.0
-            actual_rrr = (target_1 - close) / (close - stop) if stop and close > stop else 0.0
+            original_entry = float(candidate["entry_price"])
+            scale = close / original_entry if original_entry > 0 else 1.0
+            new_stop = round(float(candidate["stop_loss"]) * scale, 2) if candidate["stop_loss"] else None
+            new_target_1 = round(float(candidate["target_1"]) * scale, 2) if candidate["target_1"] else None
+            new_target_2 = round(float(candidate["target_2"]) * scale, 2) if candidate["target_2"] else None
+            new_bz_low = round(close * 0.985, 2)
+            new_bz_high = round(close * 1.015, 2)
+            new_rrr = (new_target_1 - close) / (close - new_stop) if new_stop and close > new_stop and new_target_1 else 0.0
             conn.execute(
                 "UPDATE candidates SET status = 'CONFIRMED', confirmation_status = 'CONFIRMED', "
-                "confirmation_date = ?, confirmation_reason = ?, entry_price = ?, reward_risk_ratio = ? WHERE id = ?",
-                (next_date, "次日价格承接、未缩量、未破止损", close, round(actual_rrr, 2), int(candidate["id"])),
+                "confirmation_date = ?, confirmation_reason = ?, entry_price = ?, "
+                "stop_loss = ?, target_1 = ?, target_2 = ?, "
+                "buy_zone_low = ?, buy_zone_high = ?, reward_risk_ratio = ? WHERE id = ?",
+                (next_date, "次日价格承接、未缩量、未破止损", close,
+                 new_stop, new_target_1, new_target_2,
+                 new_bz_low, new_bz_high, round(new_rrr, 2), int(candidate["id"])),
             )
             confirmed += 1
         else:
@@ -1320,16 +1330,24 @@ def confirm_pullback_candidates(
                 continue
 
             confirm_date = str(day_t2["date"])
-            target_1 = float(candidate["target_1"]) if candidate["target_1"] else 0.0
-            actual_rrr = (target_1 - t2_close) / (t2_close - stop_loss) if stop_loss > 0 and t2_close > stop_loss else 0.0
+            original_entry = float(candidate["entry_price"])
+            scale = t2_close / original_entry if original_entry > 0 else 1.0
+            new_stop = round(stop_loss * scale, 2) if stop_loss > 0 else None
+            new_target_1 = round(float(candidate["target_1"]) * scale, 2) if candidate["target_1"] else None
+            new_target_2 = round(float(candidate["target_2"]) * scale, 2) if candidate["target_2"] else None
+            new_bz_low = round(t2_close * 0.985, 2)
+            new_bz_high = round(t2_close * 1.015, 2)
+            new_rrr = (new_target_1 - t2_close) / (t2_close - new_stop) if new_stop and t2_close > new_stop and new_target_1 else 0.0
             conn.execute(
                 "UPDATE candidates SET action='BUY_CANDIDATE', confirmation_status='CONFIRMED', "
-                "confirmation_date=?, confirmation_reason=?, entry_price=?, reward_risk_ratio=? WHERE id=?",
+                "confirmation_date=?, confirmation_reason=?, entry_price=?, "
+                "stop_loss=?, target_1=?, target_2=?, "
+                "buy_zone_low=?, buy_zone_high=?, reward_risk_ratio=? WHERE id=?",
                 (
                     confirm_date,
                     f"三日确认：T日回调{pullback_pct:.1f}%缩量，T+1企稳不创新低，T+2回升收盘{t2_close:.2f}>{t1_close:.2f}",
-                    t2_close,
-                    round(actual_rrr, 2),
+                    t2_close, new_stop, new_target_1, new_target_2,
+                    new_bz_low, new_bz_high, round(new_rrr, 2),
                     int(candidate["id"]),
                 ),
             )

@@ -104,11 +104,10 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
                 WHEN c.data_date IS NOT NULL AND c.data_date != ''
                      AND c.market = 'CN_A'
                      AND c.data_date = ?
-                     AND (c.action = 'BUY_CANDIDATE'
-                          OR COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
-                          OR c.status = 'CONFIRMED')
+                     AND c.as_of_date = ?
+                     AND c.action = 'BUY_CANDIDATE'
+                     AND COALESCE(c.confirmation_status, 'PENDING') = 'PENDING'
                      AND c.candidate_score >= 78
-                     AND COALESCE(c.confirmation_status, 'PENDING') != 'CANCELLED'
                      AND COALESCE(c.reward_risk_ratio, 0) >= 1.5
                 THEN '今日新信号'
                 WHEN COALESCE(c.confirmation_status, 'PENDING') = 'CONFIRMED'
@@ -180,6 +179,7 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
             ticker
         """,
         (
+            as_of_date,
             as_of_date,
             as_of_date,
             as_of_date,

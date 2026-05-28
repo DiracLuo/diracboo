@@ -491,6 +491,7 @@ def _candidate(
         "candidate_score": effective_score,
         "action": action,
         "entry_price": close,
+        "signal_close": close,
         "buy_zone_low": round(close * 0.985, 2),
         "buy_zone_high": round(close * 1.015, 2),
         "stop_loss": round(stop_loss, 2),
@@ -1064,16 +1065,17 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                 """
                 INSERT INTO candidates (
                     as_of_date, market, ticker, name, strategy_id, candidate_score,
-                    action, entry_price, buy_zone_low, buy_zone_high, stop_loss,
+                    action, entry_price, signal_close, buy_zone_low, buy_zone_high, stop_loss,
                     target_1, target_2, reward_risk_ratio, trailing_stop_pct, trailing_activation_pct,
                     thesis, trigger_condition, risk_notes,
                     evidence_json, status, confirmation_status, data_date, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(as_of_date, market, ticker, strategy_id) DO UPDATE SET
                     candidate_score=excluded.candidate_score,
                     action=excluded.action,
                     entry_price=excluded.entry_price,
+                    signal_close=excluded.signal_close,
                     buy_zone_low=excluded.buy_zone_low,
                     buy_zone_high=excluded.buy_zone_high,
                     stop_loss=excluded.stop_loss,
@@ -1100,6 +1102,7 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     row["candidate_score"],
                     row["action"],
                     row["entry_price"],
+                    row.get("signal_close", row["entry_price"]),
                     row["buy_zone_low"],
                     row["buy_zone_high"],
                     row["stop_loss"],

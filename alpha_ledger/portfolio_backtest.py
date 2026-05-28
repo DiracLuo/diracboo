@@ -350,10 +350,11 @@ def _select_actionable_candidates(
         key = (row["market"], row["ticker"])
         if key in exclude_tickers:
             continue
-        if row["confirmation_date"] is None:
-            rrr = row["computed_rrr"]
-            if rrr is not None and float(rrr) < 1.5:
-                continue
+        rrr = row["computed_rrr"]
+        if rrr is not None and float(rrr) < 1.0:
+            continue
+        if row["confirmation_date"] is None and rrr is not None and float(rrr) < 1.5:
+            continue
         result.append(row)
         if len(result) >= max_picks:
             break

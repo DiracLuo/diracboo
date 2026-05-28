@@ -264,8 +264,7 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             signal_date = str(row["as_of_date"])
-            signal_close = float(row["entry_price"] or 0.0)
-            # Get confirmation day's close
+            sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             confirm_close_row = conn.execute(
                 "SELECT close FROM price_bars WHERE market=? AND ticker=? AND date=?",
                 (row["market"], row["ticker"], as_of_date),
@@ -277,22 +276,44 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
                 f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{signal_date} | {fmt_price(signal_close)} | {confirm_display} | "
+                f"{signal_date} | {fmt_price(sig_close)} | {confirm_display} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
                 f"{float(row['reward_risk']):.2f} | {invalid} |"
             )
         lines.append("")
 
-    if confirmation:
-        lines.append("## 等确认候选")
+    high_priority = [r for r in confirmation if r["plan_bucket"] == "重点等确认"]
+    normal_confirmation = [r for r in confirmation if r["plan_bucket"] == "等确认"]
+
+    if high_priority:
+        lines.append("## 重点等确认（高分 WATCH_PULLBACK，等待回调企稳确认）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
         lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
-        for row in confirmation[:10]:
+        for row in high_priority[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 80:
                 trigger = trigger[:77] + "..."
-            data_date = row["confirmation_date"] or row["data_date"] or "-"
+            data_date = row["data_date"] or "-"
+            lines.append(
+                "| "
+                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {fmt_price(row['entry_price'])} | "
+                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | "
+                f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
+            )
+        lines.append("")
+
+    if normal_confirmation:
+        lines.append("## 等确认（WATCH_OR_BUY_ON_CONFIRMATION，等待次日确认）")
+        lines.append("")
+        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 止损 | 目标1 | 风报比 | 数据日 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+        for row in normal_confirmation[:10]:
+            trigger = str(row["trigger_condition"]).replace("|", "/")
+            if len(trigger) > 80:
+                trigger = trigger[:77] + "..."
+            data_date = row["data_date"] or "-"
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "

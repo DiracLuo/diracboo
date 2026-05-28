@@ -252,6 +252,7 @@ SCHEMA_STATEMENTS = [
         candidate_score REAL NOT NULL,
         action TEXT NOT NULL,
         entry_price REAL NOT NULL,
+        signal_close REAL,
         buy_zone_low REAL,
         buy_zone_high REAL,
         stop_loss REAL,
@@ -703,6 +704,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "candidates", "confirmation_date", "TEXT")
         _add_column_if_missing(conn, "candidates", "confirmation_reason", "TEXT")
         _add_column_if_missing(conn, "candidates", "data_date", "TEXT")
+        _add_column_if_missing(conn, "candidates", "signal_close", "REAL")
 
     _backfill_adjusted_prices(conn)
     _backfill_net_returns(conn)

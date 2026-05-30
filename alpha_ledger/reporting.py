@@ -238,35 +238,31 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if fresh:
         lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 策略分 | 模型分 | 建议仓位 | 入场参考 | 建议入手 | 禁追价 | 止损 | 目标1 | 目标2 | 风报比 | 最晚退出 | 失效条件 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|")
         for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
-            position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
-            latest_exit = _next_business_day(_next_business_day(_next_business_day(as_of_date)))
-            invalid = f"跌破 {fmt_price(stop)} 或高开超过禁追价放弃"
-            model_pct = row.get("model_percentile")
+            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
             model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
-                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {model_str} | {position_pct:.1f}% | "
-                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | {fmt_price(sig_close * 1.03)} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
-                f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"
+                f"{row['name']} | `{row['ticker']}` | {row['strategy_name']} | "
+                f"{float(row['candidate_score']):.1f} | {model_str} | "
+                f"{fmt_price(bz_low)} | {fmt_price(stop)} | {target_str} | "
+                f"{float(row['reward_risk']):.2f} |"
             )
         lines.append("")
 
     if confirmed_today:
         lines.append(f"## 今日确认信号（往日信号 + {as_of_date} 确认，执行价以确认日次日为准）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 信号日 | 信号收盘 | 确认日收盘 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 失效条件 |")
-        lines.append("|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 确认日收盘 | 建议入手 | 止损 | 目标 | 风报比 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
         for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
-            signal_date = str(row["as_of_date"])
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = float(row["buy_zone_low"] or 0.0)
             confirm_close_row = conn.execute(
@@ -275,14 +271,15 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             ).fetchone()
             confirm_close = float(confirm_close_row[0]) if confirm_close_row else None
             confirm_display = fmt_price(confirm_close) if confirm_close else "-"
-            invalid = f"跌破 {fmt_price(stop)} 放弃"
+            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
+            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
-                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{signal_date} | {fmt_price(sig_close)} | {confirm_display} | {fmt_price(bz_low)} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
-                f"{float(row['reward_risk']):.2f} | {invalid} |"
+                f"{row['name']} | `{row['ticker']}` | {row['strategy_name']} | "
+                f"{float(row['candidate_score']):.1f} | {model_str} | {confirm_display} | "
+                f"{fmt_price(bz_low)} | {fmt_price(stop)} | {target_str} | "
+                f"{float(row['reward_risk']):.2f} |"
             )
         lines.append("")
 
@@ -292,44 +289,46 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if high_priority:
         lines.append("## 重点等确认（高分 WATCH_PULLBACK，等待回调企稳确认）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|")
         for row in high_priority[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
-            if len(trigger) > 80:
-                trigger = trigger[:77] + "..."
-            data_date = row["data_date"] or "-"
+            if len(trigger) > 40:
+                trigger = trigger[:37] + "..."
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
+            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
+            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
-                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
-                f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
+                f"{row['name']} | `{row['ticker']}` | {row['strategy_name']} | "
+                f"{float(row['candidate_score']):.1f} | {model_str} | "
+                f"{fmt_price(bz_low)} | {fmt_price(row['stop_loss'])} | {target_str} | "
+                f"{float(row['reward_risk']):.2f} | {trigger} |"
             )
         lines.append("")
 
     if normal_confirmation:
         lines.append("## 等确认（WATCH_OR_BUY_ON_CONFIRMATION，等待次日确认）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 入场参考 | 建议入手 | 止损 | 目标1 | 目标2 | 风报比 | 数据日 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|")
         for row in normal_confirmation[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
-            if len(trigger) > 80:
-                trigger = trigger[:77] + "..."
-            data_date = row["data_date"] or "-"
+            if len(trigger) > 40:
+                trigger = trigger[:37] + "..."
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
+            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
+            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
-                f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | "
-                f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | "
-                f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
-                f"{float(row['reward_risk']):.2f} | {data_date} | {trigger} |"
+                f"{row['name']} | `{row['ticker']}` | {row['strategy_name']} | "
+                f"{float(row['candidate_score']):.1f} | {model_str} | "
+                f"{fmt_price(bz_low)} | {fmt_price(row['stop_loss'])} | {target_str} | "
+                f"{float(row['reward_risk']):.2f} | {trigger} |"
             )
         lines.append("")
 

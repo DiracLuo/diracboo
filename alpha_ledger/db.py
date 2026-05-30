@@ -598,6 +598,38 @@ def _backfill_adjusted_prices(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _recompute_change_pct_from_adj_close(conn: sqlite3.Connection) -> None:
+    """Recompute change_pct from adj_close for ADJUSTED rows.
+
+    The original change_pct was computed from raw close prices, which produces
+    incorrect values on ex-dividend dates.  This migration recomputes from
+    adj_close so that change_pct reflects actual investor returns.
+    """
+    if not _table_exists(conn, "price_bars"):
+        return
+    cols = _table_columns(conn, "price_bars")
+    if "adj_close" not in cols or "adjustment_status" not in cols:
+        return
+    conn.execute(
+        """
+        WITH adj AS (
+            SELECT rowid AS rid,
+                   adj_close,
+                   LAG(adj_close) OVER (PARTITION BY market, ticker ORDER BY date) AS prev_adj_close
+            FROM price_bars
+            WHERE adjustment_status = 'ADJUSTED'
+        )
+        UPDATE price_bars
+        SET change_pct = (a.adj_close / a.prev_adj_close - 1.0) * 100.0
+        FROM adj a
+        WHERE price_bars.rowid = a.rid
+          AND a.prev_adj_close IS NOT NULL
+          AND a.prev_adj_close != 0
+        """
+    )
+    conn.commit()
+
+
 def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     if not _table_exists(conn, "financial_metrics") or not _table_exists(conn, "candidate_evaluations"):
         return
@@ -738,6 +770,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
 
     _backfill_adjusted_prices(conn)
     _backfill_net_returns(conn)
+    _recompute_change_pct_from_adj_close(conn)
 
 
 def dump_json(value: Any) -> str:

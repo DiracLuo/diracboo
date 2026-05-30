@@ -235,6 +235,33 @@ def _update_adjusted_bars(
             ),
         )
         updated += cursor.rowcount
+    # Recompute change_pct from adj_close to handle ex-dividend dates correctly.
+    if updated:
+        conn.execute(
+            """
+            WITH adj AS (
+                SELECT date,
+                       adj_close,
+                       LAG(adj_close) OVER (ORDER BY date) AS prev_adj_close
+                FROM price_bars
+                WHERE market = 'CN_A' AND ticker = ?
+                  AND adjustment_status = 'ADJUSTED'
+            )
+            UPDATE price_bars
+            SET change_pct = CASE
+                    WHEN a.prev_adj_close IS NOT NULL AND a.prev_adj_close != 0
+                    THEN (a.adj_close / a.prev_adj_close - 1.0) * 100.0
+                    ELSE change_pct
+                END
+            FROM adj a
+            WHERE price_bars.market = 'CN_A'
+              AND price_bars.ticker = ?
+              AND price_bars.date = a.date
+              AND price_bars.adjustment_status = 'ADJUSTED'
+              AND a.prev_adj_close IS NOT NULL
+            """,
+            (ticker, ticker),
+        )
     return updated
 
 

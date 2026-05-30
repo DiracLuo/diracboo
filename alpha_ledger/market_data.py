@@ -357,6 +357,7 @@ def _row_to_bar(
     volume: object,
     previous_close: float | None,
     amount: object | None = None,
+    previous_adj_close: float | None = None,
     adj_open: object | None = None,
     adj_close: object | None = None,
     adj_high: object | None = None,
@@ -387,7 +388,10 @@ def _row_to_bar(
         "volume": float(volume),
         "amount": amount_float,
         "amplitude_pct": amplitude_pct,
-        "change_pct": _pct_change(previous_close, close_float),
+        "change_pct": _pct_change(
+            previous_adj_close if previous_adj_close not in (None, 0) else previous_close,
+            adj_close_float if previous_adj_close not in (None, 0) else close_float,
+        ),
         "turnover_pct": None,
         "adj_open": adj_open_float,
         "adj_close": adj_close_float,
@@ -455,6 +459,7 @@ def fetch_yahoo_bars(instrument: Instrument, start: date, end: date) -> list[dic
 
     bars: list[dict[str, object]] = []
     previous_close: float | None = None
+    previous_adj_close: float | None = None
     for index, timestamp in enumerate(timestamps):
         open_price = opens[index] if index < len(opens) else None
         high_price = highs[index] if index < len(highs) else None
@@ -469,6 +474,7 @@ def fetch_yahoo_bars(instrument: Instrument, start: date, end: date) -> list[dic
         close = float(close_price)
         adj_close_value = adjclose[index] if index < len(adjclose) else None
         factor = float(adj_close_value) / close if adj_close_value not in (None, 0) and close else 1.0
+        adj_close_float = close * factor
         amplitude_pct = None
         if previous_close not in (None, 0):
             amplitude_pct = (high - low) / float(previous_close) * 100.0
@@ -485,10 +491,13 @@ def fetch_yahoo_bars(instrument: Instrument, start: date, end: date) -> list[dic
                 "volume": float(volume),
                 "amount": None,
                 "amplitude_pct": amplitude_pct,
-                "change_pct": _pct_change(previous_close, close),
+                "change_pct": _pct_change(
+                    previous_adj_close if previous_adj_close not in (None, 0) else previous_close,
+                    adj_close_float if previous_adj_close not in (None, 0) else close,
+                ),
                 "turnover_pct": None,
                 "adj_open": float(open_price) * factor,
-                "adj_close": close * factor,
+                "adj_close": adj_close_float,
                 "adj_high": high * factor,
                 "adj_low": low * factor,
                 "adj_factor": factor,
@@ -496,6 +505,8 @@ def fetch_yahoo_bars(instrument: Instrument, start: date, end: date) -> list[dic
             }
         )
         previous_close = close
+        if adj_close_value is not None:
+            previous_adj_close = adj_close_float
     return bars
 
 
@@ -683,6 +694,15 @@ def fetch_cn_a_bars(
         bar.update(values)
         bar["adj_factor"] = float(values["adj_close"]) / close if close else 1.0
         bar["adjustment_status"] = "ADJUSTED"
+    # Recompute change_pct from adj_close to handle ex-dividend correctly.
+    previous_adj_close: float | None = None
+    for bar in bars:
+        if bar.get("adjustment_status") == "ADJUSTED":
+            adj_close = float(bar["adj_close"])
+            bar["change_pct"] = _pct_change(previous_adj_close, adj_close)
+            previous_adj_close = adj_close
+        else:
+            previous_adj_close = None
     return bars
 
 
@@ -752,6 +772,7 @@ def fetch_tencent_hk_bars(instrument: Instrument, start: date, end: date) -> lis
                     row[5],
                     previous_close,
                     amount,
+                    previous_adj_close=previous_close,
                     adjustment_status="ADJUSTED",
                 )
             )

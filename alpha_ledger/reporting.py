@@ -238,8 +238,8 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if fresh:
         lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 市场 | 策略 | EV | 分数 | 建议仓位 | 入场参考 | 建议入手 | 禁追价 | 止损 | 目标1 | 目标2 | 风报比 | 最晚退出 | 失效条件 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| 股票 | 市场 | 策略 | EV | 策略分 | 模型分 | 建议仓位 | 入场参考 | 建议入手 | 禁追价 | 止损 | 目标1 | 目标2 | 风报比 | 最晚退出 | 失效条件 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
@@ -247,10 +247,12 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             position_pct = min(max(float(row["expected_value_rank"] or 0.0), 0.0), 10.0)
             latest_exit = _next_business_day(_next_business_day(_next_business_day(as_of_date)))
             invalid = f"跌破 {fmt_price(stop)} 或高开超过禁追价放弃"
+            model_pct = row.get("model_percentile")
+            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
             lines.append(
                 "| "
                 f"{row['name']} `{row['ticker']}` | {row['market']} | {row['strategy_name']} `{row['strategy_version']}` | "
-                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {position_pct:.1f}% | "
+                f"{float(row['expected_value_rank']):.2f} | {float(row['candidate_score']):.1f} | {model_str} | {position_pct:.1f}% | "
                 f"{fmt_price(sig_close)} | {fmt_price(bz_low)} | {fmt_price(sig_close * 1.03)} | "
                 f"{fmt_price(row['stop_loss'])} | {fmt_price(row['target_1'])} | {fmt_price(row['target_2'])} | "
                 f"{float(row['reward_risk']):.2f} | {latest_exit} | {invalid} |"

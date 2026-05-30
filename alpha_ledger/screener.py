@@ -1041,10 +1041,10 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
         + screen_abnormal_volume(conn, as_of_date)
     )
     try:
-        from .alpha_factors import adjust_candidate_scores
-        candidates = adjust_candidate_scores(conn, as_of_date, candidates)
+        from .alpha_factors import attach_model_scores
+        candidates = attach_model_scores(conn, as_of_date, candidates)
     except Exception:
-        pass  # Factor adjustment is optional; screener works without it
+        pass  # Model scores are optional; screener works without them
     candidates.sort(key=lambda c: float(c.get("candidate_score", 0)), reverse=True)
     sector_counts: dict[str, int] = {}
     filtered: list[dict[str, object]] = []
@@ -1068,14 +1068,17 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     action, entry_price, signal_close, buy_zone_low, buy_zone_high, stop_loss,
                     target_1, target_2, reward_risk_ratio, trailing_stop_pct, trailing_activation_pct,
                     thesis, trigger_condition, risk_notes,
-                    evidence_json, status, confirmation_status, data_date, created_at
+                    evidence_json, status, confirmation_status, data_date, created_at,
+                    model_score, model_percentile
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(as_of_date, market, ticker, strategy_id) DO UPDATE SET
                     candidate_score=excluded.candidate_score,
                     action=excluded.action,
                     entry_price=excluded.entry_price,
                     signal_close=excluded.signal_close,
+                    model_score=excluded.model_score,
+                    model_percentile=excluded.model_percentile,
                     buy_zone_low=excluded.buy_zone_low,
                     buy_zone_high=excluded.buy_zone_high,
                     stop_loss=excluded.stop_loss,
@@ -1119,6 +1122,8 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     row["confirmation_status"],
                     row["data_date"],
                     row["created_at"],
+                    row.get("model_score"),
+                    row.get("model_percentile"),
                 ),
             )
     return len(candidates)

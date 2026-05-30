@@ -272,3 +272,62 @@ def adjust_candidate_scores(
         c["factor_bonus"] = round(bonus, 2)
 
     return candidates
+
+
+def attach_model_scores(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    candidates: list[dict[str, object]],
+    *,
+    model_name: str = "qlib_alpha158",
+    model_version: str = "t5_full_20260530",
+) -> list[dict[str, object]]:
+    """Attach Qlib model predictions to candidates without modifying candidate_score.
+
+    Adds two fields to each candidate dict:
+    - model_score: raw model prediction (higher = more bullish)
+    - model_percentile: cross-sectional percentile (0~1)
+
+    Returns the list; candidate_score is NOT modified.
+    """
+    if not candidates:
+        return candidates
+
+    # Find the latest score_date on or before as_of_date
+    row = conn.execute(
+        """
+        SELECT MAX(score_date) AS d
+        FROM model_scores
+        WHERE model_name = ? AND model_version = ? AND score_date <= ?
+        """,
+        (model_name, model_version, as_of_date),
+    ).fetchone()
+    if not row or not row["d"]:
+        return candidates
+
+    score_date = row["d"]
+    tickers = [str(c["ticker"]) for c in candidates]
+
+    # Fetch scores and percentiles for these tickers
+    placeholders = ",".join("?" for _ in tickers)
+    rows = conn.execute(
+        f"""
+        SELECT ticker, score, percentile
+        FROM model_scores
+        WHERE model_name = ? AND model_version = ?
+          AND score_date = ? AND ticker IN ({placeholders})
+        """,
+        [model_name, model_version, score_date, *tickers],
+    ).fetchall()
+
+    score_map = {str(r["ticker"]): (float(r["score"]), float(r["percentile"])) for r in rows}
+
+    for c in candidates:
+        ticker = str(c["ticker"])
+        pair = score_map.get(ticker)
+        if pair is None:
+            continue
+        c["model_score"] = round(pair[0], 6)
+        c["model_percentile"] = round(pair[1], 4)
+
+    return candidates

@@ -6,6 +6,11 @@ from datetime import timedelta
 from pathlib import Path
 
 from .audit import audit_all, latest_audits
+from .qlib_export import export_qlib_csv, write_quality_report, audit_ticker_normalization, write_ticker_audit_report
+from .ticker_repair import audit_ticker_repair, repair_tickers, write_ticker_repair_report
+from .qlib_import import import_qlib_predictions, write_import_report
+from .daily_enrichment import enrich_daily_bars, write_enrichment_report
+from .qfq_backfill import qfq_backfill, write_qfq_backfill_report
 from .benchmarks import CN_A_BENCHMARKS
 from .data_ops import REPAIR_SCOPES, audit_data_coverage, data_update, probe_adjustment_sources
 from .db import DEFAULT_DB_PATH, connect, init_db, upsert_many
@@ -304,6 +309,63 @@ def build_parser() -> argparse.ArgumentParser:
     loss_review.add_argument("--through", required=True)
     loss_review.add_argument("--out", help="Output markdown path")
 
+    export_qlib = subparsers.add_parser("export-qlib-csv", help="Export price_bars to Qlib-compatible CSV")
+    export_qlib.add_argument("--start", required=True, help="Start date, e.g. 2024-01-01")
+    export_qlib.add_argument("--end", required=True, help="End date, e.g. 2026-05-29")
+    export_qlib.add_argument("--output", default="data/qlib_export", help="Output directory")
+    export_qlib.add_argument(
+        "--mode",
+        choices=["raw_adjusted"],
+        default="raw_adjusted",
+        help="Export mode: raw_adjusted uses adj_* prices directly",
+    )
+    export_qlib.add_argument("--markets", default="CN_A", help="Comma-separated markets, e.g. CN_A")
+
+    import_pred = subparsers.add_parser("import-qlib-predictions", help="Import Qlib pred.pkl into model_scores")
+    import_pred.add_argument("--artifact", required=True, help="Path to pred.pkl file")
+    import_pred.add_argument("--model-name", required=True, help="Model name, e.g. qlib_alpha360_lgb")
+    import_pred.add_argument("--model-version", required=True, help="Model version, e.g. smoke_v1")
+    import_pred.add_argument("--market", default="CN_A", help="Market identifier")
+    import_pred.add_argument("--out-dir", default="reports", help="Output directory for import report")
+
+    audit_tickers = subparsers.add_parser("audit-tickers", help="Dry-run audit of ticker normalization (.SH → .SS)")
+    audit_tickers.add_argument("--out-dir", default="reports", help="Output directory for audit report")
+    audit_tickers.add_argument("--limit", type=int, default=20, help="Max issues to print to stdout")
+
+    repair_tickers_cmd = subparsers.add_parser("repair-tickers", help="Repair .SH → .SS normalization (dry-run by default)")
+    repair_tickers_cmd.add_argument("--apply", action="store_true", help="Actually apply repairs (without this flag, runs as dry-run)")
+    repair_tickers_cmd.add_argument("--out-dir", default="reports", help="Output directory for repair report")
+    repair_tickers_cmd.add_argument("--limit", type=int, default=20, help="Max issues to print to stdout")
+
+    backfill_qfq = subparsers.add_parser("backfill-qfq", help="Backfill forward-adjusted (qfq) CN_A prices")
+    backfill_qfq.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
+    backfill_qfq.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+    backfill_qfq.add_argument("--throttle", type=float, default=0.3, help="Seconds between API calls")
+    backfill_qfq.add_argument("--limit", type=int, default=None, help="Max tickers to process (smoke runs)")
+    backfill_qfq.add_argument("--tickers", default=None, help="Comma-separated ticker subset")
+    backfill_qfq.add_argument("--commit-every", type=int, default=50, help="Commit batch size")
+    backfill_qfq.add_argument(
+        "--source",
+        choices=["baostock", "auto"],
+        default="baostock",
+        help="Adjustment source: baostock (BaoStock only, no fallback) or auto (BaoStock first, AkShare fallback)",
+    )
+    backfill_qfq.add_argument("--out-dir", default="reports", help="Output directory for backfill report")
+    backfill_qfq.add_argument("--dry-run", action="store_true", help="Report targets without network or DB writes")
+
+    enrich_daily = subparsers.add_parser(
+        "enrich-daily-bars",
+        help="Enrich CN_A price_bars with BaoStock amount and turnover_pct",
+    )
+    enrich_daily.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
+    enrich_daily.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+    enrich_daily.add_argument("--throttle", type=float, default=0.3, help="Seconds between API calls")
+    enrich_daily.add_argument("--limit", type=int, default=None, help="Max tickers to process (smoke runs)")
+    enrich_daily.add_argument("--tickers", default=None, help="Comma-separated ticker subset")
+    enrich_daily.add_argument("--commit-every", type=int, default=50, help="Commit batch size")
+    enrich_daily.add_argument("--out-dir", default="reports", help="Output directory for enrichment report")
+    enrich_daily.add_argument("--dry-run", action="store_true", help="Report targets without network or DB writes")
+
     return parser
 
 
@@ -457,6 +519,13 @@ def command_data_audit(
             print(f"- latest_price_date={result.latest_price_date}, trading_days={result.trading_days}")
             print(f"- price_bars={result.price_bar_count}, adjusted={result.adjusted_bar_count} ({result.adjustment_coverage_pct:.1f}%)")
             print(f"- layered_benchmark_coverage={result.benchmark_coverage_pct:.1f}%, events={result.event_count}, financials={result.financial_count}, intraday_symbols={result.intraday_symbol_count}")
+            print(
+                "- intraday_tradable_coverage="
+                f"{result.intraday_tradable_symbol_count}/{result.intraday_tradable_target_count} "
+                f"({result.intraday_coverage_pct:.1f}%), "
+                f"missing_tradable={result.intraday_tradable_missing_count}, "
+                f"no_trade_symbols={result.intraday_no_trade_symbol_count}"
+            )
             print(f"- allow_formal_daily={'yes' if result.allow_formal_daily else 'no'}")
             if result.missing_dates:
                 print(f"- missing_dates={', '.join(result.missing_dates[:10])}")
@@ -836,6 +905,177 @@ def command_candidates(db_path: str, as_of: str) -> None:
         )
 
 
+def command_audit_tickers(db_path: str, out_dir: str, limit: int = 20) -> None:
+    """Dry-run audit: check ticker normalization without modifying data."""
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = audit_ticker_normalization(conn)
+        md_path, json_path = write_ticker_audit_report(result, Path(out_dir))
+    print(
+        f"Ticker audit: {result.total_instruments} instruments, "
+        f"{result.canonical_count} canonical, "
+        f"{result.needs_normalization} need normalization, "
+        f"{result.unknown_suffix} unknown suffix. "
+        f"Reports: {md_path}, {json_path}"
+    )
+    if result.issues:
+        shown = result.issues[: max(0, limit)]
+        print(f"Issues found (showing {len(shown)} of {len(result.issues)}):")
+        for issue in shown:
+            print(f"  - {issue['ticker']}: {issue['detail']}")
+
+
+def command_repair_tickers(db_path: str, apply: bool, out_dir: str, limit: int = 20) -> None:
+    """Audit and optionally repair .SH → .SS normalization."""
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        if apply:
+            result = repair_tickers(conn)
+            print(
+                f"Ticker repair applied: "
+                f"{result.instruments_merged} instruments, "
+                f"{result.price_bars_merged} price bars, "
+                f"{result.other_tables_merged} other rows merged "
+                f"({result.total_merged} total)."
+            )
+        else:
+            result = audit_ticker_repair(conn)
+            print(
+                f"Ticker repair (dry-run): "
+                f"{result.total_canonical} canonical, "
+                f"{result.total_needs_normalization} need normalization, "
+                f"{result.total_unknown_suffix} unknown suffix, "
+                f"{result.total_conflicts} conflicts."
+            )
+        md_path, json_path = write_ticker_repair_report(result, Path(out_dir))
+        print(f"Reports: {md_path}, {json_path}")
+
+        conflicts = result.all_conflict_examples
+        if conflicts:
+            shown = conflicts[:max(0, limit)]
+            print(f"Conflicts (showing {len(shown)} of {len(conflicts)}):")
+            for c in shown:
+                print(f"  - {c['table']}: {c['sh_ticker']} → {c['canonical_ticker']}")
+
+
+def command_backfill_qfq(
+    db_path: str,
+    start: str,
+    end: str,
+    source: str,
+    throttle: float,
+    limit: int | None,
+    tickers: str | None,
+    commit_every: int,
+    out_dir: str,
+    dry_run: bool,
+) -> None:
+    """Backfill forward-adjusted CN_A prices from BaoStock/AkShare."""
+    ticker_subset = _split_csv(tickers)
+
+    # For dry-run, only print per-ticker progress if limit is small (≤50)
+    _quiet_dry_run = dry_run and (limit is None or limit > 50)
+
+    def _progress(i: int, total: int, ticker: str, updated: int, errors: int) -> None:
+        if total == 0:
+            return
+        if _quiet_dry_run:
+            return  # dry-run with many tickers: only print final summary
+        if (i + 1) % 50 == 0 or i == total - 1:
+            print(f"[{i + 1}/{total}] {ticker} | updated={updated} errors={errors}")
+
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = qfq_backfill(
+            conn,
+            start,
+            end,
+            source=source,
+            throttle=throttle,
+            limit=limit,
+            tickers_subset=ticker_subset,
+            commit_every=commit_every,
+            dry_run=dry_run,
+            progress_fn=_progress,
+        )
+        md_path, json_path = write_qfq_backfill_report(result, Path(out_dir))
+
+    mode = "DRY-RUN" if dry_run else "done"
+    print(
+        f"QFQ backfill ({mode}): "
+        f"target={result.target_count}, "
+        f"benchmarks_skipped={result.skipped_benchmarks}, "
+        f"updated_rows={result.updated_rows}, "
+        f"errors={result.skipped_errors}, "
+        f"baostock={result.baostock_count}, "
+        f"akshare={result.akshare_count}, "
+        f"elapsed={result.elapsed_seconds:.1f}s. "
+        f"Reports: {md_path}, {json_path}"
+    )
+    if result.ticker_errors:
+        shown = result.ticker_errors[:20]
+        print(f"Errors (showing {len(shown)} of {len(result.ticker_errors)}):")
+        for e in shown:
+            print(f"  - {e}")
+
+
+def command_enrich_daily_bars(
+    db_path: str,
+    start: str,
+    end: str,
+    throttle: float,
+    limit: int | None,
+    tickers: str | None,
+    commit_every: int,
+    out_dir: str,
+    dry_run: bool,
+) -> None:
+    """Enrich CN_A price_bars with BaoStock amount and turnover_pct."""
+    ticker_subset = _split_csv(tickers)
+
+    _quiet_dry_run = dry_run and (limit is None or limit > 50)
+
+    def _progress(i: int, total: int, ticker: str, updated: int, missing: int, errors: int) -> None:
+        if total == 0:
+            return
+        if _quiet_dry_run:
+            return
+        if (i + 1) % 50 == 0 or i == total - 1:
+            print(f"[{i + 1}/{total}] {ticker} | updated={updated} missing={missing} errors={errors}")
+
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = enrich_daily_bars(
+            conn,
+            start,
+            end,
+            throttle=throttle,
+            limit=limit,
+            tickers_subset=ticker_subset,
+            commit_every=commit_every,
+            dry_run=dry_run,
+            progress_fn=_progress,
+        )
+        md_path, json_path = write_enrichment_report(result, Path(out_dir))
+
+    mode = "DRY-RUN" if dry_run else "done"
+    print(
+        f"Daily enrichment ({mode}): "
+        f"target={result.target_count}, "
+        f"benchmarks_skipped={result.skipped_benchmarks}, "
+        f"updated_rows={result.updated_rows}, "
+        f"missing_rows={result.missing_rows}, "
+        f"errors={result.skipped_errors}, "
+        f"elapsed={result.elapsed_seconds:.1f}s. "
+        f"Reports: {md_path}, {json_path}"
+    )
+    if result.ticker_errors:
+        shown = result.ticker_errors[:20]
+        print(f"Errors (showing {len(shown)} of {len(result.ticker_errors)}):")
+        for e in shown:
+            print(f"  - {e}")
+
+
 def command_verify(db_path: str) -> None:
     with closing(connect(db_path)) as conn:
         broken = verify_signals(conn)
@@ -1081,6 +1321,58 @@ def main(argv: list[str] | None = None) -> int:
             init_db(conn)
             path = write_loss_review(conn, args.start, args.end, args.through, Path(args.out) if args.out else None)
         print(f"Wrote loss review: {path}")
+    elif args.command == "export-qlib-csv":
+        with closing(connect(args.db)) as conn:
+            init_db(conn)
+            markets = {m.strip() for m in args.markets.split(",") if m.strip()}
+            result = export_qlib_csv(conn, args.start, args.end, Path(args.output), markets=markets)
+            md_path, json_path = write_quality_report(result, Path(args.output))
+        print(
+            f"Exported {result.csv_count} CSV files ({result.total_bars} bars) "
+            f"to {args.output}. Warnings: {result.total_warnings}. "
+            f"Reports: {md_path}, {json_path}"
+        )
+    elif args.command == "import-qlib-predictions":
+        with closing(connect(args.db)) as conn:
+            init_db(conn)
+            result = import_qlib_predictions(
+                conn, Path(args.artifact), args.model_name, args.model_version, args.market
+            )
+            md_path, json_path = write_import_report(result, Path(args.out_dir))
+        print(
+            f"Imported {result.imported_count} scores for {args.model_name}@{args.model_version}. "
+            f"Date range: {result.date_range}. Failures: {result.ticker_mapping_failures}. "
+            f"Reports: {md_path}, {json_path}"
+        )
+    elif args.command == "audit-tickers":
+        command_audit_tickers(args.db, args.out_dir, args.limit)
+    elif args.command == "repair-tickers":
+        command_repair_tickers(args.db, args.apply, args.out_dir, args.limit)
+    elif args.command == "backfill-qfq":
+        command_backfill_qfq(
+            args.db,
+            args.start,
+            args.end,
+            args.source,
+            args.throttle,
+            args.limit,
+            args.tickers,
+            args.commit_every,
+            args.out_dir,
+            args.dry_run,
+        )
+    elif args.command == "enrich-daily-bars":
+        command_enrich_daily_bars(
+            args.db,
+            args.start,
+            args.end,
+            args.throttle,
+            args.limit,
+            args.tickers,
+            args.commit_every,
+            args.out_dir,
+            args.dry_run,
+        )
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

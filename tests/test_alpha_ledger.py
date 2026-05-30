@@ -735,7 +735,7 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         self.assertEqual(confirm_candidates(self.conn, "2026-02-03"), (1, 0))
         plan = daily_action_plan(self.conn, "2026-02-03")
         self.assertEqual(plan[0]["ticker"], "000002.SZ")
-        self.assertEqual(plan[0]["plan_bucket"], "今日可买")
+        self.assertEqual(plan[0]["plan_bucket"], "今日确认")
 
         after_confirmation = run_portfolio_backtest(
             self.conn,
@@ -1371,6 +1371,58 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         self.assertNotIn("2026-05-04", result.missing_dates)
         self.assertNotIn("2026-05-05", result.missing_dates)
 
+    def test_data_audit_marks_no_trade_intraday_universe_as_fully_covered(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        init_db(conn)
+        try:
+            for ticker in ("000300.SS", "000905.SS", "000852.SS", "399006.SZ", "000688.SS", "899050.BJ"):
+                conn.execute(
+                    """
+                    INSERT INTO price_bars (
+                        market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                        adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                    ) VALUES ('CN_A', ?, '2026-05-13', 10, 10, 10, 10, 0, 0, 0,
+                              10, 10, 10, 10, 1, 'ADJUSTED')
+                    """,
+                    (ticker,),
+                )
+            conn.execute(
+                """
+                INSERT INTO price_bars (
+                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                ) VALUES ('CN_A', '000001.SZ', '2026-05-13', 10, 10, 10, 10, 0, 0, 0,
+                          10, 10, 10, 10, 1, 'ADJUSTED')
+                """
+            )
+
+            result = audit_data_coverage(conn, "2026-05-13", "2026-05-13", "CN_A", write=True)
+            self.assertEqual(result.intraday_tradable_target_count, 0)
+            self.assertEqual(result.intraday_tradable_symbol_count, 0)
+            self.assertEqual(result.intraday_tradable_missing_count, 0)
+            self.assertEqual(result.intraday_no_trade_symbol_count, 7)
+            self.assertEqual(result.intraday_coverage_pct, 100.0)
+            self.assertEqual(result.confidence_level, CONFIDENCE_HIGH)
+            self.assertTrue(result.allow_formal_daily)
+            self.assertTrue(any("无交易标的不计为待补缺口" in note for note in result.notes))
+
+            row = conn.execute(
+                """
+                SELECT intraday_tradable_target_count, intraday_tradable_symbol_count,
+                       intraday_tradable_missing_count, intraday_no_trade_symbol_count
+                FROM data_coverage_daily
+                WHERE market = 'CN_A' AND date = '2026-05-13'
+                """
+            ).fetchone()
+            self.assertEqual(row["intraday_tradable_target_count"], 0)
+            self.assertEqual(row["intraday_tradable_symbol_count"], 0)
+            self.assertEqual(row["intraday_tradable_missing_count"], 0)
+            self.assertEqual(row["intraday_no_trade_symbol_count"], 7)
+        finally:
+            conn.close()
+
     def test_adjustment_probe_reports_success_partial_and_failed(self) -> None:
         import alpha_ledger.data_ops as data_ops_module
 
@@ -1498,7 +1550,16 @@ class AlphaLedgerMvpTest(unittest.TestCase):
     def test_baostock_symbol_conversion_ss(self) -> None:
         from alpha_ledger.market_data import _cn_a_to_baostock_symbol
         self.assertEqual(_cn_a_to_baostock_symbol("600519.SS"), "sh.600519")
+        self.assertEqual(_cn_a_to_baostock_symbol("600519.SH"), "sh.600519")
         self.assertEqual(_cn_a_to_baostock_symbol("601318.SS"), "sh.601318")
+
+    def test_instrument_canonicalizes_cn_a_ticker_but_preserves_source_symbol(self) -> None:
+        from alpha_ledger.market_data import Instrument
+        instrument = Instrument("CN_A", "600519.SH", "贵州茅台", "sina_cn", "sh600519", True, ())
+        self.assertEqual(instrument.ticker, "600519.SS")
+        self.assertEqual(instrument.source_symbol, "sh600519")
+        self.assertEqual(instrument.as_row()["ticker"], "600519.SS")
+        self.assertEqual(instrument.as_row()["source_symbol"], "sh600519")
 
     def test_baostock_symbol_conversion_bj_raises(self) -> None:
         from alpha_ledger.market_data import _cn_a_to_baostock_symbol, MarketDataError
@@ -1613,6 +1674,46 @@ class AlphaLedgerMvpTest(unittest.TestCase):
             trailing_stop_pct=3.0, trailing_activation_pct=8.0,
         )
         self.assertNotEqual(path["exit_type"], "TRAILING_STOP")
+
+    def test_normalize_cn_code_accepts_sh_suffix(self) -> None:
+        """Test that normalize_cn_code accepts .SH and converts to .SS."""
+        from alpha_ledger.event_data import normalize_cn_code
+        ticker, source_symbol, prefix = normalize_cn_code("600519.SH")
+        self.assertEqual(ticker, "600519.SS")
+        self.assertEqual(source_symbol, "sh600519")
+        self.assertEqual(prefix, "sh")
+
+    def test_normalize_cn_code_accepts_ss_suffix(self) -> None:
+        """Test that normalize_cn_code accepts .SS (canonical)."""
+        from alpha_ledger.event_data import normalize_cn_code
+        ticker, source_symbol, prefix = normalize_cn_code("600519.SS")
+        self.assertEqual(ticker, "600519.SS")
+        self.assertEqual(source_symbol, "sh600519")
+        self.assertEqual(prefix, "sh")
+
+    def test_normalize_cn_code_accepts_sz_suffix(self) -> None:
+        """Test that normalize_cn_code accepts .SZ."""
+        from alpha_ledger.event_data import normalize_cn_code
+        ticker, source_symbol, prefix = normalize_cn_code("002674.SZ")
+        self.assertEqual(ticker, "002674.SZ")
+        self.assertEqual(source_symbol, "sz002674")
+        self.assertEqual(prefix, "sz")
+
+    def test_normalize_cn_code_accepts_bare_code(self) -> None:
+        """Test that normalize_cn_code accepts bare numeric code."""
+        from alpha_ledger.event_data import normalize_cn_code
+        ticker, source_symbol, prefix = normalize_cn_code("600519")
+        self.assertEqual(ticker, "600519.SS")
+        self.assertEqual(source_symbol, "sh600519")
+        self.assertEqual(prefix, "sh")
+
+    def test_normalize_cn_code_sh_case_insensitive(self) -> None:
+        """Test that .SH is case-insensitive."""
+        from alpha_ledger.event_data import normalize_cn_code
+        ticker1, _, _ = normalize_cn_code("600519.SH")
+        ticker2, _, _ = normalize_cn_code("600519.sh")
+        self.assertEqual(ticker1, "600519.SS")
+        self.assertEqual(ticker2, "600519.SS")
 
 
 if __name__ == "__main__":

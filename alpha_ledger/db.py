@@ -20,6 +20,7 @@ _VALID_TABLES: frozenset[str] = frozenset({
     "financial_metrics", "money_flows", "candidates", "candidate_evaluations",
     "candidate_horizon_evaluations", "strategy_audits", "data_fetch_runs",
     "data_fetch_errors", "data_coverage_daily", "data_source_health",
+    "model_scores",
 })
 
 
@@ -413,6 +414,10 @@ SCHEMA_STATEMENTS = [
         event_count INTEGER NOT NULL DEFAULT 0,
         financial_count INTEGER NOT NULL DEFAULT 0,
         intraday_symbol_count INTEGER NOT NULL DEFAULT 0,
+        intraday_tradable_target_count INTEGER NOT NULL DEFAULT 0,
+        intraday_tradable_symbol_count INTEGER NOT NULL DEFAULT 0,
+        intraday_tradable_missing_count INTEGER NOT NULL DEFAULT 0,
+        intraday_no_trade_symbol_count INTEGER NOT NULL DEFAULT 0,
         confidence_level TEXT NOT NULL DEFAULT 'RESEARCH_ONLY',
         notes TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
@@ -430,6 +435,22 @@ SCHEMA_STATEMENTS = [
         last_error TEXT,
         updated_at TEXT NOT NULL,
         PRIMARY KEY(source, market)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        market TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        score_date TEXT NOT NULL,
+        score REAL NOT NULL,
+        rank INTEGER,
+        percentile REAL,
+        source_artifact TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(model_name, model_version, market, ticker, score_date)
     )
     """,
 ]
@@ -605,6 +626,15 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             """
         )
 
+    if _table_exists(conn, "data_coverage_daily"):
+        for column, definition in (
+            ("intraday_tradable_target_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("intraday_tradable_symbol_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("intraday_tradable_missing_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("intraday_no_trade_symbol_count", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            _add_column_if_missing(conn, "data_coverage_daily", column, definition)
+
     if _table_exists(conn, "price_bars"):
         for column, definition in (
             ("adj_open", "REAL"),
@@ -728,6 +758,15 @@ def upsert_many(
     rows = list(rows)
     if not rows:
         return 0
+    # Canonicalize CN_A tickers on write to prevent .SH from entering DB.
+    # Normalize each row individually — do not decide based only on rows[0].
+    if table in ("price_bars", "instruments"):
+        from .tickers import normalize_ticker
+        for row in rows:
+            if "market" in row and "ticker" in row:
+                market = str(row.get("market", ""))
+                if market == "CN_A":
+                    row["ticker"] = normalize_ticker(str(row["ticker"]), market)
     if table == "price_bars":
         for row in rows:
             close = float(row["close"]) if row.get("close") not in (None, 0) else 0.0

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .ledger import now_utc
+from .tickers import cn_a_to_baostock_symbol, normalize_ticker
 
 
 DEFAULT_UNIVERSE_PATH = Path("data/universe/default_universe.csv")
@@ -50,6 +51,10 @@ class Instrument:
     source_symbol: str
     active: bool
     tags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "market", str(self.market).strip().upper())
+        object.__setattr__(self, "ticker", normalize_ticker(self.ticker, self.market))
 
     def as_row(self) -> dict[str, object]:
         return {
@@ -87,15 +92,17 @@ def read_universe(
     symbols: set[str] | None = None,
 ) -> list[Instrument]:
     universe_path = Path(path)
+    normalized_symbols = _normalized_symbol_filter(symbols)
     with universe_path.open("r", encoding="utf-8", newline="") as handle:
         rows = csv.DictReader(handle)
         instruments = []
         for row in rows:
             market = row["market"].strip()
-            ticker = row["ticker"].strip()
+            ticker = normalize_ticker(row["ticker"], market)
+            source_symbol = row["source_symbol"].strip()
             if markets and market not in markets:
                 continue
-            if symbols and ticker not in symbols and row["source_symbol"].strip() not in symbols:
+            if normalized_symbols and ticker not in normalized_symbols and source_symbol not in normalized_symbols:
                 continue
             instruments.append(
                 Instrument(
@@ -103,7 +110,7 @@ def read_universe(
                     ticker=ticker,
                     name=row["name"].strip(),
                     source=row.get("source", "yahoo").strip() or "yahoo",
-                    source_symbol=row["source_symbol"].strip(),
+                    source_symbol=source_symbol,
                     active=row.get("active", "1").strip() not in {"0", "false", "False"},
                     tags=tuple(
                         tag.strip()
@@ -135,14 +142,16 @@ def read_db_instruments(
         params,
     ).fetchall()
     instruments: list[Instrument] = []
+    normalized_symbols = _normalized_symbol_filter(symbols)
     for row in rows:
-        if symbols and row["ticker"] not in symbols and row["source_symbol"] not in symbols:
+        ticker = normalize_ticker(row["ticker"], row["market"])
+        if normalized_symbols and ticker not in normalized_symbols and row["source_symbol"] not in normalized_symbols:
             continue
         tags = tuple(json.loads(row["tags_json"] or "[]"))
         instruments.append(
             Instrument(
                 market=row["market"],
-                ticker=row["ticker"],
+                ticker=ticker,
                 name=row["name"],
                 source=row["source"],
                 source_symbol=row["source_symbol"],
@@ -151,6 +160,16 @@ def read_db_instruments(
             )
         )
     return instruments
+
+
+def _normalized_symbol_filter(symbols: set[str] | None) -> set[str] | None:
+    if not symbols:
+        return None
+    normalized: set[str] = set()
+    for symbol in symbols:
+        normalized.add(str(symbol).strip())
+        normalized.add(normalize_ticker(symbol, "CN_A"))
+    return normalized
 
 
 def _to_unix_seconds(day: date) -> int:
@@ -278,14 +297,10 @@ def _cn_a_plain_symbol(instrument: Instrument) -> str:
 
 
 def _cn_a_to_baostock_symbol(ticker: str) -> str:
-    match = re.match(r"(\d{6})\.(SZ|SS|BJ)", ticker, re.IGNORECASE)
-    if not match:
-        raise MarketDataError(f"Cannot convert {ticker} to BaoStock format")
-    code, suffix = match.group(1), match.group(2).upper()
-    if suffix == "BJ":
-        raise MarketDataError(f"BaoStock does not support BJ stocks: {ticker}")
-    prefix_map = {"SZ": "sz", "SS": "sh"}
-    return f"{prefix_map[suffix]}.{code}"
+    try:
+        return cn_a_to_baostock_symbol(ticker)
+    except ValueError as exc:
+        raise MarketDataError(str(exc)) from exc
 
 
 def _coerce_intraday_datetime(value: object) -> datetime:
@@ -563,6 +578,16 @@ def fetch_baostock_cn_adjusted_daily_map(
     end: date,
     adjust: str = "qfq",
 ) -> dict[str, dict[str, float]]:
+    """Fetch QFQ-adjusted OHLC from BaoStock, with optional amount/turnover.
+
+    With ``adjustflag="2"`` (forward-adjusted), BaoStock returns adjusted OHLC
+    while ``amount``, ``turn`` (turnover rate), ``tradestatus``, and ``isST``
+    are raw market metrics.  When available, ``amount`` and ``turnover_pct``
+    are included in the returned map alongside the ``adj_*`` fields.
+
+    Note: ``amount`` and ``turnover_pct`` are raw market metrics carried along
+    with qfq OHLC — they should pass VWAP sanity checks before full trust.
+    """
     if instrument.market != "CN_A":
         return {}
     if "index" in instrument.tags or "benchmark" in instrument.tags:
@@ -576,7 +601,7 @@ def fetch_baostock_cn_adjusted_daily_map(
 
     rs = bs.query_history_k_data_plus(
         bs_symbol,
-        "date,open,high,low,close",
+        "date,open,high,low,close,volume,amount,turn,tradestatus,isST",
         start_date=start.isoformat(),
         end_date=end.isoformat(),
         frequency="d",
@@ -591,7 +616,7 @@ def fetch_baostock_cn_adjusted_daily_map(
         if not _within_range(row_date, start, end):
             continue
         try:
-            rows[row_date] = {
+            entry: dict[str, float] = {
                 "adj_open": float(row[1]),
                 "adj_high": float(row[2]),
                 "adj_low": float(row[3]),
@@ -599,6 +624,21 @@ def fetch_baostock_cn_adjusted_daily_map(
             }
         except (ValueError, IndexError):
             continue
+        # Optional fields: amount (index 6), turn (index 7)
+        # Skip silently if missing, empty, or non-numeric
+        try:
+            amount_str = row[6] if len(row) > 6 else None
+            if amount_str not in (None, ""):
+                entry["amount"] = float(amount_str)
+        except (ValueError, IndexError):
+            pass
+        try:
+            turn_str = row[7] if len(row) > 7 else None
+            if turn_str not in (None, ""):
+                entry["turnover_pct"] = float(turn_str)
+        except (ValueError, IndexError):
+            pass
+        rows[row_date] = entry
     return rows
 
 

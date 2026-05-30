@@ -43,6 +43,11 @@ class DataAuditResult:
     event_count: int
     financial_count: int
     intraday_symbol_count: int
+    intraday_tradable_target_count: int
+    intraday_tradable_symbol_count: int
+    intraday_tradable_missing_count: int
+    intraday_no_trade_symbol_count: int
+    intraday_coverage_pct: float
     adjustment_coverage_pct: float
     benchmark_coverage_pct: float
     confidence_level: str
@@ -436,6 +441,45 @@ def audit_data_coverage(
         "SELECT COUNT(DISTINCT ticker) AS c FROM intraday_bars WHERE market = ? AND date >= ? AND date <= ?",
         (market, start_date, end_date),
     ).fetchone()["c"] or 0)
+    price_symbol_count = int(conn.execute(
+        "SELECT COUNT(DISTINCT ticker) AS c FROM price_bars WHERE market = ?",
+        (market,),
+    ).fetchone()["c"] or 0)
+    intraday_tradable_target_count = int(conn.execute(
+        """
+        SELECT COUNT(DISTINCT ticker) AS c
+        FROM price_bars
+        WHERE market = ? AND date >= ? AND date <= ? AND volume > 0
+        """,
+        (market, start_date, end_date),
+    ).fetchone()["c"] or 0)
+    intraday_tradable_symbol_count = int(conn.execute(
+        """
+        SELECT COUNT(DISTINCT i.ticker) AS c
+        FROM intraday_bars i
+        WHERE i.market = ? AND i.date >= ? AND i.date <= ?
+          AND EXISTS (
+              SELECT 1
+              FROM price_bars p
+              WHERE p.market = i.market
+                AND p.ticker = i.ticker
+                AND p.date >= ?
+                AND p.date <= ?
+                AND p.volume > 0
+          )
+        """,
+        (market, start_date, end_date, start_date, end_date),
+    ).fetchone()["c"] or 0)
+    intraday_tradable_missing_count = max(
+        intraday_tradable_target_count - intraday_tradable_symbol_count,
+        0,
+    )
+    intraday_no_trade_symbol_count = max(price_symbol_count - intraday_tradable_target_count, 0)
+    intraday_coverage_pct = (
+        intraday_tradable_symbol_count / intraday_tradable_target_count * 100.0
+        if intraday_tradable_target_count
+        else 100.0
+    )
 
     day_rows = conn.execute(
         "SELECT DISTINCT date FROM price_bars WHERE market = ? AND date >= ? AND date <= ? ORDER BY date",
@@ -458,14 +502,27 @@ def audit_data_coverage(
             notes.append(f"复权覆盖不足：{adjusted_pct:.1f}%。")
     if benchmark_pct < 95.0:
         notes.append(f"分层基准覆盖不足：{benchmark_pct:.1f}%。")
-    if intraday_symbol_count == 0:
+    if intraday_tradable_missing_count:
+        notes.append(
+            f"分时覆盖不足：目标期有成交标的 {intraday_tradable_target_count} 只，"
+            f"已覆盖 {intraday_tradable_symbol_count} 只，缺 {intraday_tradable_missing_count} 只。"
+        )
+    elif intraday_no_trade_symbol_count:
+        notes.append(
+            f"分时覆盖按有成交标的口径为 {intraday_coverage_pct:.1f}%；"
+            f"{intraday_no_trade_symbol_count} 只目标期无交易标的不计为待补缺口。"
+        )
+    elif intraday_symbol_count == 0:
         notes.append("候选分时覆盖不足。")
 
+    intraday_ready = intraday_tradable_missing_count == 0 and (
+        intraday_tradable_target_count == 0 or intraday_symbol_count > 0
+    )
     if price_bar_count == 0 or latest_price_date is None or latest_price_date < end_date:
         confidence = CONFIDENCE_RESEARCH
-    elif adjusted_pct >= 95.0 and benchmark_pct >= 95.0 and intraday_symbol_count > 0:
+    elif adjusted_pct >= 95.0 and benchmark_pct >= 95.0 and intraday_ready:
         confidence = CONFIDENCE_HIGH
-    elif ignore_adjustment_for_short_term and adjusted_pct >= 50.0 and benchmark_pct >= 95.0 and intraday_symbol_count > 0:
+    elif ignore_adjustment_for_short_term and adjusted_pct >= 50.0 and benchmark_pct >= 95.0 and intraday_ready:
         confidence = CONFIDENCE_HIGH
     elif benchmark_pct >= 80.0 and (adjusted_pct >= 95.0 or ignore_adjustment_for_short_term):
         confidence = CONFIDENCE_MEDIUM
@@ -485,6 +542,11 @@ def audit_data_coverage(
         event_count=event_count,
         financial_count=financial_count,
         intraday_symbol_count=intraday_symbol_count,
+        intraday_tradable_target_count=intraday_tradable_target_count,
+        intraday_tradable_symbol_count=intraday_tradable_symbol_count,
+        intraday_tradable_missing_count=intraday_tradable_missing_count,
+        intraday_no_trade_symbol_count=intraday_no_trade_symbol_count,
+        intraday_coverage_pct=intraday_coverage_pct,
         adjustment_coverage_pct=adjusted_pct,
         benchmark_coverage_pct=benchmark_pct,
         confidence_level=confidence,
@@ -498,8 +560,10 @@ def audit_data_coverage(
             INSERT INTO data_coverage_daily (
                 market, date, instrument_count, price_bar_count, adjusted_bar_count,
                 benchmark_count, event_count, financial_count, intraday_symbol_count,
+                intraday_tradable_target_count, intraday_tradable_symbol_count,
+                intraday_tradable_missing_count, intraday_no_trade_symbol_count,
                 confidence_level, notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(market, date) DO UPDATE SET
                 instrument_count = excluded.instrument_count,
                 price_bar_count = excluded.price_bar_count,
@@ -508,6 +572,10 @@ def audit_data_coverage(
                 event_count = excluded.event_count,
                 financial_count = excluded.financial_count,
                 intraday_symbol_count = excluded.intraday_symbol_count,
+                intraday_tradable_target_count = excluded.intraday_tradable_target_count,
+                intraday_tradable_symbol_count = excluded.intraday_tradable_symbol_count,
+                intraday_tradable_missing_count = excluded.intraday_tradable_missing_count,
+                intraday_no_trade_symbol_count = excluded.intraday_no_trade_symbol_count,
                 confidence_level = excluded.confidence_level,
                 notes = excluded.notes,
                 created_at = excluded.created_at
@@ -522,6 +590,10 @@ def audit_data_coverage(
                 event_count,
                 financial_count,
                 intraday_symbol_count,
+                intraday_tradable_target_count,
+                intraday_tradable_symbol_count,
+                intraday_tradable_missing_count,
+                intraday_no_trade_symbol_count,
                 confidence,
                 "; ".join(notes),
                 now_utc(),

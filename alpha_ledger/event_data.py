@@ -18,6 +18,7 @@ from typing import Any
 from .db import estimate_financial_published_date, upsert_many
 from .ledger import now_utc
 from .market_data import Instrument
+from .tickers import cn_a_source_symbol, normalize_cn_a_ticker
 
 
 IMPORTANT_EVENT_KEYWORDS = {
@@ -107,14 +108,14 @@ def _request_json(url: str, headers: dict[str, str] | None = None, timeout: int 
 
 
 def normalize_cn_code(code: str) -> tuple[str, str, str]:
-    pure = re.sub(r"\D", "", str(code))
-    if pure.startswith(("8", "4", "92")):
-        return f"{pure}.BJ", f"bj{pure}", "bj"
-    if pure.startswith(("6", "9")):
-        return f"{pure}.SS", f"sh{pure}", "sh"
-    if pure.startswith(("0", "3")):
-        return f"{pure}.SZ", f"sz{pure}", "sz"
-    return f"{pure}.BJ", f"bj{pure}", "bj"
+    """Normalize a Chinese stock code to canonical (ticker, source_symbol, exchange_prefix).
+
+    Accepts bare numeric codes (600519), dotted forms (600519.SS, 600519.SH),
+    and prefixed forms (sh600519). Shanghai .SH is converted to canonical .SS.
+    """
+    ticker = normalize_cn_a_ticker(code)
+    source_symbol, prefix = cn_a_source_symbol(ticker)
+    return ticker, source_symbol, prefix
 
 
 def _score_event(event_type: str, title: str) -> float:

@@ -7,3 +7,12 @@ reports/*.md
 .DS_Store
 
 data/alpha_ledger.sqlite
+data/qlib_export*/
+mlruns/
+*.pkl
+alpha_ledger.db
+backups/
+logs/
+reports/*.json
+scripts/
+workflow_config_*.yaml

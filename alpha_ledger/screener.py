@@ -160,7 +160,11 @@ def _price_universe(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def _is_excluded_name(name: str) -> bool:
     upper_name = name.upper()
-    return "ST" in upper_name or "退" in name
+    if "ST" in upper_name or "退" in name:
+        return True
+    # Exclude indexes and ETFs
+    index_keywords = ("指数", "ETF", "LOF", "基金")
+    return any(kw in name for kw in index_keywords)
 
 
 WEAK_XINGYE_EVENT_KEYWORDS = (

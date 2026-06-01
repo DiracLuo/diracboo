@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import time
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .alpha_factors import MULTI_MODEL_CONFIGS
 from .data_ops import CONFIDENCE_HIGH, audit_data_coverage
@@ -44,6 +49,582 @@ MODEL_LABELS = {
     ("qlib_alpha158_20250101", "t10_v2"): "M2 (2025~ T+10)",
     ("qlib_alpha158_20260101", "t10_v2"): "M3 (2026~ T+10)",
 }
+
+
+def _lb_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("LONGBRIDGE_LOG_PATH", "/private/tmp/alpha_ledger_longbridge_logs")
+    Path(env["LONGBRIDGE_LOG_PATH"]).mkdir(parents=True, exist_ok=True)
+    try:
+        log_dir = Path.home() / "Library" / "Logs" / "Longbridge"
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        temp_home = Path("/private/tmp/alpha_ledger_longbridge_home")
+        temp_home.mkdir(parents=True, exist_ok=True)
+        os.chmod(temp_home, 0o700)
+        source = Path(os.environ.get("HOME", "")).expanduser() / ".longbridge"
+        target = temp_home / ".longbridge"
+        if source.exists() and not target.exists() and not target.is_symlink():
+            try:
+                target.symlink_to(source, target_is_directory=True)
+            except OSError:
+                pass
+        env["HOME"] = str(temp_home)
+    return env
+
+
+def _run_lb(args: list[str] | tuple[str, ...], timeout: int = 30) -> dict | None:
+    cmd = ["longbridge", *args]
+    if "--format" not in args:
+        cmd.extend(["--format", "json"])
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_lb_env(),
+        )
+        if result.returncode != 0:
+            return None
+        text = result.stdout.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = _extract_json_payload(text)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            return {"items": data}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    finally:
+        time.sleep(0.15)
+    return None
+
+
+def _extract_json_payload(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            data, _end = decoder.raw_decode(text[idx:])
+            return data
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("No JSON payload", text, 0)
+
+
+def _to_lb_symbol(ticker: str) -> str:
+    symbol = str(ticker).strip().upper()
+    if symbol.endswith(".SS"):
+        return symbol[:-3] + ".SH"
+    return symbol
+
+
+def _norm_key(key: object) -> str:
+    return "".join(
+        char for char in str(key).lower()
+        if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+    )
+
+
+def _walk_values(data: Any):
+    if isinstance(data, dict):
+        yield data
+        for value in data.values():
+            yield from _walk_values(value)
+    elif isinstance(data, list):
+        yield data
+        for value in data:
+            yield from _walk_values(value)
+
+
+def _as_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text in {"-", "--", "None", "null"}:
+        return None
+    multiplier = 1.0
+    if "亿" in text:
+        multiplier = 100000000.0
+    elif "万" in text:
+        multiplier = 10000.0
+    cleaned = (
+        text.replace(",", "")
+        .replace("%", "")
+        .replace("+", "")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("（", "")
+        .replace("）", "")
+        .replace("亿", "")
+        .replace("万", "")
+        .replace("元", "")
+        .replace("￥", "")
+    )
+    try:
+        return float(cleaned) * multiplier
+    except ValueError:
+        return None
+
+
+def _first_value(data: Any, keys: tuple[str, ...]) -> object | None:
+    normalized = {_norm_key(key) for key in keys}
+    for node in _walk_values(data):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if _norm_key(key) in normalized:
+                return value
+    return None
+
+
+def _first_number(data: Any, keys: tuple[str, ...]) -> float | None:
+    return _as_float(_first_value(data, keys))
+
+
+def _find_number_by_terms(data: Any, terms: tuple[str, ...]) -> float | None:
+    normalized_terms = tuple(_norm_key(term) for term in terms)
+    for node in _walk_values(data):
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            norm = _norm_key(key)
+            if all(term in norm for term in normalized_terms):
+                number = _as_float(value)
+                if number is not None:
+                    return number
+    return None
+
+
+def _fmt_money(value: float | None) -> str:
+    if value is None:
+        return "-"
+    sign = "+" if value > 0 else ""
+    abs_value = abs(value)
+    if abs_value >= 100000000:
+        return f"{sign}{value / 100000000:.2f} 亿"
+    if abs_value >= 10000:
+        return f"{sign}{value / 10000:.2f} 万"
+    return f"{sign}{value:.2f}"
+
+
+def _fmt_money_short(value: float | None) -> str:
+    if value is None:
+        return "-"
+    abs_value = abs(value)
+    if abs_value >= 100000000:
+        return f"{value / 100000000:.2f}亿"
+    if abs_value >= 10000:
+        return f"{value / 10000:.0f}万"
+    return f"{value:.0f}"
+
+
+def _fmt_signed_pct(value: float | None) -> str:
+    if value is None:
+        return "-"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
+
+
+def _fmt_percentile(value: float | None) -> str:
+    if value is None:
+        return "-"
+    pct = value * 100.0 if abs(value) <= 1.0 else value
+    return f"{pct:.0f}%"
+
+
+def _capital_value(data: Any, size: str) -> float | None:
+    aliases = {
+        "large": (
+            "large_net_inflow",
+            "large_order_net_inflow",
+            "large_net_amount",
+            "large_order_net_amount",
+            "big_order_net_inflow",
+            "big_net_inflow",
+            "大单净流入",
+            "大单净额",
+        ),
+        "medium": (
+            "medium_net_inflow",
+            "medium_order_net_inflow",
+            "medium_net_amount",
+            "medium_order_net_amount",
+            "中单净流入",
+            "中单净额",
+        ),
+        "small": (
+            "small_net_inflow",
+            "small_order_net_inflow",
+            "small_net_amount",
+            "small_order_net_amount",
+            "小单净流入",
+            "小单净额",
+        ),
+    }
+    value = _first_number(data, aliases[size])
+    if value is not None:
+        return value
+    terms = {"large": ("large", "net"), "medium": ("medium", "net"), "small": ("small", "net")}
+    value = _find_number_by_terms(data, terms[size])
+    if value is not None:
+        return value
+    cn_terms = {"large": ("大单", "净"), "medium": ("中单", "净"), "small": ("小单", "净")}
+    return _find_number_by_terms(data, cn_terms[size])
+
+
+def _market_temp_label(value: float) -> str:
+    if value >= 80:
+        return "过热"
+    if value >= 60:
+        return "偏热"
+    if value >= 40:
+        return "中性"
+    if value >= 20:
+        return "偏冷"
+    return "低迷"
+
+
+def _market_overview() -> str:
+    lines: list[str] = []
+    temp_data = _run_lb(["market-temp", "CN"])
+    # market-temp 返回 {items: [{field: "Temperature", value: "84"}, ...]}
+    temp = None
+    desc = ""
+    temp_items = temp_data.get("items", []) if isinstance(temp_data, dict) else (temp_data if isinstance(temp_data, list) else [])
+    if isinstance(temp_items, list):
+        for item in temp_items:
+            if isinstance(item, dict):
+                field = item.get("field", "").lower()
+                value = item.get("value", "")
+                if field == "temperature":
+                    try:
+                        temp = float(value)
+                    except (ValueError, TypeError):
+                        pass
+                elif field == "description":
+                    desc = value
+
+    capital_data = _run_lb(["capital", "000300.SH"])
+    large_flow = _capital_value(capital_data, "large") if capital_data else None
+
+    if temp is not None or capital_data:
+        lines.append("## 市场环境")
+        lines.append("")
+    if temp is not None:
+        label = desc if desc else _market_temp_label(temp)
+        lines.append(f"- 市场温度：{temp:.0f}/100（{label}）")
+    if capital_data:
+        if large_flow is None:
+            lines.append("- 沪深300资金：暂无资金流数据（非交易时段可能为空）")
+        else:
+            lines.append(f"- 沪深300资金：大单净流入 {_fmt_money(large_flow)}")
+    return "\n".join(lines)
+
+
+def _calc_rsi(closes: list[float], period: int = 14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    if len(gains) < period:
+        return None
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - 100 / (1 + rs)
+
+
+def _calc_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
+    def ema(data: list[float], n: int):
+        k = 2 / (n + 1)
+        result = [data[0]]
+        for i in range(1, len(data)):
+            result.append(data[i] * k + result[-1] * (1 - k))
+        return result
+
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    dif = [f - s for f, s in zip(ema_fast, ema_slow)]
+    dea = ema(dif, signal)
+    macd = [(d - e) * 2 for d, e in zip(dif, dea)]
+    return dif[-1], dea[-1], macd[-1]
+
+
+def _calc_kdj(highs: list[float], lows: list[float], closes: list[float], period: int = 9):
+    if len(closes) < period:
+        return None, None, None
+    k, d = 50.0, 50.0
+    for i in range(period - 1, len(closes)):
+        h = max(highs[i - period + 1:i + 1])
+        l = min(lows[i - period + 1:i + 1])
+        rsv = (closes[i] - l) / (h - l) * 100 if h != l else 50
+        k = 2 / 3 * k + 1 / 3 * rsv
+        d = 2 / 3 * d + 1 / 3 * k
+    j = 3 * k - 2 * d
+    return k, d, j
+
+
+def _calc_risk(closes: list[float]):
+    import math
+
+    returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] != 0]
+    if len(returns) < 20:
+        return {}
+    vol = (sum(r**2 for r in returns[-20:]) / 20) ** 0.5 * math.sqrt(252) * 100
+    peak = closes[0]
+    max_dd = 0
+    for c in closes:
+        peak = max(peak, c)
+        dd = (peak - c) / peak * 100
+        max_dd = max(max_dd, dd)
+    sr = sorted(returns)
+    var95 = sr[int(len(sr) * 0.05)] * 100
+    return {"vol": vol, "max_dd": max_dd, "var95": var95}
+
+
+def _record_field(record: dict, keys: tuple[str, ...]) -> object | None:
+    normalized = {_norm_key(key) for key in keys}
+    for key, value in record.items():
+        if _norm_key(key) in normalized:
+            return value
+    return None
+
+
+def _extract_records(data: Any) -> list[dict]:
+    best: list[dict] = []
+    for node in _walk_values(data):
+        if not isinstance(node, list):
+            continue
+        records = [item for item in node if isinstance(item, dict)]
+        if len(records) > len(best):
+            best = records
+    return best
+
+
+def _extract_kline(data: Any) -> tuple[list[float], list[float], list[float]]:
+    closes: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    for record in _extract_records(data):
+        close = _as_float(_record_field(record, ("close", "c", "closing_price", "收盘价")))
+        high = _as_float(_record_field(record, ("high", "h", "highest", "最高价")))
+        low = _as_float(_record_field(record, ("low", "l", "lowest", "最低价")))
+        if close is None or high is None or low is None:
+            continue
+        closes.append(close)
+        highs.append(high)
+        lows.append(low)
+    return highs, lows, closes
+
+
+def _macd_signal(closes: list[float]) -> str:
+    if len(closes) < 2:
+        return "-"
+    dif, dea, _macd = _calc_macd(closes)
+    prev_dif, prev_dea, _prev_macd = _calc_macd(closes[:-1])
+    if prev_dif <= prev_dea and dif > dea:
+        return "金叉"
+    if prev_dif >= prev_dea and dif < dea:
+        return "死叉"
+    return "多头" if dif > dea else "空头"
+
+
+def _metric_pair(data: Any, metric: str) -> tuple[float | None, float | None]:
+    metric_norm = _norm_key(metric)
+    value_aliases = {
+        "pe": ("pe", "pe_ttm", "pettm", "price_earning_ratio", "市盈率"),
+        "pb": ("pb", "pb_ratio", "price_book_ratio", "市净率"),
+    }
+    pct_aliases = {
+        "pe": ("pe_percentile", "pe_rank", "pe_industry_percentile", "pe_percentile_rank", "市盈率分位"),
+        "pb": ("pb_percentile", "pb_rank", "pb_industry_percentile", "pb_percentile_rank", "市净率分位"),
+    }
+    value = _first_number(data, value_aliases[metric_norm])
+    pct = _first_number(data, pct_aliases[metric_norm])
+    if value is not None or pct is not None:
+        return value, pct
+
+    for node in _walk_values(data):
+        if not isinstance(node, dict):
+            continue
+        label = _record_field(node, ("metric", "name", "indicator", "指标", "项目"))
+        if label is None or metric_norm not in _norm_key(label):
+            continue
+        value = _as_float(_record_field(node, ("value", "current", "latest", "值", "当前值")))
+        pct = _as_float(_record_field(node, ("percentile", "rank", "percentile_rank", "industry_percentile", "分位", "排名")))
+        return value, pct
+    return None, None
+
+
+def _format_capital(data: dict | None) -> str:
+    if not data:
+        return "**资金流** 暂无数据（非交易时段可能为空）"
+    large = _capital_value(data, "large")
+    medium = _capital_value(data, "medium")
+    small = _capital_value(data, "small")
+    if large is None and medium is None and small is None:
+        return "**资金流** 暂无数据（非交易时段可能为空）"
+    return (
+        f"**资金流** 大单 {_fmt_money(large)} | "
+        f"中单 {_fmt_money(medium)} | 小单 {_fmt_money(small)}"
+    )
+
+
+def _format_technical(data: dict | None) -> tuple[str, str]:
+    if not data:
+        return "**技术面** 暂无K线数据", "**风险** 暂无足够K线数据"
+    highs, lows, closes = _extract_kline(data)
+    if not closes:
+        return "**技术面** 暂无K线数据", "**风险** 暂无足够K线数据"
+
+    rsi = _calc_rsi(closes)
+    k, d, j = _calc_kdj(highs, lows, closes)
+    tech_parts = [f"MACD {_macd_signal(closes)}"]
+    tech_parts.append(f"RSI {rsi:.1f}" if rsi is not None else "RSI -")
+    if k is not None and d is not None and j is not None:
+        tech_parts.append(f"KDJ K{k:.0f}/D{d:.0f}/J{j:.0f}")
+    else:
+        tech_parts.append("KDJ -")
+
+    risk = _calc_risk(closes)
+    if risk:
+        risk_line = (
+            f"**风险** 波动率 {risk['vol']:.1f}% | "
+            f"最大回撤 -{risk['max_dd']:.1f}% | VaR(95%) {risk['var95']:.1f}%"
+        )
+    else:
+        risk_line = "**风险** 暂无足够K线数据"
+    return f"**技术面** {' | '.join(tech_parts)}", risk_line
+
+
+def _format_valuation(data: dict | None) -> str:
+    if not data:
+        return "**估值** 暂无估值数据"
+    pe, pe_pct = _metric_pair(data, "pe")
+    pb, pb_pct = _metric_pair(data, "pb")
+    if pe is None and pb is None:
+        return "**估值** 暂无估值数据"
+    pe_text = f"PE {pe:.1f}" if pe is not None else "PE -"
+    pb_text = f"PB {pb:.1f}" if pb is not None else "PB -"
+    if pe_pct is not None:
+        pe_text += f"（行业{_fmt_percentile(pe_pct)}分位）"
+    if pb_pct is not None:
+        pb_text += f"（行业{_fmt_percentile(pb_pct)}分位）"
+    return f"**估值** {pe_text} | {pb_text}"
+
+
+def _format_financial_report(data: dict | None) -> str:
+    if not data:
+        return "**财报** 暂无最新财报数据"
+    period = _first_value(data, ("period", "quarter", "report_period", "fiscal_period", "报告期", "季度"))
+    revenue = _first_number(data, ("revenue", "operating_revenue", "total_revenue", "营业收入", "营收"))
+    revenue_yoy = _first_number(data, ("revenue_yoy", "operating_revenue_yoy", "revenue_growth", "营收同比", "营业收入同比"))
+    profit = _first_number(data, ("net_profit", "net_income", "net_profit_attributable", "归母净利润", "净利润"))
+    profit_yoy = _first_number(data, ("net_profit_yoy", "net_income_yoy", "profit_growth", "净利同比", "净利润同比"))
+    if revenue is None and profit is None:
+        return "**财报** 暂无最新财报数据"
+
+    prefix = str(period) if period else "最新"
+    parts = []
+    if revenue is not None:
+        text = f"营收 {_fmt_money_short(revenue)}"
+        if revenue_yoy is not None:
+            text += f"({_fmt_signed_pct(revenue_yoy)})"
+        parts.append(text)
+    if profit is not None:
+        text = f"净利 {_fmt_money_short(profit)}"
+        if profit_yoy is not None:
+            text += f"({_fmt_signed_pct(profit_yoy)})"
+        parts.append(text)
+    return f"**财报** {prefix} {' | '.join(parts)}"
+
+
+def _stock_deep_analysis(ticker: str) -> str:
+    symbol = _to_lb_symbol(ticker)
+    capital = _run_lb(["capital", symbol])
+    kline = _run_lb(["kline", symbol, "--period", "day", "--count", "60"])
+    valuation = _run_lb(["valuation", symbol])
+    financial = _run_lb(["financial-report", symbol])
+
+    technical_line, risk_line = _format_technical(kline)
+    return "\n".join(
+        [
+            _format_capital(capital),
+            technical_line,
+            _format_valuation(valuation),
+            _format_financial_report(financial),
+            risk_line,
+        ]
+    )
+
+
+def _industry_name(record: dict) -> str:
+    value = _record_field(record, ("industry", "name", "sector", "行业", "板块"))
+    return str(value) if value else "-"
+
+
+def _record_pct(record: dict) -> float | None:
+    return _as_float(_record_field(record, ("change_pct", "pct_chg", "change_rate", "chg", "涨跌幅", "涨幅")))
+
+
+def _market_insights() -> str:
+    lines: list[str] = []
+    rank_data = _run_lb(["industry-rank", "--market", "CN"])
+    # industry-rank 返回 {items: [{name, chg, lists: [{name, chg, ...}]}]}
+    # 需要展平 lists 获取子行业数据
+    rank_rows = []
+    if rank_data and isinstance(rank_data, dict):
+        for item in rank_data.get("items", []):
+            for sub in item.get("lists", []):
+                if sub.get("name") and sub.get("chg"):
+                    rank_rows.append(sub)
+    rank_rows = rank_rows[:10]
+    if rank_rows:
+        lines.append("## 行业热度 Top 10")
+        lines.append("")
+        lines.append("| 排名 | 行业 | 涨跌幅 |")
+        lines.append("|---:|---|---:|")
+        for idx, record in enumerate(rank_rows, start=1):
+            lines.append(f"| {idx} | {_industry_name(record)} | {_fmt_signed_pct(_record_pct(record))} |")
+        lines.append("")
+
+    calendar_data = _run_lb([
+        "finance-calendar",
+        "--category",
+        "report",
+        "--start",
+        "2026-05-29",
+        "--end",
+        "2026-06-05",
+    ])
+    calendar_rows = _extract_records(calendar_data) if calendar_data else []
+    if calendar_rows:
+        lines.append("## 近期催化剂")
+        lines.append("")
+        for record in calendar_rows[:20]:
+            date_value = _record_field(record, ("date", "event_date", "report_date", "披露日期", "日期"))
+            name = _record_field(record, ("name", "company_name", "title", "event", "公司", "证券简称"))
+            ticker = _record_field(record, ("symbol", "ticker", "code", "代码"))
+            label = str(name or ticker or "财报")
+            date_text = str(date_value or "-")
+            if len(date_text) >= 10 and date_text[4] == "-" and date_text[7] == "-":
+                date_text = date_text[5:10]
+            suffix = f" `{ticker}`" if ticker and name else ""
+            lines.append(f"- {date_text} {label}{suffix} 财报")
+    return "\n".join(lines).rstrip()
 
 
 def _latest_price_date(conn: sqlite3.Connection, market: str = "CN_A") -> str | None:
@@ -402,6 +983,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append(f"- data_note: {note}")
     lines.append(f"- 正式交易范围：{FORMAL_MARKET_LABEL}。美股/港股暂为实验数据，不进入今日买入清单。")
     lines.append("")
+    overview = _market_overview()
+    if overview:
+        lines.append(overview)
+        lines.append("")
     if not rows:
         lines.append("暂无可操作候选。")
         return "\n".join(lines).rstrip() + "\n"
@@ -436,6 +1021,7 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
 
     top_picks = _model_top_picks(conn, as_of_date)
     if top_picks:
+        analysis_cache: dict[str, str] = {}
         lines.append("## 模型选股（Top 3，仅供参考，非策略筛选）")
         lines.append("")
         lines.append("> 每个模型选出预测分数最高的 3 只股票。仅供参考，不计入正式买入清单。")
@@ -452,6 +1038,13 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                     f"{_fmt_model_pick_pct(p, 'M1')} | {_fmt_model_pick_pct(p, 'M2')} | {_fmt_model_pick_pct(p, 'M3')} | "
                     f"{p['close']:.2f} | {chg_str} |"
                 )
+                ticker = str(p["ticker"])
+                if ticker not in analysis_cache:
+                    analysis_cache[ticker] = _stock_deep_analysis(ticker)
+                if analysis_cache[ticker]:
+                    lines.append("")
+                    lines.append(analysis_cache[ticker])
+                    lines.append("")
             lines.append("")
 
     if confirmed_today:
@@ -547,6 +1140,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     lines.append("- 跌破止损或事件窗口低点，直接淘汰。")
     lines.append("- 等确认候选若次日不放量承接或收盘跌回触发位下方，降级观察。")
     lines.append("- 同一股票同日多策略重叠时，只按最高分策略处理，避免重复下注。")
+    insights = _market_insights()
+    if insights:
+        lines.append("")
+        lines.append(insights)
     return "\n".join(lines).rstrip() + "\n"
 
 

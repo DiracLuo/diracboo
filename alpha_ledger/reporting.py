@@ -257,6 +257,16 @@ def _fmt_percentile(value: float | None) -> str:
 
 
 def _capital_value(data: Any, size: str) -> float | None:
+    # Longbridge CLI 返回 {capital_in: {large, medium, small}, capital_out: {large, medium, small}}
+    if isinstance(data, dict):
+        cap_in = data.get("capital_in", {})
+        cap_out = data.get("capital_out", {})
+        if isinstance(cap_in, dict) and isinstance(cap_out, dict):
+            in_val = _as_float(cap_in.get(size))
+            out_val = _as_float(cap_out.get(size))
+            if in_val is not None and out_val is not None:
+                return in_val - out_val
+    # 兼容扁平格式
     aliases = {
         "large": (
             "large_net_inflow",

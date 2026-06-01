@@ -70,7 +70,9 @@
       "Bash(awk '{print \"PID:\", $2, \"CPU:\", $3, \"MEM:\", $4, \"TIME:\", $10}')",
       "Bash(awk '/^### M1.*深度分析/,/^### M2/' reports/daily_plan_2026-06-01.md)",
       "Bash(awk '/^## 缠论分析/,/^## 行业热度/' reports/daily_plan_2026-06-01.md)",
-      "Bash(git commit -m 'feat: 06-01 data update, clean report layout, restore chan analysis *)"
+      "Bash(git commit -m 'feat: 06-01 data update, clean report layout, restore chan analysis *)",
+      "Bash(longbridge capital *)",
+      "Bash(git commit -m 'fix: parse Longbridge capital flow nested format \\(capital_in/out\\) *)"
     ]
   }
 }

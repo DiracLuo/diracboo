@@ -6,6 +6,7 @@ Used to adjust candidate scores after screening, not as standalone signals.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -162,10 +163,69 @@ NEGATIVE_FACTORS = {"volatility_20d"}
 
 # 多模型评分配置：(model_name, model_version, score_field, percentile_field)
 MULTI_MODEL_CONFIGS = [
-    ("qlib_alpha158", "t5_full_20260601", "model_score", "model_percentile"),
+    ("qlib_alpha158", "t5_full_20260601_v2", "model_score", "model_percentile"),
     ("qlib_alpha158_20250101", "t10_v3", "model_score_2", "model_percentile_2"),
     ("qlib_alpha158_20260101", "t10_v3", "model_score_3", "model_percentile_3"),
 ]
+
+
+def _version_prefix(model_version: str) -> str:
+    """Return a stable prefix for date-suffixed model versions."""
+    match = re.match(r"^(?P<prefix>.+)_\d{8}(?:_v\d+)?$", model_version)
+    if match:
+        return match.group("prefix")
+    return model_version
+
+
+def _resolve_model_version(
+    conn: sqlite3.Connection,
+    model_name: str,
+    preferred_version: str,
+    as_of_date: str,
+) -> str | None:
+    """Resolve preferred version, falling back to latest date-suffixed version."""
+    row = conn.execute(
+        """
+        SELECT MAX(score_date) AS d
+        FROM model_scores
+        WHERE model_name = ? AND model_version = ? AND score_date <= ?
+        """,
+        (model_name, preferred_version, as_of_date),
+    ).fetchone()
+    if row and row["d"]:
+        return preferred_version
+
+    prefix = _version_prefix(preferred_version)
+    row = conn.execute(
+        """
+        SELECT model_version, MAX(score_date) AS latest_score_date, MAX(created_at) AS latest_created_at
+        FROM model_scores
+        WHERE model_name = ?
+          AND score_date <= ?
+          AND model_version LIKE ?
+        GROUP BY model_version
+        ORDER BY latest_score_date DESC, latest_created_at DESC, model_version DESC
+        LIMIT 1
+        """,
+        (model_name, as_of_date, f"{prefix}_%"),
+    ).fetchone()
+    if row and row["model_version"]:
+        return str(row["model_version"])
+
+    row = conn.execute(
+        """
+        SELECT model_version, MAX(score_date) AS latest_score_date, MAX(created_at) AS latest_created_at
+        FROM model_scores
+        WHERE model_name = ? AND score_date <= ?
+        GROUP BY model_version
+        ORDER BY latest_score_date DESC, latest_created_at DESC, model_version DESC
+        LIMIT 1
+        """,
+        (model_name, as_of_date),
+    ).fetchone()
+    if row and row["model_version"]:
+        return str(row["model_version"])
+    return None
 
 
 def compute_cross_sectional_ranks(
@@ -313,6 +373,10 @@ def attach_model_scores(
         configs = model_configs or MULTI_MODEL_CONFIGS
 
     for cfg_model_name, cfg_model_version, score_field, percentile_field in configs:
+        resolved_version = _resolve_model_version(conn, cfg_model_name, cfg_model_version, as_of_date)
+        if resolved_version is None:
+            continue
+
         # 查找 as_of_date 当日或之前最近一次可用模型分。
         row = conn.execute(
             """
@@ -320,7 +384,7 @@ def attach_model_scores(
             FROM model_scores
             WHERE model_name = ? AND model_version = ? AND score_date <= ?
             """,
-            (cfg_model_name, cfg_model_version, as_of_date),
+            (cfg_model_name, resolved_version, as_of_date),
         ).fetchone()
         if not row or not row["d"]:
             continue
@@ -333,7 +397,7 @@ def attach_model_scores(
             WHERE model_name = ? AND model_version = ?
               AND score_date = ? AND ticker IN ({placeholders})
             """,
-            [cfg_model_name, cfg_model_version, score_date, *tickers],
+            [cfg_model_name, resolved_version, score_date, *tickers],
         ).fetchall()
 
         score_map = {str(r["ticker"]): (float(r["score"]), float(r["percentile"])) for r in rows}

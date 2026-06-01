@@ -553,6 +553,43 @@ def command_data_audit(
                     )
 
 
+def _missing_model_predictions(conn, as_of: str, market: str = "CN_A") -> list[str]:
+    try:
+        from .alpha_factors import MULTI_MODEL_CONFIGS
+    except Exception:
+        return []
+
+    missing: list[str] = []
+    seen: set[str] = set()
+    for model_name, _model_version, _score_field, _percentile_field in MULTI_MODEL_CONFIGS:
+        if model_name in seen:
+            continue
+        seen.add(model_name)
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM model_scores
+            WHERE market = ? AND model_name = ? AND score_date = ?
+            """,
+            (market, model_name, as_of),
+        ).fetchone()
+        if not row or int(row["count"]) == 0:
+            missing.append(model_name)
+    return missing
+
+
+def _print_model_prediction_hint(missing_models: list[str], as_of: str) -> None:
+    if not missing_models:
+        return
+    script_path = Path("scripts/update_model_predictions.py")
+    print(
+        "WARNING: model_scores 缺少 "
+        f"{as_of} 的模型预测 ({', '.join(missing_models)}). "
+        "建议运行 "
+        f"/opt/anaconda3/bin/python3 {script_path} --as-of {as_of}"
+    )
+
+
 def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = False) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
@@ -573,6 +610,8 @@ def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = Fa
             ignore_adjustment_for_short_term=True,
         )
         candidate_count = screen_all(conn, as_of)
+        missing_models = _missing_model_predictions(conn, as_of)
+        _print_model_prediction_hint(missing_models, as_of)
         confirmed = confirm_candidates(conn, as_of)
         confirmed_pb = confirm_pullback_candidates(conn, as_of)
         report_path = write_daily_plan(conn, as_of)

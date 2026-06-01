@@ -202,8 +202,62 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
 def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, list[dict]]:
     """每个模型返回 percentile 最高的 3 只股票（排除 ST/ETF/指数/基金）。
 
-    Returns: {model_label: [{ticker, name, percentile, close, change_pct}]}
+    Returns: {model_label: [{ticker, name, percentiles, close, change_pct}]}
     """
+    model_configs = []
+    for idx, config in enumerate(MULTI_MODEL_CONFIGS, start=1):
+        model_name, model_version, _score_field, percentile_field, *rest = config
+        short_label = f"M{idx}"
+        display_label = str(rest[0]) if rest else MODEL_LABELS.get(
+            (model_name, model_version),
+            f"{short_label} ({model_name} {model_version})",
+        )
+        model_configs.append(
+            {
+                "model_name": model_name,
+                "model_version": model_version,
+                "percentile_field": percentile_field,
+                "short_label": short_label,
+                "display_label": display_label,
+            }
+        )
+
+    all_scores: dict[str, dict[str, float]] = {}
+    for config in model_configs:
+        row = conn.execute(
+            """
+            SELECT MAX(score_date) AS d
+            FROM model_scores
+            WHERE model_name = ?
+              AND model_version = ?
+              AND market = 'CN_A'
+              AND score_date <= ?
+            """,
+            (config["model_name"], config["model_version"], as_of_date),
+        ).fetchone()
+        if not row or not row["d"]:
+            continue
+
+        rows = conn.execute(
+            """
+            SELECT ticker, percentile
+            FROM model_scores
+            WHERE model_name = ?
+              AND model_version = ?
+              AND market = 'CN_A'
+              AND score_date = ?
+            """,
+            (config["model_name"], config["model_version"], row["d"]),
+        ).fetchall()
+        for score_row in rows:
+            if score_row["percentile"] is None:
+                continue
+            percentile = float(score_row["percentile"])
+            if percentile > 1.0:
+                percentile /= 100.0
+            ticker = str(score_row["ticker"])
+            all_scores.setdefault(ticker, {})[str(config["short_label"])] = percentile
+
     candidate_rows = conn.execute(
         """
         SELECT DISTINCT ticker
@@ -215,7 +269,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
     candidate_tickers = {str(row["ticker"]) for row in candidate_rows}
 
     result: dict[str, list[dict]] = {}
-    for model_name, model_version, _score_field, _percentile_field in MULTI_MODEL_CONFIGS:
+    for config in model_configs:
         row = conn.execute(
             """
             SELECT MAX(score_date) AS d
@@ -225,7 +279,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND market = 'CN_A'
               AND score_date <= ?
             """,
-            (model_name, model_version, as_of_date),
+            (config["model_name"], config["model_version"], as_of_date),
         ).fetchone()
         if not row or not row["d"]:
             continue
@@ -240,7 +294,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND score_date = ?
             ORDER BY percentile DESC
             """,
-            (model_name, model_version, row["d"]),
+            (config["model_name"], config["model_version"], row["d"]),
         ).fetchall()
 
         picks: list[dict] = []
@@ -292,7 +346,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
             picks.append({
                 "ticker": ticker,
                 "name": name,
-                "percentile": float(score_row["percentile"]),
+                "percentiles": all_scores.get(ticker, {}),
                 "close": close,
                 "change_pct": change_pct,
             })
@@ -300,8 +354,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
                 break
 
         if picks:
-            label = MODEL_LABELS.get((model_name, model_version), f"{model_name} {model_version}")
-            result[label] = picks
+            result[str(config["display_label"])] = picks
 
     return result
 
@@ -311,6 +364,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
 
     def _fmt_model_pct(row: sqlite3.Row, field: str) -> str:
         val = row[field] if field in row.keys() else None
+        return f"{float(val):.0%}" if val is not None else "-"
+
+    def _fmt_model_pick_pct(pick: dict, label: str) -> str:
+        val = pick.get("percentiles", {}).get(label)
         return f"{float(val):.0%}" if val is not None else "-"
 
     latest_date = _latest_price_date(conn, "CN_A")
@@ -386,12 +443,13 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         for model_label, picks in top_picks.items():
             lines.append(f"### {model_label}")
             lines.append("")
-            lines.append("| 股票 | 代码 | 模型百分位 | 收盘价 | 涨跌幅 |")
-            lines.append("|---|---|---:|---:|---:|")
+            lines.append("| 股票 | 代码 | M1 | M2 | M3 | 收盘价 | 涨跌幅 |")
+            lines.append("|---|---|---:|---:|---:|---:|---:|")
             for p in picks:
                 chg_str = f"{p['change_pct']:.1f}%" if p.get("change_pct") is not None else "-"
                 lines.append(
-                    f"| {p['name']} | `{p['ticker']}` | {p['percentile']:.0%} | "
+                    f"| {p['name']} | `{p['ticker']}` | "
+                    f"{_fmt_model_pick_pct(p, 'M1')} | {_fmt_model_pick_pct(p, 'M2')} | {_fmt_model_pick_pct(p, 'M3')} | "
                     f"{p['close']:.2f} | {chg_str} |"
                 )
             lines.append("")

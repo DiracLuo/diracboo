@@ -162,9 +162,9 @@ NEGATIVE_FACTORS = {"volatility_20d"}
 
 # 多模型评分配置：(model_name, model_version, score_field, percentile_field)
 MULTI_MODEL_CONFIGS = [
-    ("qlib_alpha158", "t5_full_20260530", "model_score", "model_percentile"),
-    ("qlib_alpha158_20250101", "t10_v2", "model_score_2", "model_percentile_2"),
-    ("qlib_alpha158_20260101", "t10_v2", "model_score_3", "model_percentile_3"),
+    ("qlib_alpha158", "t5_full_20260601", "model_score", "model_percentile"),
+    ("qlib_alpha158_20250101", "t10_v3", "model_score_2", "model_percentile_2"),
+    ("qlib_alpha158_20260101", "t10_v3", "model_score_3", "model_percentile_3"),
 ]
 
 
@@ -305,7 +305,7 @@ def attach_model_scores(
     if model_name is not None or model_version is not None:
         configs = [(
             model_name or "qlib_alpha158",
-            model_version or "t5_full_20260530",
+            model_version or "t5_full_20260601",
             "model_score",
             "model_percentile",
         )]

@@ -5,6 +5,7 @@ __pycache__/
 data/*.sqlite
 reports/*.md
 .DS_Store
+Users/
 
 data/alpha_ledger.sqlite
 data/qlib_export*/

@@ -47,9 +47,9 @@ def fmt_rate(value: object) -> str:
 MAX_ACTIONABLE_CANDIDATES = 5
 FORMAL_MARKET_LABEL = ", ".join(FORMAL_MARKETS)
 MODEL_LABELS = {
-    ("qlib_alpha158", "t5_full_20260530"): "M1 (2024~ T+5)",
-    ("qlib_alpha158_20250101", "t10_v2"): "M2 (2025~ T+10)",
-    ("qlib_alpha158_20260101", "t10_v2"): "M3 (2026~ T+10)",
+    ("qlib_alpha158", "t5_full_20260601"): "M1 (2024~ T+5)",
+    ("qlib_alpha158_20250101", "t10_v3"): "M2 (2025~ T+10)",
+    ("qlib_alpha158_20260101", "t10_v3"): "M3 (2026~ T+10)",
 }
 
 

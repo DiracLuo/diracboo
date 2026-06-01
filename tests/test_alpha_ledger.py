@@ -1072,8 +1072,8 @@ class AlphaLedgerMvpTest(unittest.TestCase):
                 (ticker, metric_name, metric_value),
             )
         for model_name, model_version, percentile in [
-            ("qlib_alpha158_20250101", "t10_v2", 0.62),
-            ("qlib_alpha158_20260101", "t10_v2", 0.41),
+            ("qlib_alpha158_20250101", "t10_v3", 0.62),
+            ("qlib_alpha158_20260101", "t10_v3", 0.41),
         ]:
             self.conn.execute(
                 """

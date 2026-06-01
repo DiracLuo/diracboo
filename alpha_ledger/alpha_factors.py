@@ -160,6 +160,13 @@ POSITIVE_FACTORS = {"breakout_20d", "volume_ratio_10d", "momentum_5d", "momentum
 # Factors where LOWER raw value = BETTER signal
 NEGATIVE_FACTORS = {"volatility_20d"}
 
+# 多模型评分配置：(model_name, model_version, score_field, percentile_field)
+MULTI_MODEL_CONFIGS = [
+    ("qlib_alpha158", "t5_full_20260530", "model_score", "model_percentile"),
+    ("qlib_alpha158_20250101", "t10_v2", "model_score_2", "model_percentile_2"),
+    ("qlib_alpha158_20260101", "t10_v2", "model_score_3", "model_percentile_3"),
+]
+
 
 def compute_cross_sectional_ranks(
     conn: sqlite3.Connection,
@@ -279,55 +286,63 @@ def attach_model_scores(
     as_of_date: str,
     candidates: list[dict[str, object]],
     *,
-    model_name: str = "qlib_alpha158",
-    model_version: str = "t5_full_20260530",
+    model_configs: list[tuple[str, str, str, str]] | None = None,
+    model_name: str | None = None,
+    model_version: str | None = None,
 ) -> list[dict[str, object]]:
     """Attach Qlib model predictions to candidates without modifying candidate_score.
 
-    Adds two fields to each candidate dict:
-    - model_score: raw model prediction (higher = more bullish)
-    - model_percentile: cross-sectional percentile (0~1)
+    Adds model score and percentile fields to each candidate dict.
 
     Returns the list; candidate_score is NOT modified.
     """
     if not candidates:
         return candidates
 
-    # Find the latest score_date on or before as_of_date
-    row = conn.execute(
-        """
-        SELECT MAX(score_date) AS d
-        FROM model_scores
-        WHERE model_name = ? AND model_version = ? AND score_date <= ?
-        """,
-        (model_name, model_version, as_of_date),
-    ).fetchone()
-    if not row or not row["d"]:
-        return candidates
-
-    score_date = row["d"]
     tickers = [str(c["ticker"]) for c in candidates]
-
-    # Fetch scores and percentiles for these tickers
     placeholders = ",".join("?" for _ in tickers)
-    rows = conn.execute(
-        f"""
-        SELECT ticker, score, percentile
-        FROM model_scores
-        WHERE model_name = ? AND model_version = ?
-          AND score_date = ? AND ticker IN ({placeholders})
-        """,
-        [model_name, model_version, score_date, *tickers],
-    ).fetchall()
 
-    score_map = {str(r["ticker"]): (float(r["score"]), float(r["percentile"])) for r in rows}
+    if model_name is not None or model_version is not None:
+        configs = [(
+            model_name or "qlib_alpha158",
+            model_version or "t5_full_20260530",
+            "model_score",
+            "model_percentile",
+        )]
+    else:
+        configs = model_configs or MULTI_MODEL_CONFIGS
 
-    for c in candidates:
-        ticker = str(c["ticker"])
-        pair = score_map.get(ticker)
-        if pair is None:
+    for cfg_model_name, cfg_model_version, score_field, percentile_field in configs:
+        # 查找 as_of_date 当日或之前最近一次可用模型分。
+        row = conn.execute(
+            """
+            SELECT MAX(score_date) AS d
+            FROM model_scores
+            WHERE model_name = ? AND model_version = ? AND score_date <= ?
+            """,
+            (cfg_model_name, cfg_model_version, as_of_date),
+        ).fetchone()
+        if not row or not row["d"]:
             continue
-        c["model_score"] = round(pair[0], 6)
-        c["model_percentile"] = round(pair[1], 4)
+
+        score_date = row["d"]
+        rows = conn.execute(
+            f"""
+            SELECT ticker, score, percentile
+            FROM model_scores
+            WHERE model_name = ? AND model_version = ?
+              AND score_date = ? AND ticker IN ({placeholders})
+            """,
+            [cfg_model_name, cfg_model_version, score_date, *tickers],
+        ).fetchall()
+
+        score_map = {str(r["ticker"]): (float(r["score"]), float(r["percentile"])) for r in rows}
+        for c in candidates:
+            ticker = str(c["ticker"])
+            pair = score_map.get(ticker)
+            if pair is None:
+                continue
+            c[score_field] = round(pair[0], 6)
+            c[percentile_field] = round(pair[1], 4)
 
     return candidates

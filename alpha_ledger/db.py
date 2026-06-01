@@ -256,6 +256,10 @@ SCHEMA_STATEMENTS = [
         signal_close REAL,
         model_score REAL,
         model_percentile REAL,
+        model_score_2 REAL,
+        model_percentile_2 REAL,
+        model_score_3 REAL,
+        model_percentile_3 REAL,
         buy_zone_low REAL,
         buy_zone_high REAL,
         stop_loss REAL,
@@ -771,6 +775,18 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "candidates", "signal_close", "REAL")
         _add_column_if_missing(conn, "candidates", "model_score", "REAL")
         _add_column_if_missing(conn, "candidates", "model_percentile", "REAL")
+        for column in (
+            "model_score_2",
+            "model_percentile_2",
+            "model_score_3",
+            "model_percentile_3",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE candidates ADD COLUMN {column} REAL")
+            except sqlite3.OperationalError as exc:
+                # 兼容已升级过的数据库，重复列直接跳过。
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     _backfill_adjusted_prices(conn)
     _backfill_net_returns(conn)

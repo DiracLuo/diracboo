@@ -26,7 +26,14 @@ from alpha_ledger.metrics import (
 )
 from alpha_ledger.portfolio_backtest import _risk_parity_position_size, run_portfolio_backtest
 from alpha_ledger.reporting import daily_action_plan, render_daily_plan
-from alpha_ledger.screener import _candidate, _latest_financial_flags, confirm_candidates, screen_all, screen_event_catalyst
+from alpha_ledger.screener import (
+    _candidate,
+    _latest_financial_flags,
+    confirm_candidates,
+    screen_all,
+    screen_cn_a_pead_quality_surprise,
+    screen_event_catalyst,
+)
 from alpha_ledger.seed import seed_all
 from alpha_ledger.trading_rules import cn_a_limit_pct
 
@@ -134,7 +141,7 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         screen_all(self.conn, "2026-05-13")
         evaluate_candidate_horizons_for_date(self.conn, "2026-05-13", "2026-05-25")
         count = audit_all(self.conn, "2026-05-25")
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         row = self.conn.execute(
             """
             SELECT signal_count, health_status
@@ -979,6 +986,110 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         stop_distance = (float(row["entry_price"]) - float(row["stop_loss"])) / float(row["entry_price"])
         self.assertGreaterEqual(stop_distance, 0.03)
         self.assertLessEqual(stop_distance, 0.10)
+
+    def test_cn_a_pead_quality_surprise_requires_event_price_and_m2_m3(self) -> None:
+        ticker = "301113.SZ"
+        name = "财报测试"
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO instruments
+                (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+            VALUES ('CN_A', ?, ?, 'test', ?, 1, '[]', 'now')
+            """,
+            (ticker, name, ticker),
+        )
+        previous_close = 10.0
+        for day in range(1, 30):
+            date_value = f"2026-05-{day:02d}"
+            if day == 28:
+                close = previous_close * 1.03
+                volume = 1_700_000
+                change_pct = 3.0
+                high = close * 1.03
+                low = close * 0.96
+            elif day == 29:
+                close = previous_close * 1.01
+                volume = 1_200_000
+                change_pct = 1.0
+                high = close * 1.02
+                low = close * 0.98
+            else:
+                close = 10.0 + day * 0.03
+                volume = 1_000_000
+                change_pct = 0.3
+                high = close * 1.02
+                low = close * 0.98
+            self.conn.execute(
+                """
+                INSERT INTO price_bars (
+                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "CN_A",
+                    ticker,
+                    date_value,
+                    close * 0.99,
+                    close,
+                    high,
+                    low,
+                    volume,
+                    65_000_000,
+                    change_pct,
+                    close * 0.99,
+                    close,
+                    high,
+                    low,
+                    1.0,
+                    "ADJUSTED",
+                ),
+            )
+            previous_close = close
+
+        self.conn.execute(
+            """
+            INSERT INTO corporate_events (
+                market, ticker, name, event_date, event_type, title, source, source_url,
+                importance_score, summary, created_at
+            ) VALUES ('CN_A', ?, ?, '2026-05-28', 'EARNINGS_REPORT',
+                      '2026年一季报净利润超预期增长', 'test', '', 0.90, '', 'now')
+            """,
+            (ticker, name),
+        )
+        for metric_name, metric_value in [
+            ("净利润增长率(%)", 40.0),
+            ("主营业务收入增长率(%)", 18.0),
+            ("加权净资产收益率(%)", 12.0),
+        ]:
+            self.conn.execute(
+                """
+                INSERT INTO financial_metrics (
+                    market, ticker, report_date, published_date, metric_name,
+                    metric_value, unit, source, created_at
+                ) VALUES ('CN_A', ?, '2026-03-31', '2026-05-28', ?, ?, '%', 'test', 'now')
+                """,
+                (ticker, metric_name, metric_value),
+            )
+        for model_name, model_version, percentile in [
+            ("qlib_alpha158_20250101", "t10_v2", 0.62),
+            ("qlib_alpha158_20260101", "t10_v2", 0.41),
+        ]:
+            self.conn.execute(
+                """
+                INSERT INTO model_scores (
+                    model_name, model_version, market, ticker, score_date, score,
+                    rank, percentile, source_artifact, created_at
+                ) VALUES (?, ?, 'CN_A', ?, '2026-05-29', 0.1, 1, ?, 'test', 'now')
+                """,
+                (model_name, model_version, ticker, percentile),
+            )
+
+        rows = screen_cn_a_pead_quality_surprise(self.conn, "2026-05-29")
+        row = next((candidate for candidate in rows if candidate["ticker"] == ticker), None)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["strategy_id"], "cn_a_pead_quality_surprise")
+        self.assertGreaterEqual(float(row["candidate_score"]), 75.0)
 
     def test_risk_parity_sizes_high_risk_positions_smaller(self) -> None:
         low_risk = _risk_parity_position_size(

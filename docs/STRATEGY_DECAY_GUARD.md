@@ -58,9 +58,26 @@
 - `DECAY_WATCH`：完整样本表现变差，需要降权。
 - `ACTIVE_OBSERVE`：可以继续观察，但仍不是免检策略。
 
+## 权重调整管线
+
+审计结果不只是报告，还有自动化权重调整机制（`metrics.py`）：
+
+- `suggest_strategy_weight_adjustments`：根据审计结果生成建议，输出 `KEEP_COLLECTING`（样本不足继续收集）、`DOWN_WEIGHT`（表现差应降权）等推荐。
+- `apply_strategy_weight_adjustments`：将建议写入 `strategies.weight`，实际改变策略权重。
+
+通过 `tune-weights` 命令触发：
+
+```bash
+# 只看建议
+python -m alpha_ledger tune-weights --start 2026-04-01 --end 2026-05-15 --through 2026-05-25
+
+# 真正写入权重
+python -m alpha_ledger tune-weights --start 2026-04-01 --end 2026-05-15 --through 2026-05-25 --apply
+```
+
 ## 对默认策略的态度
 
-默认策略不是“我相信它们一定赚钱”，而是“它们有明确筛选器，能够生成可验证候选”。它们进入系统后必须竞争，不能凭名字占据权重。
+默认策略不是”我相信它们一定赚钱”，而是”它们有明确筛选器，能够生成可验证候选”。它们进入系统后必须竞争，不能凭名字占据权重。
 
 下一阶段应该做两类增强：
 

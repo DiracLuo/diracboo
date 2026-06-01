@@ -150,6 +150,30 @@ STRATEGIES = [
         "weight": 0.9,
     },
     {
+        "id": "cn_a_pead_quality_surprise",
+        "name": "A股财报超预期漂移",
+        "market_scope": "CN_A",
+        "thesis": "利用A股财报披露后的信息消化滞后。业绩超预期但公告后未过度反应的股票，存在后续漂移机会。",
+        "entry_rules_json": dump_json(
+            {
+                "event": "近1-5个交易日披露季报/年报/业绩快报/业绩预告修正",
+                "profit_growth": "扣非净利润同比>=25%，营收同比>=10%，ROE TTM>=8%",
+                "surprise": "实际值在预告上沿70%以上，或净利高于一致预期>=10%",
+                "post_announcement": "公告后首日涨幅-2%到+7%，非一字涨停，量比1.2-2.8，收盘在MA20上方",
+                "not_overextended": "过去20日涨幅<=25%，过去5日涨停次数<=1",
+                "model_requirement": "M2或M3>=60%",
+            }
+        ),
+        "exit_rules_json": dump_json(
+            {
+                "stop": "跌破公告日低点或-6%，取更近者",
+                "take_profit": "+8%减半，+15%或T+20清仓；跌破MA20清仓",
+            }
+        ),
+        "status": "ACTIVE",
+        "weight": 0.8,
+    },
+    {
         "id": "xingye_style_prepositioning",
         "name": "兴业科技型重估埋伏启动",
         "market_scope": "CN_A",
@@ -184,6 +208,7 @@ def rows() -> list[dict[str, object]]:
     default_version = "v1.1-cn-a-formal"
     horizon_by_strategy = {
         "trend_breakout": 20,
+        "cn_a_pead_quality_surprise": 20,
         "xingye_style_prepositioning": 10,
         "abnormal_volume_small_midcap": 5,
     }

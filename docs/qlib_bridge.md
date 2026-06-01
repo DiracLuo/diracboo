@@ -113,14 +113,38 @@ python -m alpha_ledger enrich-daily-bars \
 - Benchmarks/indexes are skipped (BaoStock does not support them).
 - Reports written to `reports/daily_enrichment_*.md` and `.json`.
 
-**Important:** Qlib Alpha158/Alpha360 training should wait for both full QFQ backfill (`backfill-qfq`) and daily enrichment (`enrich-daily-bars`) to complete before formal training runs. The enrichment path exists today, but the production DB is still being backfilled.
+**Important:** Qlib Alpha158/Alpha360 training should wait for both full QFQ backfill (`backfill-qfq`) and daily enrichment (`enrich-daily-bars`) to complete before formal training runs。实际 VWAP 覆盖率取决于 amount 字段填充情况，未填充的 ticker 回退到 `(high+low+close)/3`。
+
+## Ticker Normalization
+
+A 股 ticker 后缀需从 `.SH`/`.SZ` 归一化为 `.SS`/`.SZ`（新浪格式）。相关命令：
+
+```bash
+# 干跑审计，查看哪些 ticker 需要修复
+python -m alpha_ledger audit-tickers
+
+# 执行修复（默认干跑，加 --apply 真正写入）
+python -m alpha_ledger repair-tickers --apply
+```
+
+## Qlib Predictions 导入
+
+Qlib 模型训练产出的 `pred.pkl` 可导入为模型分数：
+
+```bash
+python -m alpha_ledger import-qlib-predictions \
+    --pred-path ~/code/external/qlib/output/pred.pkl \
+    --model-name alpha158_v1
+```
+
+导入后写入 `model_scores` 表，候选的 `model_score` 和 `model_percentile` 列会自动更新。
 
 ## Alpha158 vs Alpha360
 
 | Handler | Fields Needed | Status |
 |---------|--------------|--------|
 | Alpha360 | OHLCV | Working |
-| Alpha158 | OHLCV + VWAP | Working (vwap via typical price fallback) |
+| Alpha158 | OHLCV + VWAP | Working（有 amount 的 ticker 用真实 VWAP，否则回退 `(H+L+C)/3`） |
 
 ## Data Quality
 

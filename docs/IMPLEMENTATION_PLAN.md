@@ -26,6 +26,8 @@ Alpha Ledger 的目标是持续找出更可能赚钱的股票候选，而不是�
 
 `strategies.version` 记录当前策略参数版本；报告会显示 `strategy_id@version`，避免调参后混淆历史样本。
 
+`model_scores` 表存储 Qlib 等外部模型的预测分数（`import-qlib-predictions` 导入），写入候选的 `model_score` 和 `model_percentile` 列，作为独立于策略评分的参考维度。
+
 ## 核心命令
 
 ```bash
@@ -40,6 +42,8 @@ python -m alpha_ledger walk-forward --start 2026-04-01 --end 2026-05-25
 
 ## 回放逻辑
 
+- `trend_breakout` 筛选出涨幅 ≥8.5% 的强势股时标记为 `WATCH_PULLBACK`，暂缓买入。回调确认机制（`confirm_pullback_candidates`）通过三日形态判断：回调日回调 5-10% 且缩量、企稳日不破低点收阳、反转日回升收盘。三日全部满足后升级为 `BUY_CANDIDATE`。
+- 板块分散约束：同一 3 位股票代码前缀（如 `300`、`603`）最多入选 2 个候选，避免板块集中度过高。
 - 候选生成只读取候选日及以前数据。
 - 财务指标必须满足披露日约束。
 - 候选日不假设能以收盘价成交。

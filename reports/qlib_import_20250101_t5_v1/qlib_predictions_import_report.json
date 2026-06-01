@@ -1,0 +1,13 @@
+{
+  "model_name": "qlib_alpha158_20250101",
+  "model_version": "t5_v1",
+  "artifact_path": "mlruns/460699244947915754/fe4fc2e5cba948a4959cbef6fb6b8f08/artifacts/pred.pkl",
+  "imported_count": 5400,
+  "date_range": [
+    "2026-05-06",
+    "2026-05-29"
+  ],
+  "ticker_mapping_failures": 0,
+  "avg_stocks_per_day": 300.0,
+  "warnings": []
+}

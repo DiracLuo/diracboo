@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .alpha_factors import MULTI_MODEL_CONFIGS
 from .data_ops import CONFIDENCE_HIGH, audit_data_coverage
 from .metrics import (
     FORMAL_MARKETS,
@@ -15,6 +16,7 @@ from .metrics import (
     strategy_risk_adjusted_metrics,
     suggest_strategy_weight_adjustments,
 )
+from .screener import _is_excluded_name
 
 
 def fmt_pct(value: object) -> str:
@@ -37,6 +39,11 @@ def fmt_rate(value: object) -> str:
 
 MAX_ACTIONABLE_CANDIDATES = 5
 FORMAL_MARKET_LABEL = ", ".join(FORMAL_MARKETS)
+MODEL_LABELS = {
+    ("qlib_alpha158", "t5_full_20260530"): "M1 (2024~ T+5)",
+    ("qlib_alpha158_20250101", "t10_v2"): "M2 (2025~ T+10)",
+    ("qlib_alpha158_20260101", "t10_v2"): "M3 (2026~ T+10)",
+}
 
 
 def _latest_price_date(conn: sqlite3.Connection, market: str = "CN_A") -> str | None:
@@ -192,8 +199,120 @@ def daily_action_plan(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3
     ).fetchall()
 
 
+def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, list[dict]]:
+    """每个模型返回 percentile 最高的 3 只股票（排除 ST/ETF/指数/基金）。
+
+    Returns: {model_label: [{ticker, name, percentile, close, change_pct}]}
+    """
+    candidate_rows = conn.execute(
+        """
+        SELECT DISTINCT ticker
+        FROM candidates
+        WHERE market = 'CN_A' AND as_of_date = ?
+        """,
+        (as_of_date,),
+    ).fetchall()
+    candidate_tickers = {str(row["ticker"]) for row in candidate_rows}
+
+    result: dict[str, list[dict]] = {}
+    for model_name, model_version, _score_field, _percentile_field in MULTI_MODEL_CONFIGS:
+        row = conn.execute(
+            """
+            SELECT MAX(score_date) AS d
+            FROM model_scores
+            WHERE model_name = ?
+              AND model_version = ?
+              AND market = 'CN_A'
+              AND score_date <= ?
+            """,
+            (model_name, model_version, as_of_date),
+        ).fetchone()
+        if not row or not row["d"]:
+            continue
+
+        score_rows = conn.execute(
+            """
+            SELECT ticker, percentile
+            FROM model_scores
+            WHERE model_name = ?
+              AND model_version = ?
+              AND market = 'CN_A'
+              AND score_date = ?
+            ORDER BY percentile DESC
+            """,
+            (model_name, model_version, row["d"]),
+        ).fetchall()
+
+        picks: list[dict] = []
+        for score_row in score_rows:
+            ticker = str(score_row["ticker"])
+            if ticker in candidate_tickers:
+                continue
+
+            price_row = conn.execute(
+                """
+                SELECT
+                    p.ticker,
+                    COALESCE(i.name, p.ticker) AS name,
+                    p.close,
+                    prev.close AS prev_close
+                FROM price_bars p
+                LEFT JOIN instruments i
+                  ON i.market = p.market
+                 AND i.ticker = p.ticker
+                LEFT JOIN price_bars prev
+                  ON prev.market = p.market
+                 AND prev.ticker = p.ticker
+                 AND prev.date = (
+                     SELECT MAX(date)
+                     FROM price_bars
+                     WHERE market = p.market
+                       AND ticker = p.ticker
+                       AND date < p.date
+                 )
+                WHERE p.market = 'CN_A'
+                  AND p.ticker = ?
+                  AND p.date = ?
+                """,
+                (ticker, as_of_date),
+            ).fetchone()
+            if not price_row:
+                continue
+
+            name = str(price_row["name"])
+            if _is_excluded_name(name):
+                continue
+
+            close = float(price_row["close"])
+            prev_close = price_row["prev_close"]
+            change_pct = None
+            if prev_close is not None and float(prev_close) > 0:
+                change_pct = (close - float(prev_close)) / float(prev_close) * 100.0
+
+            picks.append({
+                "ticker": ticker,
+                "name": name,
+                "percentile": float(score_row["percentile"]),
+                "close": close,
+                "change_pct": change_pct,
+            })
+            if len(picks) >= 3:
+                break
+
+        if picks:
+            label = MODEL_LABELS.get((model_name, model_version), f"{model_name} {model_version}")
+            result[label] = picks
+
+    return result
+
+
 def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     rows = daily_action_plan(conn, as_of_date)
+
+    def _fmt_model_pct(row: sqlite3.Row, field: str) -> str:
+        val = row[field] if field in row.keys() else None
+        return f"{float(val):.0%}" if val is not None else "-"
+
     latest_date = _latest_price_date(conn, "CN_A")
     stale = latest_date is not None and as_of_date > latest_date
     data_status = "STALE_DATA" if stale else "FRESH"
@@ -238,14 +357,16 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if fresh:
         lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
         lines.append("")
-        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | M1 | M2 | M3 | 建议入手 | 止损 | 目标 | 风报比 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
-            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
-            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            m1 = _fmt_model_pct(row, "model_percentile")
+            m2 = _fmt_model_pct(row, "model_percentile_2")
+            m3 = _fmt_model_pct(row, "model_percentile_3")
+            model_str = f"{m1} | {m2} | {m3}"
             target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
@@ -256,11 +377,30 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             )
         lines.append("")
 
+    top_picks = _model_top_picks(conn, as_of_date)
+    if top_picks:
+        lines.append("## 模型选股（Top 3，仅供参考，非策略筛选）")
+        lines.append("")
+        lines.append("> 每个模型选出预测分数最高的 3 只股票。仅供参考，不计入正式买入清单。")
+        lines.append("")
+        for model_label, picks in top_picks.items():
+            lines.append(f"### {model_label}")
+            lines.append("")
+            lines.append("| 股票 | 代码 | 模型百分位 | 收盘价 | 涨跌幅 |")
+            lines.append("|---|---|---:|---:|---:|")
+            for p in picks:
+                chg_str = f"{p['change_pct']:.1f}%" if p.get("change_pct") is not None else "-"
+                lines.append(
+                    f"| {p['name']} | `{p['ticker']}` | {p['percentile']:.0%} | "
+                    f"{p['close']:.2f} | {chg_str} |"
+                )
+            lines.append("")
+
     if confirmed_today:
         lines.append(f"## 今日确认信号（往日信号 + {as_of_date} 确认，执行价以确认日次日为准）")
         lines.append("")
-        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 确认日收盘 | 建议入手 | 止损 | 目标 | 风报比 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | M1 | M2 | M3 | 确认日收盘 | 建议入手 | 止损 | 目标 | 风报比 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
             stop = float(row["stop_loss"] or 0.0)
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
@@ -271,8 +411,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
             ).fetchone()
             confirm_close = float(confirm_close_row[0]) if confirm_close_row else None
             confirm_display = fmt_price(confirm_close) if confirm_close else "-"
-            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
-            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            m1 = _fmt_model_pct(row, "model_percentile")
+            m2 = _fmt_model_pct(row, "model_percentile_2")
+            m3 = _fmt_model_pct(row, "model_percentile_3")
+            model_str = f"{m1} | {m2} | {m3}"
             target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
@@ -289,16 +431,18 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if high_priority:
         lines.append("## 重点等确认（高分 WATCH_PULLBACK，等待回调企稳确认）")
         lines.append("")
-        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | M1 | M2 | M3 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for row in high_priority[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 40:
                 trigger = trigger[:37] + "..."
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
-            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
-            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            m1 = _fmt_model_pct(row, "model_percentile")
+            m2 = _fmt_model_pct(row, "model_percentile_2")
+            m3 = _fmt_model_pct(row, "model_percentile_3")
+            model_str = f"{m1} | {m2} | {m3}"
             target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "
@@ -312,16 +456,18 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     if normal_confirmation:
         lines.append("## 等确认（WATCH_OR_BUY_ON_CONFIRMATION，等待次日确认）")
         lines.append("")
-        lines.append("| 股票 | 代码 | 策略 | 策略分 | 模型分 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
-        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("| 股票 | 代码 | 策略 | 策略分 | M1 | M2 | M3 | 建议入手 | 止损 | 目标 | 风报比 | 触发摘要 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for row in normal_confirmation[:10]:
             trigger = str(row["trigger_condition"]).replace("|", "/")
             if len(trigger) > 40:
                 trigger = trigger[:37] + "..."
             sig_close = float(row["signal_close"] or row["entry_price"] or 0.0)
             bz_low = round(sig_close * 0.985, 2)
-            model_pct = row["model_percentile"] if "model_percentile" in row.keys() else None
-            model_str = f"{float(model_pct):.0%}" if model_pct is not None else "-"
+            m1 = _fmt_model_pct(row, "model_percentile")
+            m2 = _fmt_model_pct(row, "model_percentile_2")
+            m3 = _fmt_model_pct(row, "model_percentile_3")
+            model_str = f"{m1} | {m2} | {m3}"
             target_str = f"{fmt_price(row['target_1'])} / {fmt_price(row['target_2'])}"
             lines.append(
                 "| "

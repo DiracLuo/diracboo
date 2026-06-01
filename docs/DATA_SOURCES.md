@@ -10,8 +10,9 @@ Alpha Ledger 已经接入三类公开日线行情源，并统一写入 `price_ba
 |---|---|---|---|
 | 美股 | 新浪美股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
 | 港股 | 腾讯港股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
-| A股 | 新浪 A 股日K接口 + AkShare 前复权日线 | 原始 OHLCV + 复权收益价 | 原始价用于成交展示，`adj_*` 用于收益统计 |
-| A股基准 | 新浪 A 股日K接口 | 沪深 300 `000300.SS` | 默认 A 股 benchmark，用于 alpha 统计 |
+| A股 | 新浪 A 股日K接口 + BaoStock 前复权（AkShare 兜底） | 原始 OHLCV + 复权收益价 | 原始价用于成交展示，`adj_*` 用于收益统计；BaoStock `query_history_k_data_plus`(`adjustflag="2"`) 为前复权主源，AkShare `stock_zh_a_hist`(`adjust="qfq"`) 仅在 BaoStock 返回空时兜底 |
+| A股换手率/成交额 | BaoStock `query_history_k_data_plus`(`adjustflag="3"`) | 补充 `amount` 和 `turnover_pct` | 通过 `enrich-daily-bars` 命令写入 |
+| A股基准 | 新浪 A 股日K接口 | 沪深300 `000300.SS`、中证500 `000905.SS`、中证1000 `000852.SS`、创业板指 `399006.SZ`、科创50 `000688.SS`、北证50 `899050.BJ` | 分层基准，`cn_a_benchmark_for_ticker()` 按股票代码前缀自动映射 |
 
 A 股回放还支持 5 分钟线，统一写入 `intraday_bars`：
 
@@ -217,9 +218,11 @@ python -m alpha_ledger tune-weights \
   --apply
 ```
 
-## AkShare 与 Tushare
+## BaoStock、AkShare 与 Tushare
 
-AkShare 已安装并用于事件、财务、当前资金流和 A 股分钟线兜底；但本环境中 AkShare 的东方财富链路偶尔会出现 `ProxyError / RemoteDisconnected`，所以 A 股分钟线当前优先使用新浪直连源。
+BaoStock 已安装并用于 A 股前复权（主源）和日线换手率/成交额补充。前复权通过 `query_history_k_data_plus` 的 `adjustflag="2"` 获取；换手率通过 `adjustflag="3"` 获取（无复权，仅取原始指标）。`backfill-qfq` 命令也使用 BaoStock 批量回补前复权价格。
+
+AkShare 已安装并用于事件、财务、当前资金流和 A 股分钟线兜底；但本环境中 AkShare 的东方财富链路偶尔会出现 `ProxyError / RemoteDisconnected`，所以 A 股分钟线当前优先使用新浪直连源，前复权优先使用 BaoStock。
 
 Tushare 适合后续补充结构化 A股基础数据、财务指标、行情和公司事件；通常需要 token。
 

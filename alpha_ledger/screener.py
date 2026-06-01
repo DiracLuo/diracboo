@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from .ledger import now_utc
+from .trading_rules import cn_a_limit_pct
 
 
 def _latest_price_bar(
@@ -293,6 +294,27 @@ CORE_HARD_EVENT_KEYWORDS = (
     "收购",
     "并购",
 )
+PEAD_EVENT_TYPES = (
+    "EARNINGS_REPORT",
+    "EARNINGS_PRELIMINARY",
+    "EARNINGS_FORECAST",
+    "ANNUAL_REPORT",
+    "QUARTERLY_REPORT",
+)
+PEAD_EVENT_KEYWORDS = (
+    "业绩",
+    "财报",
+    "快报",
+    "预告",
+    "年报",
+    "季报",
+    "年度报告",
+    "季度报告",
+)
+PEAD_NET_PROFIT_METRICS = ("扣非净利润增长率(%)", "净利润增长率(%)", "归母净利润增长率(%)")
+PEAD_REVENUE_METRICS = ("主营业务收入增长率(%)", "营业收入增长率(%)", "营收增长率(%)")
+PEAD_ROE_METRICS = ("ROE TTM(%)", "净资产收益率TTM(%)", "加权净资产收益率(%)", "净资产收益率(%)")
+PEAD_MIN_AVG_AMOUNT = 50_000_000.0
 
 
 def _event_text(event: dict[str, object]) -> str:
@@ -520,6 +542,23 @@ def _date_minus(date_value: str, days: int) -> str:
     return (current - timedelta(days=days)).isoformat()
 
 
+def _trading_window_start(conn: sqlite3.Connection, market: str, as_of_date: str, lookback_days: int) -> str:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT date
+        FROM price_bars
+        WHERE market = ? AND date <= ?
+        ORDER BY date DESC
+        LIMIT ?
+        """,
+        (market, as_of_date, lookback_days),
+    ).fetchall()
+    if rows:
+        return str(rows[-1]["date"])
+    # 没有行情日历时退回自然日，避免事件表为空库时报错。
+    return _date_minus(as_of_date, lookback_days * 2)
+
+
 def _event_rows(conn: sqlite3.Connection, as_of_date: str, lookback_days: int = 5) -> list[sqlite3.Row]:
     return conn.execute(
         """
@@ -532,6 +571,135 @@ def _event_rows(conn: sqlite3.Connection, as_of_date: str, lookback_days: int = 
         """,
         (_date_minus(as_of_date, lookback_days), as_of_date, MIN_EVENT_IMPORTANCE),
     ).fetchall()
+
+
+def _first_price_bar_on_or_after(
+    conn: sqlite3.Connection, market: str, ticker: str, start_date: str, end_date: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM price_bars
+        WHERE market = ? AND ticker = ? AND date >= ? AND date <= ?
+        ORDER BY date ASC
+        LIMIT 1
+        """,
+        (market, ticker, start_date, end_date),
+    ).fetchone()
+
+
+def _change_pct_from_prior(bar: sqlite3.Row, prior: list[sqlite3.Row]) -> float:
+    if bar["change_pct"] is not None:
+        return float(bar["change_pct"])
+    if not prior:
+        return 0.0
+    previous_close = float(prior[0]["close"])
+    if previous_close <= 0:
+        return 0.0
+    return (float(bar["close"]) / previous_close - 1.0) * 100.0
+
+
+def _amount_value(row: sqlite3.Row) -> float | None:
+    if row["amount"] is not None:
+        return float(row["amount"])
+    close = row["close"]
+    volume = row["volume"]
+    if close is None or volume is None:
+        return None
+    return float(close) * float(volume)
+
+
+def _amount_average(rows: list[sqlite3.Row]) -> float | None:
+    values = [_amount_value(row) for row in rows]
+    valid = [value for value in values if value is not None]
+    if not valid:
+        return None
+    return sum(valid) / len(valid)
+
+
+def _latest_pead_financials(
+    conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str
+) -> tuple[bool, bool, dict[str, float]]:
+    metric_names = PEAD_NET_PROFIT_METRICS + PEAD_REVENUE_METRICS + PEAD_ROE_METRICS
+    placeholders = ", ".join("?" for _ in metric_names)
+    rows = conn.execute(
+        f"""
+        SELECT metric_name, metric_value, report_date, published_date
+        FROM financial_metrics
+        WHERE market = ? AND ticker = ?
+          AND report_date <= ?
+          AND COALESCE(published_date, report_date) <= ?
+          AND metric_name IN ({placeholders})
+        ORDER BY report_date DESC, COALESCE(published_date, report_date) DESC
+        """,
+        (market, ticker, as_of_date, as_of_date, *metric_names),
+    ).fetchall()
+    if not rows:
+        return True, False, {}
+
+    latest_report_date = str(rows[0]["report_date"])
+    values: dict[str, float] = {}
+    for row in rows:
+        if str(row["report_date"]) != latest_report_date or row["metric_value"] is None:
+            continue
+        name = str(row["metric_name"])
+        value = float(row["metric_value"])
+        if name in PEAD_NET_PROFIT_METRICS and "net_profit_growth" not in values:
+            values["net_profit_growth"] = value
+        elif name in PEAD_REVENUE_METRICS and "revenue_growth" not in values:
+            values["revenue_growth"] = value
+        elif name in PEAD_ROE_METRICS and "roe_ttm" not in values:
+            values["roe_ttm"] = value
+
+    if not values:
+        return True, False, {}
+    passes = True
+    if values.get("net_profit_growth", 25.0) < 25.0:
+        passes = False
+    if values.get("revenue_growth", 10.0) < 10.0:
+        passes = False
+    if values.get("roe_ttm", 8.0) < 8.0:
+        passes = False
+    return passes, True, values
+
+
+def _latest_model_percentiles(
+    conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str
+) -> dict[str, float]:
+    try:
+        from .alpha_factors import MULTI_MODEL_CONFIGS
+    except Exception:
+        return {}
+
+    percentiles: dict[str, float] = {}
+    for idx, (model_name, model_version, _score_field, percentile_field) in enumerate(MULTI_MODEL_CONFIGS[1:3], start=2):
+        row = conn.execute(
+            """
+            SELECT MAX(score_date) AS d
+            FROM model_scores
+            WHERE model_name = ? AND model_version = ? AND score_date <= ?
+            """,
+            (model_name, model_version, as_of_date),
+        ).fetchone()
+        if not row or not row["d"]:
+            continue
+        score_row = conn.execute(
+            """
+            SELECT percentile
+            FROM model_scores
+            WHERE model_name = ? AND model_version = ?
+              AND market = ? AND ticker = ? AND score_date = ?
+            """,
+            (model_name, model_version, market, ticker, row["d"]),
+        ).fetchone()
+        if score_row is None or score_row["percentile"] is None:
+            continue
+        percentile = float(score_row["percentile"])
+        if percentile > 1.0:
+            percentile /= 100.0
+        percentiles[f"M{idx}"] = percentile
+        percentiles[percentile_field] = percentile
+    return percentiles
 
 
 def _latest_financial_flags(conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str) -> list[str]:
@@ -745,6 +913,183 @@ def screen_event_catalyst(conn: sqlite3.Connection, as_of_date: str) -> list[dic
                     }
                 ],
                 data_date=str(bar["date"]),
+            )
+        )
+    return candidates
+
+
+def _pead_event_rows(conn: sqlite3.Connection, as_of_date: str, lookback_days: int = 5) -> list[dict[str, object]]:
+    start_date = _trading_window_start(conn, "CN_A", as_of_date, lookback_days)
+    event_type_placeholders = ", ".join("?" for _ in PEAD_EVENT_TYPES)
+    keyword_clause = " OR ".join("event_type LIKE ?" for _ in PEAD_EVENT_KEYWORDS)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM corporate_events
+        WHERE market = 'CN_A'
+          AND event_date >= ?
+          AND event_date <= ?
+          AND (
+                UPPER(event_type) IN ({event_type_placeholders})
+             OR {keyword_clause}
+          )
+        ORDER BY event_date DESC, importance_score DESC
+        """,
+        (start_date, as_of_date, *PEAD_EVENT_TYPES, *[f"%{keyword}%" for keyword in PEAD_EVENT_KEYWORDS]),
+    ).fetchall()
+    return [{key: row[key] for key in row.keys()} for row in rows]
+
+
+def screen_cn_a_pead_quality_surprise(conn: sqlite3.Connection, as_of_date: str) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for event in _latest_event_by_ticker(_pead_event_rows(conn, as_of_date)):
+        market = str(event["market"])
+        ticker = str(event["ticker"])
+        name = str(event["name"])
+        if market != "CN_A" or _is_excluded_name(name):
+            continue
+
+        model_percentiles = _latest_model_percentiles(conn, market, ticker, as_of_date)
+        m2 = model_percentiles.get("M2", 0.0)
+        m3 = model_percentiles.get("M3", 0.0)
+        if m2 < 0.60 and m3 < 0.60:
+            continue
+
+        financial_ok, _has_financial_data, financial_values = _latest_pead_financials(conn, market, ticker, as_of_date)
+        if not financial_ok:
+            continue
+
+        signal_bar = _latest_price_bar(conn, market, ticker, as_of_date)
+        if signal_bar is None:
+            continue
+        signal_prior = _prior_bars(conn, market, ticker, signal_bar["date"], 25)
+        if len(signal_prior) < 20:
+            continue
+
+        reaction_bar = _first_price_bar_on_or_after(
+            conn, market, ticker, str(event["event_date"]), as_of_date
+        )
+        if reaction_bar is None:
+            reaction_bar = signal_bar
+        reaction_prior = _prior_bars(conn, market, ticker, reaction_bar["date"], 20)
+        if len(reaction_prior) < 10:
+            continue
+
+        close = float(signal_bar["close"])
+        reaction_high = float(reaction_bar["high"])
+        reaction_low = float(reaction_bar["low"])
+        reaction_change_pct = _change_pct_from_prior(reaction_bar, reaction_prior)
+        reaction_volume_ratio = float(reaction_bar["volume"]) / (_volume_average(reaction_prior[:10]) or 1.0)
+        ma20 = _average_close(signal_prior[:20])
+        past_20_return_pct = (close / float(signal_prior[19]["close"]) - 1.0) * 100.0
+        avg_amount_20 = _amount_average([signal_bar, *signal_prior[:19]])
+        recent_5_with_signal = [signal_bar, *signal_prior[:4]]
+        limit_pct = cn_a_limit_pct(ticker, name) * 100.0
+        limit_up_count_5 = sum(
+            1 for row in recent_5_with_signal if float(row["change_pct"] or 0.0) >= limit_pct * 0.98
+        )
+
+        if not (-2.0 <= reaction_change_pct <= 7.0):
+            continue
+        if reaction_low >= reaction_high * 0.97:
+            continue
+        if not (1.2 <= reaction_volume_ratio <= 2.8):
+            continue
+        if close <= ma20:
+            continue
+        if past_20_return_pct > 25.0:
+            continue
+        if limit_up_count_5 > 1:
+            continue
+        if avg_amount_20 is not None and avg_amount_20 <= PEAD_MIN_AVG_AMOUNT:
+            continue
+
+        score = 60.0
+        net_profit_growth = financial_values.get("net_profit_growth")
+        revenue_growth = financial_values.get("revenue_growth")
+        roe_ttm = financial_values.get("roe_ttm")
+        if net_profit_growth is not None:
+            score += min(15.0, 5.0 + max(net_profit_growth - 25.0, 0.0) / 10.0)
+        if revenue_growth is not None:
+            score += min(8.0, 3.0 + max(revenue_growth - 10.0, 0.0) / 8.0)
+        if 1.5 <= reaction_volume_ratio <= 2.0:
+            score += 5.0
+        elif 1.2 <= reaction_volume_ratio <= 2.4:
+            score += 3.0
+        distance_to_ma20_pct = (close / ma20 - 1.0) * 100.0
+        if 0.0 <= distance_to_ma20_pct <= 3.0:
+            score += 5.0
+        elif 0.0 <= distance_to_ma20_pct <= 8.0:
+            score += 3.0
+        score = min(score, 100.0)
+
+        stop_loss = max(reaction_low, close * 0.94)
+        if stop_loss >= close:
+            continue
+        target_1 = close * 1.08
+        target_2 = close * 1.15
+        reward_risk = (target_1 - close) / (close - stop_loss) if close > stop_loss else 0.0
+        if reward_risk < 1.0:
+            continue
+
+        financial_parts = []
+        if net_profit_growth is not None:
+            financial_parts.append(f"净利润增长 {net_profit_growth:.1f}%")
+        if revenue_growth is not None:
+            financial_parts.append(f"营收增长 {revenue_growth:.1f}%")
+        if roe_ttm is not None:
+            financial_parts.append(f"ROE {roe_ttm:.1f}%")
+        financial_text = "；财务过滤：" + "，".join(financial_parts) if financial_parts else "；财务数据缺失，跳过基本面硬过滤"
+        model_text = f"；模型分 M2 {m2 * 100:.1f}%，M3 {m3 * 100:.1f}%"
+        title = str(event["title"])
+
+        candidates.append(
+            _candidate(
+                as_of_date=as_of_date,
+                market=market,
+                ticker=ticker,
+                name=name,
+                strategy_id="cn_a_pead_quality_surprise",
+                score=score,
+                action="WATCH_OR_BUY_ON_CONFIRMATION",
+                close=close,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                thesis=(
+                    "近期财报/业绩类公告后价格反应温和，盈利质量和模型分通过硬过滤，"
+                    "市场可能仍在消化超预期信息。"
+                ),
+                trigger_condition=(
+                    f"{event['event_date']} {event['event_type']}：{title}；"
+                    f"{reaction_bar['date']} 公告后反应涨幅 {reaction_change_pct:.2f}%，"
+                    f"量比10日 {reaction_volume_ratio:.2f}，当日区间 {reaction_low:.2f}-{reaction_high:.2f}；"
+                    f"{signal_bar['date']} 收盘 {close:.2f}，距MA20 {distance_to_ma20_pct:.1f}%，"
+                    f"近20日涨幅 {past_20_return_pct:.1f}%，近5日涨停 {limit_up_count_5} 次，"
+                    f"20日均额 {(avg_amount_20 or 0.0) / 10000:.0f}万{financial_text}{model_text}。"
+                ),
+                risk_notes=(
+                    "财报事件需要人工复核实际值相对预告或一致预期的超预期幅度；"
+                    "若跌破公告反应日低点、-6%止损线或MA20，应剔除。"
+                ),
+                evidence=[
+                    {
+                        "type": "corporate_event",
+                        "title": title,
+                        "url": event.get("source_url"),
+                    },
+                    {
+                        "type": "price_action",
+                        "title": "公告后温和反应且未过度延伸",
+                        "url": None,
+                    },
+                    {
+                        "type": "model_filter",
+                        "model_percentile_2": m2,
+                        "model_percentile_3": m3,
+                    },
+                ],
+                data_date=str(signal_bar["date"]),
             )
         )
     return candidates
@@ -1040,13 +1385,14 @@ def clear_candidates_for_date(conn: sqlite3.Connection, as_of_date: str) -> None
 def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool = True) -> int:
     candidates = (
         screen_event_catalyst(conn, as_of_date)
+        + screen_cn_a_pead_quality_surprise(conn, as_of_date)
         + screen_xingye_style_prepositioning(conn, as_of_date)
         + screen_trend_breakout(conn, as_of_date)
         + screen_abnormal_volume(conn, as_of_date)
     )
     try:
-        from .alpha_factors import attach_model_scores
-        candidates = attach_model_scores(conn, as_of_date, candidates)
+        from .alpha_factors import MULTI_MODEL_CONFIGS, attach_model_scores
+        candidates = attach_model_scores(conn, as_of_date, candidates, model_configs=MULTI_MODEL_CONFIGS)
     except Exception:
         pass  # Model scores are optional; screener works without them
     candidates.sort(key=lambda c: float(c.get("candidate_score", 0)), reverse=True)
@@ -1073,9 +1419,10 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     target_1, target_2, reward_risk_ratio, trailing_stop_pct, trailing_activation_pct,
                     thesis, trigger_condition, risk_notes,
                     evidence_json, status, confirmation_status, data_date, created_at,
-                    model_score, model_percentile
+                    model_score, model_percentile, model_score_2, model_percentile_2,
+                    model_score_3, model_percentile_3
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(as_of_date, market, ticker, strategy_id) DO UPDATE SET
                     candidate_score=excluded.candidate_score,
                     action=excluded.action,
@@ -1083,6 +1430,10 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     signal_close=excluded.signal_close,
                     model_score=excluded.model_score,
                     model_percentile=excluded.model_percentile,
+                    model_score_2=excluded.model_score_2,
+                    model_percentile_2=excluded.model_percentile_2,
+                    model_score_3=excluded.model_score_3,
+                    model_percentile_3=excluded.model_percentile_3,
                     buy_zone_low=excluded.buy_zone_low,
                     buy_zone_high=excluded.buy_zone_high,
                     stop_loss=excluded.stop_loss,
@@ -1128,6 +1479,10 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                     row["created_at"],
                     row.get("model_score"),
                     row.get("model_percentile"),
+                    row.get("model_score_2"),
+                    row.get("model_percentile_2"),
+                    row.get("model_score_3"),
+                    row.get("model_percentile_3"),
                 ),
             )
     return len(candidates)

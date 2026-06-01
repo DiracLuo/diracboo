@@ -15,6 +15,7 @@ CROWDING_RISK = {
     "hk_southbound_recovery": 0.55,
     "hk_news_recovery": 0.58,
     "a_share_hard_event_catalyst": 0.46,
+    "cn_a_pead_quality_surprise": 0.52,
 }
 
 

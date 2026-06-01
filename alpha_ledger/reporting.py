@@ -1257,8 +1257,9 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append("暂无可操作候选。")
         return "\n".join(lines).rstrip() + "\n"
 
-    fresh = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日新信号"]
-    confirmed_today = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日确认"]
+    # MEDIUM_CONFIDENCE 也显示今日新信号/今日确认，但加风险提示
+    fresh = [] if stale else [r for r in rows if r["plan_bucket"] == "今日新信号"]
+    confirmed_today = [] if stale else [r for r in rows if r["plan_bucket"] == "今日确认"]
     confirmation = [r for r in rows if r["plan_bucket"] in ("重点等确认", "等确认")]
     observation = [r for r in rows if r["plan_bucket"] == "观察"]
     top_picks = _model_top_picks(conn, as_of_date)

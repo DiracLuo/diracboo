@@ -63,7 +63,14 @@
       "Bash(longbridge env *)",
       "Bash(longbridge export *)",
       "Bash(longbridge financial-report *)",
-      "mcp__codex__codex"
+      "mcp__codex__codex",
+      "Bash(kill -0 81002)",
+      "Bash(awk '{print $2, $3, $4, $11}')",
+      "Bash(awk '{print $6, $7, $8, $9}')",
+      "Bash(awk '{print \"PID:\", $2, \"CPU:\", $3, \"MEM:\", $4, \"TIME:\", $10}')",
+      "Bash(awk '/^### M1.*深度分析/,/^### M2/' reports/daily_plan_2026-06-01.md)",
+      "Bash(awk '/^## 缠论分析/,/^## 行业热度/' reports/daily_plan_2026-06-01.md)",
+      "Bash(git commit -m 'feat: 06-01 data update, clean report layout, restore chan analysis *)"
     ]
   }
 }

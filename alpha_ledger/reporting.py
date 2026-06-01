@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from czsc import CZSC, Freq, RawBar
+
 from .alpha_factors import MULTI_MODEL_CONFIGS
 from .data_ops import CONFIDENCE_HIGH, audit_data_coverage
 from .metrics import (
@@ -228,6 +230,18 @@ def _fmt_money_short(value: float | None) -> str:
     return f"{value:.0f}"
 
 
+def _fmt_flow_money(value: float | None) -> str:
+    if value is None:
+        return "-"
+    sign = "+" if value > 0 else ""
+    abs_value = abs(value)
+    if abs_value >= 10000000:
+        return f"{sign}{value / 100000000:.1f}亿"
+    if abs_value >= 10000:
+        return f"{sign}{value / 10000:.0f}万"
+    return f"{sign}{value:.0f}"
+
+
 def _fmt_signed_pct(value: float | None) -> str:
     if value is None:
         return "-"
@@ -314,20 +328,25 @@ def _market_overview() -> str:
                 elif field == "description":
                     desc = value
 
-    capital_data = _run_lb(["capital", "000300.SH"])
-    large_flow = _capital_value(capital_data, "large") if capital_data else None
-
-    if temp is not None or capital_data:
-        lines.append("## 市场环境")
-        lines.append("")
+    lines.append("## 市场环境")
+    lines.append("")
     if temp is not None:
         label = desc if desc else _market_temp_label(temp)
         lines.append(f"- 市场温度：{temp:.0f}/100（{label}）")
-    if capital_data:
-        if large_flow is None:
-            lines.append("- 沪深300资金：暂无资金流数据（非交易时段可能为空）")
+
+    indices = [
+        ("000300.SH", "沪深300"),
+        ("000905.SH", "中证500"),
+        ("399006.SZ", "创业板指"),
+    ]
+    for symbol, name in indices:
+        time.sleep(0.15)
+        data = _run_lb(["capital", symbol])
+        flow = _capital_value(data, "large") if data else None
+        if flow is not None:
+            lines.append(f"- {name}({symbol})：大单净流入 {_fmt_money(flow)}")
         else:
-            lines.append(f"- 沪深300资金：大单净流入 {_fmt_money(large_flow)}")
+            lines.append(f"- {name}({symbol})：暂无数据")
     return "\n".join(lines)
 
 
@@ -430,6 +449,231 @@ def _extract_kline(data: Any) -> tuple[list[float], list[float], list[float]]:
     return highs, lows, closes
 
 
+def _parse_bar_dt(value: object, fallback_id: int) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 100000000000:
+            number /= 1000.0
+        return datetime.fromtimestamp(number)
+    text = str(value or "").strip()
+    if text:
+        normalized = text.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized).replace(tzinfo=None)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(text[:10], fmt)
+            except ValueError:
+                continue
+    return datetime(1970, 1, 1) + timedelta(days=fallback_id)
+
+
+def _to_czsc_bars(ticker: str, data: Any) -> list[RawBar]:
+    bars: list[RawBar] = []
+    for idx, record in enumerate(_extract_records(data)):
+        open_price = _as_float(_record_field(record, ("open", "o", "opening_price", "开盘价")))
+        close = _as_float(_record_field(record, ("close", "c", "closing_price", "收盘价")))
+        high = _as_float(_record_field(record, ("high", "h", "highest", "最高价")))
+        low = _as_float(_record_field(record, ("low", "l", "lowest", "最低价")))
+        if open_price is None or close is None or high is None or low is None:
+            continue
+        dt_value = _record_field(record, ("date", "datetime", "timestamp", "time", "trade_date", "日期", "时间"))
+        volume = _as_float(_record_field(record, ("volume", "vol", "成交量"))) or 0.0
+        amount = _as_float(_record_field(record, ("amount", "turnover", "成交额"))) or 0.0
+        bars.append(
+            RawBar(
+                symbol=_to_lb_symbol(ticker),
+                dt=_parse_bar_dt(dt_value, idx),
+                freq=Freq.D,
+                open=open_price,
+                close=close,
+                high=high,
+                low=low,
+                vol=volume,
+                amount=amount,
+                id=idx,
+            )
+        )
+    bars.sort(key=lambda bar: bar.dt)
+    unique: list[RawBar] = []
+    seen: set[datetime] = set()
+    for idx, bar in enumerate(bars):
+        if bar.dt in seen:
+            continue
+        seen.add(bar.dt)
+        unique.append(
+            RawBar(
+                symbol=bar.symbol,
+                dt=bar.dt,
+                freq=bar.freq,
+                open=bar.open,
+                close=bar.close,
+                high=bar.high,
+                low=bar.low,
+                vol=bar.vol,
+                amount=bar.amount,
+                id=idx,
+            )
+        )
+    return unique if len(unique) >= 20 else []
+
+
+def _fmt_chan_dt(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%m-%d")
+    text = str(value or "")
+    return text[5:10] if len(text) >= 10 and text[4] in "-/" else text[:10]
+
+
+def _chan_mark_text(mark: object) -> str:
+    text = str(mark)
+    if text in {"G", "Mark.G", "顶"} or "顶" in text:
+        return "顶分型"
+    if text in {"D", "Mark.D", "底"} or "底" in text:
+        return "底分型"
+    return text
+
+
+def _chan_direction_text(direction: object) -> str:
+    text = str(direction)
+    if "上" in text or text.lower() == "up":
+        return "上升笔"
+    if "下" in text or text.lower() == "down":
+        return "下降笔"
+    return text
+
+
+def _fmt_fx(c: CZSC) -> str:
+    fx_list = list(getattr(c, "fx_list", []) or getattr(c, "ubi_fxs", []) or [])
+    if not fx_list:
+        return "-"
+    fx = fx_list[-1]
+    mark = _chan_mark_text(getattr(fx, "mark", ""))
+    price = _as_float(getattr(fx, "fx", None))
+    price_text = f"{price:.2f}" if price is not None else "-"
+    return f"{mark} {_fmt_chan_dt(getattr(fx, 'dt', ''))} @{price_text}"
+
+
+def _fmt_bi(c: CZSC) -> str:
+    bi_list = list(getattr(c, "bi_list", []) or getattr(c, "finished_bis", []) or [])
+    if not bi_list:
+        return "-"
+    bi = bi_list[-1]
+    direction = _chan_direction_text(getattr(bi, "direction", ""))
+    start = _fmt_chan_dt(getattr(bi, "sdt", ""))
+    end = _fmt_chan_dt(getattr(bi, "edt", ""))
+    low = _as_float(getattr(bi, "low", None))
+    high = _as_float(getattr(bi, "high", None))
+    if low is None or high is None:
+        return f"{direction} {start}~{end}"
+    return f"{direction} {start}~{end} [{low:.2f}, {high:.2f}]"
+
+
+def _latest_zs_range(c: CZSC) -> tuple[float, float] | None:
+    zs_list = getattr(c, "zs_list", None)
+    if zs_list:
+        zs = zs_list[-1]
+        low = _as_float(getattr(zs, "dd", None) or getattr(zs, "low", None) or getattr(zs, "zg", None))
+        high = _as_float(getattr(zs, "gg", None) or getattr(zs, "high", None) or getattr(zs, "zd", None))
+        if low is not None and high is not None:
+            return min(low, high), max(low, high)
+
+    bi_list = list(getattr(c, "bi_list", []) or getattr(c, "finished_bis", []) or [])
+    if len(bi_list) < 3:
+        return None
+    for i in range(len(bi_list) - 3, -1, -1):
+        subset = bi_list[i:i + 3]
+        highs = [_as_float(getattr(bi, "high", None)) for bi in subset]
+        lows = [_as_float(getattr(bi, "low", None)) for bi in subset]
+        if any(value is None for value in highs + lows):
+            continue
+        upper = min(highs)  # type: ignore[arg-type]
+        lower = max(lows)  # type: ignore[arg-type]
+        if upper > lower:
+            return float(lower), float(upper)
+    return None
+
+
+def _fmt_zs(c: CZSC) -> str:
+    zs_range = _latest_zs_range(c)
+    if not zs_range:
+        return "-"
+    low, high = zs_range
+    return f"{low:.2f}~{high:.2f}"
+
+
+def _fmt_signal(c: CZSC) -> str:
+    bi_list = list(getattr(c, "bi_list", []) or getattr(c, "finished_bis", []) or [])
+    zs_range = _latest_zs_range(c)
+    if not bi_list:
+        return "暂无明确信号"
+
+    last_bi = bi_list[-1]
+    direction = _chan_direction_text(getattr(last_bi, "direction", ""))
+    current = _as_float(getattr(c.bars_raw[-1], "close", None)) if getattr(c, "bars_raw", None) else None
+    bi_low = _as_float(getattr(last_bi, "low", None))
+    bi_high = _as_float(getattr(last_bi, "high", None))
+    if current is None or bi_low is None or bi_high is None or not zs_range:
+        return "暂无明确信号"
+
+    zs_low, zs_high = zs_range
+    if direction == "上升笔":
+        if bi_low < zs_low and current <= zs_low * 1.03:
+            return "一买观察"
+        if zs_low <= bi_low <= zs_high and current > bi_low:
+            return "二买观察"
+        if bi_low >= zs_high * 0.98 and current > zs_high:
+            return "三买观察"
+    if direction == "下降笔":
+        if bi_high > zs_high and current >= zs_high * 0.97:
+            return "一卖观察"
+        if zs_low <= bi_high <= zs_high and current < bi_high:
+            return "二卖观察"
+        if bi_high <= zs_low * 1.02 and current < zs_low:
+            return "三卖观察"
+    return "暂无明确信号"
+
+
+def _chan_analysis_section(stocks: list[tuple[str, str, str]]) -> str:
+    lines = ["## 缠论分析（czsc · Longbridge 300日K线）", ""]
+    lines.append("| 股票 | 类型 | 最近分型 | 最近一笔 | 中枢 | 买卖点 |")
+    lines.append("|------|------|----------|----------|------|--------|")
+
+    for ticker, name, label in stocks:
+        lb_sym = _to_lb_symbol(ticker)
+        time.sleep(0.15)
+        kline = _run_lb(["kline", lb_sym, "--period", "day", "--count", "300"])
+        if not kline:
+            lines.append(f"| {_md_cell(name)} | {_md_cell(label)} | - | - | - | 无数据 |")
+            continue
+
+        bars = _to_czsc_bars(ticker, kline)
+        if not bars:
+            lines.append(f"| {_md_cell(name)} | {_md_cell(label)} | - | - | - | 数据不足 |")
+            continue
+
+        try:
+            c = CZSC(bars)
+            fx_str = _fmt_fx(c)
+            bi_str = _fmt_bi(c)
+            zs_str = _fmt_zs(c)
+            signal_str = _fmt_signal(c)
+        except Exception as exc:
+            fx_str = bi_str = zs_str = "-"
+            signal_str = f"分析失败：{type(exc).__name__}"
+        lines.append(
+            f"| {_md_cell(name)} | {_md_cell(label)} | {_md_cell(fx_str)} | "
+            f"{_md_cell(bi_str)} | {_md_cell(zs_str)} | {_md_cell(signal_str)} |"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _macd_signal(closes: list[float]) -> str:
     if len(closes) < 2:
         return "-"
@@ -471,24 +715,24 @@ def _metric_pair(data: Any, metric: str) -> tuple[float | None, float | None]:
 
 def _format_capital(data: dict | None) -> str:
     if not data:
-        return "**资金流** 暂无数据（非交易时段可能为空）"
+        return "暂无数据（非交易时段可能为空）"
     large = _capital_value(data, "large")
     medium = _capital_value(data, "medium")
     small = _capital_value(data, "small")
     if large is None and medium is None and small is None:
-        return "**资金流** 暂无数据（非交易时段可能为空）"
+        return "暂无数据（非交易时段可能为空）"
     return (
-        f"**资金流** 大单 {_fmt_money(large)} | "
-        f"中单 {_fmt_money(medium)} | 小单 {_fmt_money(small)}"
+        f"大单 {_fmt_flow_money(large)} / "
+        f"中单 {_fmt_flow_money(medium)} / 小单 {_fmt_flow_money(small)}"
     )
 
 
 def _format_technical(data: dict | None) -> tuple[str, str]:
     if not data:
-        return "**技术面** 暂无K线数据", "**风险** 暂无足够K线数据"
+        return "暂无K线数据", "暂无足够K线数据"
     highs, lows, closes = _extract_kline(data)
     if not closes:
-        return "**技术面** 暂无K线数据", "**风险** 暂无足够K线数据"
+        return "暂无K线数据", "暂无足够K线数据"
 
     rsi = _calc_rsi(closes)
     k, d, j = _calc_kdj(highs, lows, closes)
@@ -502,40 +746,40 @@ def _format_technical(data: dict | None) -> tuple[str, str]:
     risk = _calc_risk(closes)
     if risk:
         risk_line = (
-            f"**风险** 波动率 {risk['vol']:.1f}% | "
-            f"最大回撤 -{risk['max_dd']:.1f}% | VaR(95%) {risk['var95']:.1f}%"
+            f"波动率 {risk['vol']:.1f}% · "
+            f"最大回撤 -{risk['max_dd']:.1f}% · VaR(95%) {risk['var95']:.1f}%"
         )
     else:
-        risk_line = "**风险** 暂无足够K线数据"
-    return f"**技术面** {' | '.join(tech_parts)}", risk_line
+        risk_line = "暂无足够K线数据"
+    return f"{' · '.join(tech_parts)}", risk_line
 
 
 def _format_valuation(data: dict | None) -> str:
     if not data:
-        return "**估值** 暂无估值数据"
+        return "暂无估值数据"
     pe, pe_pct = _metric_pair(data, "pe")
     pb, pb_pct = _metric_pair(data, "pb")
     if pe is None and pb is None:
-        return "**估值** 暂无估值数据"
+        return "暂无估值数据"
     pe_text = f"PE {pe:.1f}" if pe is not None else "PE -"
     pb_text = f"PB {pb:.1f}" if pb is not None else "PB -"
     if pe_pct is not None:
         pe_text += f"（行业{_fmt_percentile(pe_pct)}分位）"
     if pb_pct is not None:
         pb_text += f"（行业{_fmt_percentile(pb_pct)}分位）"
-    return f"**估值** {pe_text} | {pb_text}"
+    return f"{pe_text} · {pb_text}"
 
 
 def _format_financial_report(data: dict | None) -> str:
     if not data:
-        return "**财报** 暂无最新财报数据"
+        return "暂无最新财报数据"
     period = _first_value(data, ("period", "quarter", "report_period", "fiscal_period", "报告期", "季度"))
     revenue = _first_number(data, ("revenue", "operating_revenue", "total_revenue", "营业收入", "营收"))
     revenue_yoy = _first_number(data, ("revenue_yoy", "operating_revenue_yoy", "revenue_growth", "营收同比", "营业收入同比"))
     profit = _first_number(data, ("net_profit", "net_income", "net_profit_attributable", "归母净利润", "净利润"))
     profit_yoy = _first_number(data, ("net_profit_yoy", "net_income_yoy", "profit_growth", "净利同比", "净利润同比"))
     if revenue is None and profit is None:
-        return "**财报** 暂无最新财报数据"
+        return "暂无最新财报数据"
 
     prefix = str(period) if period else "最新"
     parts = []
@@ -549,10 +793,14 @@ def _format_financial_report(data: dict | None) -> str:
         if profit_yoy is not None:
             text += f"({_fmt_signed_pct(profit_yoy)})"
         parts.append(text)
-    return f"**财报** {prefix} {' | '.join(parts)}"
+    return f"{prefix} {' · '.join(parts)}"
 
 
-def _stock_deep_analysis(ticker: str) -> str:
+def _md_cell(value: object) -> str:
+    return str(value).replace("|", "/").replace("\n", " ")
+
+
+def _stock_deep_analysis(ticker: str, name: str | None = None) -> str:
     symbol = _to_lb_symbol(ticker)
     capital = _run_lb(["capital", symbol])
     kline = _run_lb(["kline", symbol, "--period", "day", "--count", "60"])
@@ -560,13 +808,20 @@ def _stock_deep_analysis(ticker: str) -> str:
     financial = _run_lb(["financial-report", symbol])
 
     technical_line, risk_line = _format_technical(kline)
+    display_name = name or ticker
+    rows = [
+        ("资金流", _format_capital(capital)),
+        ("技术面", technical_line),
+        ("估值", _format_valuation(valuation)),
+        ("财报", _format_financial_report(financial)),
+        ("风险", risk_line),
+    ]
     return "\n".join(
         [
-            _format_capital(capital),
-            technical_line,
-            _format_valuation(valuation),
-            _format_financial_report(financial),
-            risk_line,
+            f"**{_md_cell(display_name)} `{ticker}`**",
+            "| 维度 | 分析 |",
+            "|------|------|",
+            *[f"| {dim} | {_md_cell(text)} |" for dim, text in rows],
         ]
     )
 
@@ -968,6 +1223,7 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     lines.append(f"# Alpha Ledger Daily Plan - {as_of_date}")
     lines.append("")
     lines.append(f"- data_as_of_date: `{as_of_date}`")
+    lines.append(f"- 数据说明：策略筛选基于 {as_of_date} 本地数据；Longbridge 实时数据在报告生成时获取")
     lines.append(f"- trade_plan_date: `{trade_plan_date}`")
     lines.append(f"- data_status: `{data_status}`")
     lines.append(f"- confidence_level: `{confidence_level}`")
@@ -995,6 +1251,22 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     confirmed_today = [] if stale or confidence_level != CONFIDENCE_HIGH else [r for r in rows if r["plan_bucket"] == "今日确认"]
     confirmation = [r for r in rows if r["plan_bucket"] in ("重点等确认", "等确认")]
     observation = [r for r in rows if r["plan_bucket"] == "观察"]
+    top_picks = _model_top_picks(conn, as_of_date)
+    analysis_cache: dict[str, str] = {}
+
+    def _append_deep_analysis_section(title: str, stocks: list[tuple[str, str]]) -> None:
+        if not stocks:
+            return
+        lines.append(f"### {title} · 深度分析")
+        lines.append("")
+        lines.append("> 数据来源：Longbridge CLI")
+        lines.append("")
+        for ticker, name in stocks:
+            if ticker not in analysis_cache:
+                analysis_cache[ticker] = _stock_deep_analysis(ticker, name)
+            if analysis_cache[ticker]:
+                lines.append(analysis_cache[ticker])
+                lines.append("")
 
     if fresh:
         lines.append(f"## 今日新信号（基于 {as_of_date} 数据筛选，最多 {MAX_ACTIONABLE_CANDIDATES} 只）")
@@ -1018,34 +1290,10 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 f"{float(row['reward_risk']):.2f} |"
             )
         lines.append("")
-
-    top_picks = _model_top_picks(conn, as_of_date)
-    if top_picks:
-        analysis_cache: dict[str, str] = {}
-        lines.append("## 模型选股（Top 3，仅供参考，非策略筛选）")
-        lines.append("")
-        lines.append("> 每个模型选出预测分数最高的 3 只股票。仅供参考，不计入正式买入清单。")
-        lines.append("")
-        for model_label, picks in top_picks.items():
-            lines.append(f"### {model_label}")
-            lines.append("")
-            lines.append("| 股票 | 代码 | M1 | M2 | M3 | 收盘价 | 涨跌幅 |")
-            lines.append("|---|---|---:|---:|---:|---:|---:|")
-            for p in picks:
-                chg_str = f"{p['change_pct']:.1f}%" if p.get("change_pct") is not None else "-"
-                lines.append(
-                    f"| {p['name']} | `{p['ticker']}` | "
-                    f"{_fmt_model_pick_pct(p, 'M1')} | {_fmt_model_pick_pct(p, 'M2')} | {_fmt_model_pick_pct(p, 'M3')} | "
-                    f"{p['close']:.2f} | {chg_str} |"
-                )
-                ticker = str(p["ticker"])
-                if ticker not in analysis_cache:
-                    analysis_cache[ticker] = _stock_deep_analysis(ticker)
-                if analysis_cache[ticker]:
-                    lines.append("")
-                    lines.append(analysis_cache[ticker])
-                    lines.append("")
-            lines.append("")
+        _append_deep_analysis_section(
+            "今日新信号",
+            [(str(row["ticker"]), str(row["name"])) for row in fresh[:MAX_ACTIONABLE_CANDIDATES]],
+        )
 
     if confirmed_today:
         lines.append(f"## 今日确认信号（往日信号 + {as_of_date} 确认，执行价以确认日次日为准）")
@@ -1075,6 +1323,33 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
                 f"{float(row['reward_risk']):.2f} |"
             )
         lines.append("")
+        _append_deep_analysis_section(
+            "今日确认",
+            [(str(row["ticker"]), str(row["name"])) for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]],
+        )
+
+    if top_picks:
+        lines.append("## 模型选股（Top 3，仅供参考，非策略筛选）")
+        lines.append("")
+        lines.append("> 每个模型选出预测分数最高的 3 只股票。仅供参考，不计入正式买入清单。")
+        lines.append("")
+        for model_label, picks in top_picks.items():
+            lines.append(f"### {model_label}")
+            lines.append("")
+            lines.append("| 股票 | 代码 | M1 | M2 | M3 | 收盘价 | 涨跌幅 |")
+            lines.append("|---|---|---:|---:|---:|---:|---:|")
+            for p in picks:
+                chg_str = f"{p['change_pct']:.1f}%" if p.get("change_pct") is not None else "-"
+                lines.append(
+                    f"| {p['name']} | `{p['ticker']}` | "
+                    f"{_fmt_model_pick_pct(p, 'M1')} | {_fmt_model_pick_pct(p, 'M2')} | {_fmt_model_pick_pct(p, 'M3')} | "
+                    f"{p['close']:.2f} | {chg_str} |"
+                )
+            lines.append("")
+            _append_deep_analysis_section(
+                str(model_label),
+                [(str(p["ticker"]), str(p["name"])) for p in picks],
+            )
 
     high_priority = [r for r in confirmation if r["plan_bucket"] == "重点等确认"]
     normal_confirmation = [r for r in confirmation if r["plan_bucket"] == "等确认"]
@@ -1140,6 +1415,20 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
     lines.append("- 跌破止损或事件窗口低点，直接淘汰。")
     lines.append("- 等确认候选若次日不放量承接或收盘跌回触发位下方，降级观察。")
     lines.append("- 同一股票同日多策略重叠时，只按最高分策略处理，避免重复下注。")
+
+    chan_stocks: list[tuple[str, str, str]] = []
+    for row in fresh[:MAX_ACTIONABLE_CANDIDATES]:
+        chan_stocks.append((str(row["ticker"]), str(row["name"]), "今日新信号"))
+    for row in confirmed_today[:MAX_ACTIONABLE_CANDIDATES]:
+        chan_stocks.append((str(row["ticker"]), str(row["name"]), "今日确认"))
+    for model_label, picks in top_picks.items():
+        for p in picks:
+            chan_stocks.append((str(p["ticker"]), str(p["name"]), str(model_label)))
+
+    if chan_stocks:
+        lines.append("")
+        lines.append(_chan_analysis_section(chan_stocks))
+
     insights = _market_insights()
     if insights:
         lines.append("")

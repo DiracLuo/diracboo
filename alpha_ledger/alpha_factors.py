@@ -163,9 +163,9 @@ NEGATIVE_FACTORS = {"volatility_20d"}
 
 # 多模型评分配置：(model_name, model_version, score_field, percentile_field)
 MULTI_MODEL_CONFIGS = [
-    ("qlib_alpha158", "t5_full_20260601_v2", "model_score", "model_percentile"),
-    ("qlib_alpha158_20250101", "t10_v3", "model_score_2", "model_percentile_2"),
-    ("qlib_alpha158_20260101", "t10_v3", "model_score_3", "model_percentile_3"),
+    ("qlib_alpha360", "t2_18m", "model_score", "model_percentile"),
+    ("qlib_alpha360_20250101", "t2_15m", "model_score_2", "model_percentile_2"),
+    ("qlib_alpha360_20260101", "t2_4m", "model_score_3", "model_percentile_3"),
 ]
 
 

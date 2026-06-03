@@ -11,7 +11,7 @@ from typing import Any
 
 from czsc import CZSC, Freq, RawBar
 
-from .alpha_factors import MULTI_MODEL_CONFIGS
+from .alpha_factors import MULTI_MODEL_CONFIGS, _resolve_model_version
 from .data_ops import CONFIDENCE_HIGH, audit_data_coverage
 from .metrics import (
     FORMAL_MARKETS,
@@ -1070,6 +1070,12 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
 
     all_scores: dict[str, dict[str, float]] = {}
     for config in model_configs:
+        resolved_ver = _resolve_model_version(
+            conn, config["model_name"], config["model_version"], as_of_date,
+        )
+        if not resolved_ver:
+            continue
+        config["resolved_version"] = resolved_ver
         row = conn.execute(
             """
             SELECT MAX(score_date) AS d
@@ -1079,7 +1085,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND market = 'CN_A'
               AND score_date <= ?
             """,
-            (config["model_name"], config["model_version"], as_of_date),
+            (config["model_name"], resolved_ver, as_of_date),
         ).fetchone()
         if not row or not row["d"]:
             continue
@@ -1093,7 +1099,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND market = 'CN_A'
               AND score_date = ?
             """,
-            (config["model_name"], config["model_version"], row["d"]),
+            (config["model_name"], resolved_ver, row["d"]),
         ).fetchall()
         for score_row in rows:
             if score_row["percentile"] is None:
@@ -1116,6 +1122,11 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
 
     result: dict[str, list[dict]] = {}
     for config in model_configs:
+        resolved_ver = config.get("resolved_version") or _resolve_model_version(
+            conn, config["model_name"], config["model_version"], as_of_date,
+        )
+        if not resolved_ver:
+            continue
         row = conn.execute(
             """
             SELECT MAX(score_date) AS d
@@ -1125,7 +1136,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND market = 'CN_A'
               AND score_date <= ?
             """,
-            (config["model_name"], config["model_version"], as_of_date),
+            (config["model_name"], resolved_ver, as_of_date),
         ).fetchone()
         if not row or not row["d"]:
             continue
@@ -1140,7 +1151,7 @@ def _model_top_picks(conn: sqlite3.Connection, as_of_date: str) -> dict[str, lis
               AND score_date = ?
             ORDER BY percentile DESC
             """,
-            (config["model_name"], config["model_version"], row["d"]),
+            (config["model_name"], resolved_ver, row["d"]),
         ).fetchall()
 
         picks: list[dict] = []
@@ -1440,10 +1451,6 @@ def render_daily_plan(conn: sqlite3.Connection, as_of_date: str) -> str:
         lines.append("")
         lines.append(_chan_analysis_section(chan_stocks))
 
-    insights = _market_insights()
-    if insights:
-        lines.append("")
-        lines.append(insights)
     return "\n".join(lines).rstrip() + "\n"
 
 

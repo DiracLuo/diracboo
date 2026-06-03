@@ -9,7 +9,7 @@ data_handler_config: &data_handler_config
     fit_start_time: 2025-01-01
     fit_end_time: 2026-03-31
     instruments: *market
-    label: ["Ref($close, -10) / $close - 1"]
+    label: ["Ref($close, -2) / $close - 1"]
 task:
     model:
         class: LGBModel

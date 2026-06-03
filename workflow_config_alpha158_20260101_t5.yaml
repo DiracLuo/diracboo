@@ -5,7 +5,7 @@ market: &market all
 benchmark: &benchmark SH000300
 data_handler_config: &data_handler_config
     start_time: 2026-01-01
-    end_time: 2026-06-01
+    end_time: 2026-06-03
     fit_start_time: 2026-01-01
     fit_end_time: 2026-04-30
     instruments: *market
@@ -37,7 +37,7 @@ task:
             segments:
                 train: [2026-01-01, 2026-04-30]
                 valid: [2026-05-01, 2026-05-15]
-                test: [2026-05-16, 2026-06-01]
+                test: [2026-05-16, 2026-06-03]
     record:
         - class: SignalRecord
           module_path: qlib.workflow.record_temp

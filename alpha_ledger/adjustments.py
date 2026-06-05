@@ -21,7 +21,7 @@ CONFIRMED_BY_PRECLOSE = "CONFIRMED_BY_PRECLOSE"
 CONFIRMED_BY_DERIVED_PRECLOSE = "CONFIRMED_BY_DERIVED_PRECLOSE"
 SUSPECTED_BY_PRICE_GAP = "SUSPECTED_BY_PRICE_GAP"
 IGNORED_DATA_QUALITY = "IGNORED_DATA_QUALITY"
-CONFIRMED_REASONS = {CONFIRMED_BY_PRECLOSE, CONFIRMED_BY_DERIVED_PRECLOSE}
+CONFIRMED_REASONS = {CONFIRMED_BY_PRECLOSE}
 
 
 @dataclass(frozen=True)
@@ -201,12 +201,14 @@ def detect_adjustment_breaks(
     preclose_threshold_pct: float = 3.0,
     price_gap_threshold_pct: float = 5.0,
     change_tolerance_pct: float = 0.75,
+    continuity_tolerance_pct: float = 0.5,
 ) -> AdjustmentBreakResult:
     """Detect adjustment breaks for a market date and enqueue repairs."""
     rows = conn.execute(
         """
         SELECT p.market, p.ticker, p.date, p.close, p.pre_close, p.change_pct,
-               p.volume, prev.date AS previous_date, prev.close AS previous_close
+               p.volume, p.adj_factor, prev.date AS previous_date,
+               prev.close AS previous_close, prev.adj_factor AS previous_adj_factor
         FROM price_bars p
         LEFT JOIN price_bars prev
           ON prev.market = p.market
@@ -226,6 +228,7 @@ def detect_adjustment_breaks(
         ticker = str(row["ticker"])
         previous_date = row["previous_date"]
         raw_prev_close = row["previous_close"]
+        previous_adj_factor = row["previous_adj_factor"]
         close = row["close"]
         pre_close = row["pre_close"]
         change_pct = row["change_pct"]
@@ -251,19 +254,24 @@ def detect_adjustment_breaks(
         close_f = float(close)
         raw_change_pct = (close_f / raw_prev - 1.0) * 100.0
         pre: float | None = None
-        confirmed_reason = CONFIRMED_BY_PRECLOSE
         if pre_close not in (None, 0):
             pre = float(pre_close)
-        elif change_pct is not None:
-            denominator = 1.0 + float(change_pct) / 100.0
-            if denominator > 0:
-                pre = close_f / denominator
-                confirmed_reason = CONFIRMED_BY_DERIVED_PRECLOSE
         if pre not in (None, 0):
             official_change = (close_f / pre - 1.0) * 100.0
-            source_change = official_change if change_pct is None else float(change_pct)
             preclose_gap = abs(pre / raw_prev - 1.0) * 100.0
-            if preclose_gap >= preclose_threshold_pct and abs(official_change - source_change) <= change_tolerance_pct:
+            if preclose_gap >= preclose_threshold_pct and (
+                change_pct is None or abs(official_change - float(change_pct)) <= change_tolerance_pct
+            ):
+                prev_factor = _valid_factor(previous_adj_factor) or 1.0
+                current_factor = _valid_factor(row["adj_factor"]) or 1.0
+                qfq_pre_close = pre * current_factor
+                continuity_gap_pct = (
+                    abs((raw_prev * prev_factor) / qfq_pre_close - 1.0) * 100.0
+                    if qfq_pre_close
+                    else 100.0
+                )
+                if continuity_gap_pct <= continuity_tolerance_pct:
+                    continue
                 confirmed += 1
                 queued += 1
                 _upsert_queue(
@@ -275,9 +283,9 @@ def detect_adjustment_breaks(
                     raw_prev_close=raw_prev,
                     pre_close=pre,
                     close=close_f,
-                    change_pct=source_change,
+                    change_pct=official_change,
                     raw_change_pct=raw_change_pct,
-                    reason=confirmed_reason,
+                    reason=CONFIRMED_BY_PRECLOSE,
                     status="PENDING",
                 )
                 continue
@@ -320,7 +328,7 @@ def qfq_repair_daily(
     market: str = "CN_A",
     tolerance_pct: float = 0.5,
 ) -> QfqRepairResult:
-    """Repair queued confirmed breaks using explicit or derived pre_close."""
+    """Repair queued confirmed breaks using explicit same-day pre_close."""
     queue_rows = conn.execute(
         """
         SELECT *
@@ -328,10 +336,10 @@ def qfq_repair_daily(
         WHERE market = ?
           AND detected_date = ?
           AND status = 'PENDING'
-          AND reason IN (?, ?)
+          AND reason = ?
         ORDER BY ticker
         """,
-        (market, as_of, CONFIRMED_BY_PRECLOSE, CONFIRMED_BY_DERIVED_PRECLOSE),
+        (market, as_of, CONFIRMED_BY_PRECLOSE),
     ).fetchall()
     errors: list[str] = []
     repaired = failed = updated_rows = 0
@@ -341,7 +349,7 @@ def qfq_repair_daily(
         raw_prev_close = row["raw_prev_close"]
         pre_close = row["pre_close"]
         ex_date = str(row["detected_date"])
-        source = "pre_close" if str(row["reason"]) == CONFIRMED_BY_PRECLOSE else "derived_pre_close"
+        source = "pre_close"
         conn.execute("SAVEPOINT qfq_repair_one")
         try:
             if raw_prev_close in (None, 0) or pre_close in (None, 0):

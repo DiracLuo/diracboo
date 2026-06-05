@@ -47,6 +47,8 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 
 `production-run` 会按固定顺序完成核心数据快路径、除权断点检测、前复权因子快修、数据审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和正式日报生成。不要用 `daily-plan`、`daily-run` 或旧脚本替代生产入口。
 
+核心数据快路径使用 AKShare/Sina spot 快照，重复运行会覆盖当天记录，并写入接口返回的有效字段：原始 OHLCV、成交额、昨收、涨跌幅、涨跌额、买入/卖出价和时间戳。
+
 每日决策优先阅读：
 
 1. `reports/production/daily/daily_plan_<date>.md`

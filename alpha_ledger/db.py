@@ -110,8 +110,12 @@ SCHEMA_STATEMENTS = [
         volume REAL NOT NULL,
         amount REAL,
         pre_close REAL,
+        change_amount REAL,
         amplitude_pct REAL,
         change_pct REAL,
+        bid_price REAL,
+        ask_price REAL,
+        quote_time TEXT,
         turnover_pct REAL,
         adj_open REAL,
         adj_close REAL,
@@ -951,6 +955,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
     if _table_exists(conn, "price_bars"):
         for column, definition in (
             ("pre_close", "REAL"),
+            ("change_amount", "REAL"),
             ("adj_open", "REAL"),
             ("adj_close", "REAL"),
             ("adj_high", "REAL"),
@@ -964,6 +969,9 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             ("ps_ttm", "REAL"),
             ("pb", "REAL"),
             ("total_mv", "REAL"),
+            ("bid_price", "REAL"),
+            ("ask_price", "REAL"),
+            ("quote_time", "TEXT"),
         ):
             _add_column_if_missing(conn, "price_bars", column, definition)
 

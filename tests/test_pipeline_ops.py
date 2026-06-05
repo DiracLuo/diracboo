@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from alpha_ledger.cli import command_data_update, command_qfq_maintenance
+from alpha_ledger.cli import command_data_update, command_qfq_maintenance, main as cli_main
 from alpha_ledger.benchmarks import CN_A_BENCHMARKS
 from alpha_ledger.data_ops import actionable_intraday_instruments, data_update
 from alpha_ledger.db import connect, init_db
@@ -154,7 +155,12 @@ class DataUpdateCoreOnlyTest(TestCase):
                             "low": 99.0,
                             "volume": 1000.0,
                             "amount": 100000.0,
-                            "change_pct": 1.0,
+                            "pre_close": 88.0,
+                            "change_amount": 13.0,
+                            "change_pct": 14.77,
+                            "bid_price": 100.9,
+                            "ask_price": 101.1,
+                            "quote_time": "15:30:00",
                             "adjustment_status": "RAW_FALLBACK",
                         }
                     ], []
@@ -194,12 +200,98 @@ class DataUpdateCoreOnlyTest(TestCase):
                 mock_fetch.assert_called_once()
                 row = conn.execute(
                     """
-                    SELECT amount
+                    SELECT amount, pre_close, change_amount, change_pct, bid_price, ask_price, quote_time
                     FROM price_bars
                     WHERE market = 'CN_A' AND ticker = '600519.SS' AND date = '2026-06-04'
                     """
                 ).fetchone()
             self.assertEqual(row["amount"], 100000.0)
+            self.assertEqual(row["pre_close"], 88.0)
+            self.assertEqual(row["change_amount"], 13.0)
+            self.assertEqual(row["change_pct"], 14.77)
+            self.assertEqual(row["bid_price"], 100.9)
+            self.assertEqual(row["ask_price"], 101.1)
+            self.assertEqual(row["quote_time"], "15:30:00")
+
+    def test_core_price_mode_refreshes_existing_same_day_spot_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.sqlite"
+            with connect(db_path) as conn:
+                init_db(conn)
+                _seed_price_data(conn)
+                conn.execute(
+                    """
+                    INSERT INTO price_bars (
+                        market, ticker, date, open, high, low, close, volume,
+                        amount, pre_close, change_pct, adjustment_status
+                    ) VALUES (
+                        'CN_A', '600519.SS', '2026-06-04', 90, 91, 89, 90,
+                        1, 1, NULL, -99, 'RAW_FALLBACK'
+                    )
+                    """
+                )
+                conn.commit()
+
+                def fake_spot(instruments: list[Instrument], as_of):
+                    return [
+                        {
+                            "market": "CN_A",
+                            "ticker": "600519.SS",
+                            "date": as_of.isoformat(),
+                            "open": 100.0,
+                            "close": 101.0,
+                            "high": 102.0,
+                            "low": 99.0,
+                            "volume": 1000.0,
+                            "amount": 100000.0,
+                            "pre_close": 88.0,
+                            "change_pct": 14.77,
+                            "adjustment_status": "RAW_FALLBACK",
+                        }
+                    ], []
+
+                def fake_benchmarks(instruments, start, end, throttle_seconds=0.0, adjust=None):
+                    return [
+                        {
+                            "market": "CN_A",
+                            "ticker": instrument.ticker,
+                            "date": end.isoformat(),
+                            "open": 10.0,
+                            "close": 10.1,
+                            "high": 10.2,
+                            "low": 9.9,
+                            "volume": 1000.0,
+                            "amount": None,
+                            "change_pct": 1.0,
+                            "adjustment_status": "ADJUSTED",
+                        }
+                        for instrument in instruments
+                    ], []
+
+                with patch("alpha_ledger.data_ops.fetch_akshare_cn_spot_bars", side_effect=fake_spot) as mock_spot, \
+                     patch("alpha_ledger.data_ops.fetch_bars", side_effect=fake_benchmarks):
+                    result = data_update(
+                        conn,
+                        "2026-06-04",
+                        fetch_events=False,
+                        fetch_intraday=False,
+                        price_mode="core",
+                        adjust=None,
+                    )
+
+                self.assertEqual(result.status, "SUCCESS")
+                mock_spot.assert_called_once()
+                row = conn.execute(
+                    """
+                    SELECT close, amount, pre_close, change_pct
+                    FROM price_bars
+                    WHERE market='CN_A' AND ticker='600519.SS' AND date='2026-06-04'
+                    """
+                ).fetchone()
+            self.assertEqual(row["close"], 101.0)
+            self.assertEqual(row["amount"], 100000.0)
+            self.assertEqual(row["pre_close"], 88.0)
+            self.assertEqual(row["change_pct"], 14.77)
 
     def test_core_price_mode_marks_missing_benchmarks_partial(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1160,3 +1252,60 @@ class QfqMaintenanceTest(TestCase):
             self.assertEqual(row["requested_symbols"], 2)
             self.assertEqual(row["price_bars"], 4)
             self.assertEqual(row["error_count"], 0)
+
+    def test_qfq_maintenance_scan_and_repair_cli_does_not_duplicate_mode_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "test.sqlite")
+            with connect(db_path) as conn:
+                init_db(conn)
+                conn.execute(
+                    """
+                    INSERT INTO instruments
+                        (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+                    VALUES ('CN_A', '301213.SZ', '观想科技', 'test', 'sz301213', 1, '[]', datetime('now'))
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO price_bars
+                        (market, ticker, date, open, high, low, close, volume, amount, change_pct, adj_factor, adjustment_status)
+                    VALUES ('CN_A', '301213.SZ', '2026-06-04', 63.95, 63.95, 63.95, 63.95, 1000, 10000, 0, 1, 'RAW_FALLBACK')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO price_bars
+                        (market, ticker, date, open, high, low, close, volume, amount, pre_close, change_pct, adj_factor, adjustment_status)
+                    VALUES ('CN_A', '301213.SZ', '2026-06-05', 46.89, 46.89, 46.89, 46.89, 1000, 10000, 45.61, 2.80640210480159, 1, 'RAW_FALLBACK')
+                    """
+                )
+                conn.commit()
+
+            argv = [
+                "alpha_ledger",
+                "--db",
+                db_path,
+                "qfq-maintenance",
+                "--as-of",
+                "2026-06-05",
+                "--mode",
+                "scan-and-repair",
+                "--lookback-days",
+                "2",
+                "--force",
+                "--out-dir",
+                str(Path(tmpdir) / "reports"),
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT adj_close, adjustment_source
+                    FROM price_bars
+                    WHERE market='CN_A' AND ticker='301213.SZ' AND date='2026-06-04'
+                    """
+                ).fetchone()
+            self.assertAlmostEqual(row["adj_close"], 45.61, places=2)
+            self.assertEqual(row["adjustment_source"], "pre_close")

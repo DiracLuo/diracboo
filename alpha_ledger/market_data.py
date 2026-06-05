@@ -290,6 +290,13 @@ def _series_get(row: Any, names: tuple[str, ...]) -> object:
     raise MarketDataError(f"Missing expected column, tried: {', '.join(names)}")
 
 
+def _series_get_optional(row: Any, names: tuple[str, ...]) -> object | None:
+    try:
+        return _series_get(row, names)
+    except MarketDataError:
+        return None
+
+
 def _cn_a_plain_symbol(instrument: Instrument) -> str:
     match = re.search(r"(\d{6})", instrument.source_symbol or instrument.ticker)
     if match:
@@ -358,6 +365,11 @@ def _row_to_bar(
     volume: object,
     previous_close: float | None,
     amount: object | None = None,
+    change_pct: object | None = None,
+    change_amount: object | None = None,
+    bid_price: object | None = None,
+    ask_price: object | None = None,
+    quote_time: object | None = None,
     previous_adj_close: float | None = None,
     adj_open: object | None = None,
     adj_close: object | None = None,
@@ -375,6 +387,14 @@ def _row_to_bar(
     adj_low_float = low_float if adj_low is None else float(adj_low)
     adj_factor = adj_close_float / close_float if close_float else 1.0
     amount_float = None if amount in (None, "", {}) else float(amount)
+    change_pct_float = (
+        _pct_change(
+            previous_adj_close if previous_adj_close not in (None, 0) else previous_close,
+            adj_close_float if previous_adj_close not in (None, 0) else close_float,
+        )
+        if change_pct in (None, "", {})
+        else float(change_pct)
+    )
     amplitude_pct = None
     if previous_close not in (None, 0):
         amplitude_pct = (high_float - low_float) / float(previous_close) * 100.0
@@ -389,11 +409,12 @@ def _row_to_bar(
         "volume": float(volume),
         "amount": amount_float,
         "pre_close": previous_close,
+        "change_amount": None if change_amount in (None, "", {}) else float(change_amount),
         "amplitude_pct": amplitude_pct,
-        "change_pct": _pct_change(
-            previous_adj_close if previous_adj_close not in (None, 0) else previous_close,
-            adj_close_float if previous_adj_close not in (None, 0) else close_float,
-        ),
+        "change_pct": change_pct_float,
+        "bid_price": None if bid_price in (None, "", {}) else float(bid_price),
+        "ask_price": None if ask_price in (None, "", {}) else float(ask_price),
+        "quote_time": None if quote_time in (None, "", {}) else str(quote_time),
         "turnover_pct": None,
         "adj_open": adj_open_float,
         "adj_close": adj_close_float,
@@ -615,6 +636,11 @@ def fetch_akshare_cn_spot_bars(
                     _series_get(row, ("成交量", "volume")),
                     previous_close,
                     amount=_series_get(row, ("成交额", "amount", "money")),
+                    change_pct=_series_get_optional(row, ("涨跌幅", "change_pct", "涨幅")),
+                    change_amount=_series_get_optional(row, ("涨跌额", "change_amount")),
+                    bid_price=_series_get_optional(row, ("买入", "bid", "bid_price")),
+                    ask_price=_series_get_optional(row, ("卖出", "ask", "ask_price")),
+                    quote_time=_series_get_optional(row, ("时间戳", "time", "quote_time")),
                     adjustment_status="RAW_FALLBACK",
                 )
             )

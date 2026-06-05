@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 
 from alpha_ledger.adjustments import (
-    CONFIRMED_BY_DERIVED_PRECLOSE,
     CONFIRMED_BY_PRECLOSE,
+    SUSPECTED_BY_PRICE_GAP,
     detect_adjustment_breaks,
     get_price_frame,
     qfq_repair_daily,
@@ -122,7 +122,7 @@ class AdjustmentFactorTest(unittest.TestCase):
                 self.assertAlmostEqual(row["close"], 46.47)
                 self.assertAlmostEqual(row["adj_close"], 31.94, places=2)
 
-    def test_missing_preclose_can_be_derived_from_official_change_pct(self) -> None:
+    def test_missing_preclose_is_suspected_not_auto_repaired(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with connect(Path(tmpdir) / "test.sqlite") as conn:
                 init_db(conn)
@@ -136,22 +136,23 @@ class AdjustmentFactorTest(unittest.TestCase):
                     change_pct=2.80640210480159,
                 )
                 detected = detect_adjustment_breaks(conn, "2026-06-05")
-                self.assertEqual(detected.confirmed, 1)
-                self.assertEqual(detected.suspected, 0)
+                self.assertEqual(detected.confirmed, 0)
+                self.assertEqual(detected.suspected, 1)
                 queue = conn.execute(
                     "SELECT reason, pre_close FROM adjustment_maintenance_queue WHERE ticker='301213.SZ'"
                 ).fetchone()
-                self.assertEqual(queue["reason"], CONFIRMED_BY_DERIVED_PRECLOSE)
-                self.assertAlmostEqual(queue["pre_close"], 45.61, places=2)
+                self.assertEqual(queue["reason"], SUSPECTED_BY_PRICE_GAP)
+                self.assertIsNone(queue["pre_close"])
 
                 repaired = qfq_repair_daily(conn, "2026-06-05")
-                self.assertEqual(repaired.repaired_count, 1)
+                self.assertEqual(repaired.target_count, 0)
+                self.assertEqual(repaired.repaired_count, 0)
                 row = conn.execute(
                     "SELECT close, adj_close, adjustment_source FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-04'"
                 ).fetchone()
                 self.assertAlmostEqual(row["close"], 63.95)
-                self.assertAlmostEqual(row["adj_close"], 45.61, places=2)
-                self.assertEqual(row["adjustment_source"], "derived_pre_close")
+                self.assertAlmostEqual(row["adj_close"], 63.95, places=2)
+                self.assertIsNone(row["adjustment_source"])
 
     def test_detection_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,6 +202,33 @@ class AdjustmentFactorTest(unittest.TestCase):
                 ).fetchone()
                 self.assertAlmostEqual(row["adj_factor"], 45.61 / 63.95, places=6)
                 self.assertAlmostEqual(row["adj_close"], 45.61, places=2)
+
+    def test_detect_after_repair_does_not_requeue_same_break(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with connect(Path(tmpdir) / "test.sqlite") as conn:
+                init_db(conn)
+                self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95)
+                self._insert_bar(
+                    conn,
+                    "301213.SZ",
+                    "2026-06-05",
+                    46.89,
+                    pre_close=45.61,
+                    change_pct=2.80640210480159,
+                )
+                first = detect_adjustment_breaks(conn, "2026-06-05")
+                self.assertEqual(first.confirmed, 1)
+                repaired = qfq_repair_daily(conn, "2026-06-05")
+                self.assertEqual(repaired.repaired_count, 1)
+
+                second = detect_adjustment_breaks(conn, "2026-06-05")
+                self.assertEqual(second.confirmed, 0)
+                self.assertEqual(second.suspected, 0)
+                self.assertEqual(second.queued, 0)
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM adjustment_maintenance_queue WHERE ticker='301213.SZ'"
+                ).fetchone()["n"]
+                self.assertEqual(count, 1)
 
     def test_get_price_frame_and_qlib_export_use_raw_times_factor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

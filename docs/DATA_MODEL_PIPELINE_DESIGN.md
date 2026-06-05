@@ -116,7 +116,7 @@ data-update --core-only --adjust none
 
 ```text
 每日快路径：
-拉原始快照行情和 pre_close。
+拉 AKShare/Sina spot 快照行情。有效字段直接写入 price_bars，包括 open/high/low/close/volume/amount/pre_close/change_pct/change_amount/bid_price/ask_price/quote_time。当天 spot 字段是最新交易日的权威字段，重复运行应 upsert 覆盖当日数据。
 
 每日断点检测：
 detect-adjustment-breaks 对比 pre_close 与上一交易日原始 close，发现除权断点后写入 adjustment_maintenance_queue。

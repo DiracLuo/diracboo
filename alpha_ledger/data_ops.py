@@ -882,8 +882,9 @@ def data_update(
         and can_use_same_day_snapshot
         and _amount_coverage_pct(conn, "CN_A", as_of_date) < 95.0
     )
+    force_core_snapshot_refresh = price_mode == "core" and start == as_of_date
     fetched_full_missing_range = price_mode != "none" and (
-        latest is None or latest < as_of_date or needs_core_amount_repair
+        latest is None or latest < as_of_date or needs_core_amount_repair or force_core_snapshot_refresh
     )
     if fetched_full_missing_range:
         if price_mode == "core" and start == as_of_date:

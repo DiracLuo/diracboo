@@ -10,7 +10,7 @@ Alpha Ledger 已经接入三类公开日线行情源，并统一写入 `price_ba
 |---|---|---|---|
 | 美股 | 新浪美股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
 | 港股 | 腾讯港股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
-| A股 | 新浪/AkShare 快照 + pre_close 因子修复 + BaoStock 维护兜底 | 原始 OHLCV + pre_close + adj_factor | 原始价用于成交展示；每日用 `pre_close / previous_raw_close` 维护前复权因子；BaoStock `adjustflag="2"` 只作为疑似样本、失败样本和历史补漏源 |
+| A股 | 新浪/AkShare 快照 + pre_close 因子修复 + BaoStock 维护兜底 | 原始 OHLCV + amount + pre_close + change_pct + change_amount + bid/ask + quote_time + adj_factor | spot 快照字段直接入库并覆盖当天记录；原始价用于成交展示；每日用 `pre_close / previous_raw_close` 维护前复权因子；BaoStock `adjustflag="2"` 只作为疑似样本、失败样本和历史补漏源 |
 | A股换手率/成交额 | BaoStock `query_history_k_data_plus`(`adjustflag="3"`) | 补充 `amount` 和 `turnover_pct` | 通过 `enrich-daily-bars` 命令写入 |
 | A股基准 | 新浪 A 股日K接口 | 沪深300 `000300.SS`、中证500 `000905.SS`、中证1000 `000852.SS`、创业板指 `399006.SZ`、科创50 `000688.SS`、北证50 `899050.BJ` | 分层基准，`cn_a_benchmark_for_ticker()` 按股票代码前缀自动映射 |
 
@@ -127,7 +127,7 @@ python -m alpha_ledger fetch-prices \
   --adjust none
 ```
 
-正式生产不要用上述手工命令替代 `production-run`。前复权日常主路径是 `detect-adjustment-breaks` + `qfq-repair-daily` 维护 `adj_factor`，不是在拉行情时全市场请求 qfq。
+正式生产不要用上述手工命令替代 `production-run`。前复权日常主路径是 `detect-adjustment-breaks` + `qfq-repair-daily` 维护 `adj_factor`，不是在拉行情时全市场请求 qfq。缺 `pre_close` 时不得自动反推复权因子，只能作为疑似样本等待外部校验。
 
 筛选候选：
 

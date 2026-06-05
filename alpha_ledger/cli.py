@@ -481,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair_daily = subparsers.add_parser(
         "qfq-repair-daily",
-        help="Repair queued CN_A qfq factors using pre_close-derived factor ratios",
+        help="Repair queued CN_A qfq factors using explicit pre_close factor ratios",
     )
     repair_daily.add_argument("--as-of", required=True, help="Repair date YYYY-MM-DD")
     repair_daily.add_argument("--market", default="CN_A")
@@ -1893,7 +1893,6 @@ def main(argv: list[str] | None = None) -> int:
             args.as_of,
             args.interval_days,
             args.lookback_days,
-            args.mode,
             args.source,
             args.throttle,
             args.limit,

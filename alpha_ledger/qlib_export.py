@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .adjustments import get_price_frame
 from .tickers import (
     CN_A_SUFFIX_TO_QLIB_PREFIX as TICKER_SUFFIX_MAP,
     normalize_cn_a_ticker,
@@ -177,18 +178,13 @@ def export_qlib_csv(
             )
             continue
 
-        # Fetch bars for this ticker
-        alias_placeholders = ",".join("?" for _ in aliases)
-        bars = conn.execute(
-            "SELECT * FROM price_bars "
-            f"WHERE market = ? AND ticker IN ({alias_placeholders}) AND date >= ? AND date <= ? "
-            "ORDER BY date",
-            (market, *aliases, start, end),
-        ).fetchall()
+        # Fetch bars for this ticker through the unified price reader.
+        # Qlib receives qfq prices computed as raw OHLC * adj_factor.
+        bars = get_price_frame(conn, market, aliases, start, end, price_mode="qfq").rows
 
         if not bars:
             continue
-        canonical_bars: dict[str, sqlite3.Row] = {}
+        canonical_bars: dict[str, dict[str, Any]] = {}
         for bar in bars:
             bar_date = str(bar["date"])
             current = canonical_bars.get(bar_date)
@@ -231,7 +227,7 @@ def export_qlib_csv(
             change_pct = bar_dict.get("change_pct")
 
             # Handle missing adj_factor
-            if adj_factor is None or (isinstance(adj_factor, (int, float)) and adj_factor <= 0):
+            if bar_dict.get("adj_factor_was_missing") or adj_factor is None or (isinstance(adj_factor, (int, float)) and adj_factor <= 0):
                 warnings.append(f"adj_factor missing/invalid on {bar_dict.get('date')}, using 1.0")
                 adj_factor = 1.0
 

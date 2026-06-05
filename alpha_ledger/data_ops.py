@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -11,8 +12,11 @@ from .ledger import now_utc
 from .market_data import (
     DEFAULT_UNIVERSE_PATH,
     Instrument,
+    fetch_akshare_cn_spot_bars,
+    fetch_baostock_cn_adjusted_daily_map,
     fetch_bars,
     fetch_intraday_bars,
+    fetch_tonghuashun_cn_spot_bars,
     parse_date,
     read_db_instruments,
     read_universe,
@@ -69,6 +73,7 @@ class DataUpdateResult:
     financial_metrics: int
     money_flows: int
     error_count: int
+    source_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,85 @@ def _latest_price_date(conn: sqlite3.Connection, market: str) -> str | None:
         (market,),
     ).fetchone()
     return str(row["d"]) if row and row["d"] else None
+
+
+def _amount_coverage_pct(conn: sqlite3.Connection, market: str, as_of_date: str) -> float:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN p.amount IS NOT NULL AND p.amount > 0 THEN 1 ELSE 0 END) AS ok_count,
+            COUNT(*) AS total_count
+        FROM price_bars p
+        LEFT JOIN instruments i ON i.market = p.market AND i.ticker = p.ticker
+        WHERE p.market = ? AND p.date = ?
+          AND p.volume IS NOT NULL AND p.volume > 0
+          AND COALESCE(i.tags_json, '') NOT LIKE '%index%'
+          AND COALESCE(i.tags_json, '') NOT LIKE '%benchmark%'
+          AND p.ticker NOT GLOB '399*.SZ'
+          AND p.ticker NOT GLOB '000[0-9][0-9][0-9].SS'
+          AND p.ticker != '899050.BJ'
+        """,
+        (market, as_of_date),
+    ).fetchone()
+    total = int(row["total_count"] or 0) if row else 0
+    if total <= 0:
+        return 0.0
+    return float(row["ok_count"] or 0) / total * 100.0
+
+
+def _missing_amount_instruments(
+    conn: sqlite3.Connection,
+    instruments: list[Instrument],
+    as_of_date: str,
+    *,
+    limit: int = 80,
+) -> list[Instrument]:
+    by_ticker = {item.ticker: item for item in instruments if item.market == "CN_A"}
+    rows = conn.execute(
+        """
+        SELECT p.ticker
+        FROM price_bars p
+        LEFT JOIN instruments i ON i.market = p.market AND i.ticker = p.ticker
+        WHERE p.market = 'CN_A' AND p.date = ?
+          AND p.volume IS NOT NULL AND p.volume > 0
+          AND (p.amount IS NULL OR p.amount <= 0)
+          AND COALESCE(i.tags_json, '') NOT LIKE '%index%'
+          AND COALESCE(i.tags_json, '') NOT LIKE '%benchmark%'
+        LIMIT ?
+        """,
+        (as_of_date, limit),
+    ).fetchall()
+    return [by_ticker[str(row["ticker"])] for row in rows if str(row["ticker"]) in by_ticker]
+
+
+def _repair_amount_with_baostock(
+    conn: sqlite3.Connection,
+    instruments: list[Instrument],
+    as_of_date: str,
+) -> tuple[int, list[str]]:
+    updated = 0
+    errors: list[str] = []
+    day = parse_date(as_of_date)
+    for instrument in instruments:
+        try:
+            data = fetch_baostock_cn_adjusted_daily_map(instrument, day, day, adjust="qfq").get(as_of_date)
+            if not data or data.get("amount") in (None, 0):
+                errors.append(f"{instrument.ticker} BaoStock amount repair returned no amount")
+                continue
+            conn.execute(
+                """
+                UPDATE price_bars
+                SET amount = ?,
+                    turnover_pct = COALESCE(?, turnover_pct)
+                WHERE market = 'CN_A' AND ticker = ? AND date = ?
+                """,
+                (data.get("amount"), data.get("turnover_pct"), instrument.ticker, as_of_date),
+            )
+            updated += 1
+        except Exception as exc:
+            errors.append(f"{instrument.ticker} BaoStock amount repair error: {exc}")
+    conn.commit()
+    return updated, errors
 
 
 def _earliest_price_date(conn: sqlite3.Connection, market: str) -> str | None:
@@ -318,6 +402,18 @@ def _repair_coverage_instruments(
     by_ticker = _instrument_map(conn)
     repair: dict[str, Instrument] = {}
     expected_dates, _ = _trade_calendar_dates(conn, start_date, end_date, "CN_A")
+    if repair_scope in {REPAIR_SCOPE_BENCHMARKS, REPAIR_SCOPE_ALL}:
+        market_rows = conn.execute(
+            """
+            SELECT DISTINCT date
+            FROM price_bars
+            WHERE market = 'CN_A' AND date >= ? AND date <= ?
+            ORDER BY date
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        market_dates = [str(row["date"]) for row in market_rows]
+        expected_dates = sorted(set(expected_dates) | set(market_dates))
     expected_count = len(expected_dates)
     benchmark_tickers = set(_cn_a_benchmark_tickers())
 
@@ -359,6 +455,26 @@ def _repair_coverage_instruments(
 
 
 def actionable_intraday_instruments(conn: sqlite3.Connection, as_of_date: str) -> list[Instrument]:
+    seen: set[tuple[str, str]] = set()
+    instruments: list[Instrument] = []
+
+    def append_instrument(row: sqlite3.Row) -> None:
+        key = (str(row["market"]), str(row["ticker"]))
+        if key in seen:
+            return
+        seen.add(key)
+        instruments.append(
+            Instrument(
+                market=str(row["market"]),
+                ticker=str(row["ticker"]),
+                name=str(row["name"]),
+                source=str(row["source"]),
+                source_symbol=str(row["source_symbol"]),
+                active=True,
+                tags=tuple(json.loads(row["tags_json"] or "[]")),
+            )
+        )
+
     rows = conn.execute(
         """
         SELECT DISTINCT c.market, c.ticker, c.name, i.source, i.source_symbol, i.tags_json
@@ -368,25 +484,90 @@ def actionable_intraday_instruments(conn: sqlite3.Connection, as_of_date: str) -
           AND (c.as_of_date = ? OR c.confirmation_date = ?)
           AND (
               c.action = 'BUY_CANDIDATE'
+              OR c.action = 'WATCH_PULLBACK'
               OR c.action LIKE '%CONFIRM%'
               OR c.confirmation_status = 'CONFIRMED'
           )
         """,
         (as_of_date, as_of_date),
     ).fetchall()
-    instruments = []
     for row in rows:
-        instruments.append(
-            Instrument(
-                market=str(row["market"]),
-                ticker=str(row["ticker"]),
-                name=str(row["name"]),
-                source=str(row["source"]),
-                source_symbol=str(row["source_symbol"]),
-                active=True,
-                tags=(),
-            )
+        append_instrument(row)
+
+    candidate_tickers = {ticker for _market, ticker in seen}
+    model_rows = conn.execute(
+        """
+        SELECT model_name, model_version
+        FROM model_registry
+        WHERE status = 'PRODUCTION'
+        ORDER BY id
+        LIMIT 3
+        """
+    ).fetchall()
+    try:
+        from .alpha_factors import _resolve_model_version
+    except Exception:
+        _resolve_model_version = None  # type: ignore[assignment]
+
+    for model in model_rows:
+        model_name = str(model["model_name"])
+        model_version = str(model["model_version"])
+        resolved_version = (
+            _resolve_model_version(conn, model_name, model_version, as_of_date)
+            if _resolve_model_version is not None
+            else model_version
         )
+        if not resolved_version:
+            continue
+        date_row = conn.execute(
+            """
+            SELECT MAX(score_date) AS d
+            FROM model_scores
+            WHERE market = 'CN_A'
+              AND model_name = ?
+              AND model_version = ?
+              AND score_date <= ?
+            """,
+            (model_name, resolved_version, as_of_date),
+        ).fetchone()
+        if not date_row or not date_row["d"]:
+            continue
+        pick_rows = conn.execute(
+            """
+            SELECT ms.market, ms.ticker, COALESCE(i.name, ms.ticker) AS name,
+                   COALESCE(i.source, 'sina_cn') AS source,
+                   COALESCE(i.source_symbol, '') AS source_symbol,
+                   COALESCE(i.tags_json, '[]') AS tags_json
+            FROM model_scores ms
+            LEFT JOIN instruments i ON i.market = ms.market AND i.ticker = ms.ticker
+            JOIN price_bars p ON p.market = ms.market AND p.ticker = ms.ticker AND p.date = ?
+            WHERE ms.market = 'CN_A'
+              AND ms.model_name = ?
+              AND ms.model_version = ?
+              AND ms.score_date = ?
+              AND ms.percentile IS NOT NULL
+              AND ms.ticker NOT IN ({candidate_placeholders})
+              AND COALESCE(i.name, ms.ticker) NOT LIKE '%ST%'
+              AND COALESCE(i.name, ms.ticker) NOT LIKE '%退%'
+              AND COALESCE(i.name, ms.ticker) NOT LIKE '%ETF%'
+              AND COALESCE(i.name, ms.ticker) NOT LIKE '%基金%'
+            ORDER BY ms.percentile DESC
+            LIMIT 3
+            """.format(
+                candidate_placeholders=",".join("?" for _ in candidate_tickers) or "''"
+            ),
+            (
+                as_of_date,
+                model_name,
+                resolved_version,
+                str(date_row["d"]),
+                *sorted(candidate_tickers),
+            ),
+        ).fetchall()
+        for row in pick_rows:
+            if not row["source_symbol"]:
+                continue
+            append_instrument(row)
     return instruments
 
 
@@ -397,6 +578,7 @@ def audit_data_coverage(
     market: str = "CN_A",
     write: bool = True,
     ignore_adjustment_for_short_term: bool = False,
+    intraday_universe: list[Instrument] | None = None,
 ) -> DataAuditResult:
     expected_dates, calendar_source = _trade_calendar_dates(conn, start_date, end_date, market)
     price = conn.execute(
@@ -445,31 +627,76 @@ def audit_data_coverage(
         "SELECT COUNT(DISTINCT ticker) AS c FROM price_bars WHERE market = ?",
         (market,),
     ).fetchone()["c"] or 0)
-    intraday_tradable_target_count = int(conn.execute(
-        """
-        SELECT COUNT(DISTINCT ticker) AS c
-        FROM price_bars
-        WHERE market = ? AND date >= ? AND date <= ? AND volume > 0
-        """,
-        (market, start_date, end_date),
-    ).fetchone()["c"] or 0)
-    intraday_tradable_symbol_count = int(conn.execute(
-        """
-        SELECT COUNT(DISTINCT i.ticker) AS c
-        FROM intraday_bars i
-        WHERE i.market = ? AND i.date >= ? AND i.date <= ?
-          AND EXISTS (
-              SELECT 1
-              FROM price_bars p
-              WHERE p.market = i.market
-                AND p.ticker = i.ticker
-                AND p.date >= ?
-                AND p.date <= ?
-                AND p.volume > 0
-          )
-        """,
-        (market, start_date, end_date, start_date, end_date),
-    ).fetchone()["c"] or 0)
+    intraday_scope = "market"
+    intraday_tickers: list[str] = []
+    if intraday_universe is not None:
+        intraday_scope = "signal"
+        seen_tickers: set[str] = set()
+        for instrument in intraday_universe:
+            if instrument.market != market or instrument.ticker in seen_tickers:
+                continue
+            seen_tickers.add(instrument.ticker)
+            intraday_tickers.append(instrument.ticker)
+
+    if intraday_scope == "signal":
+        if intraday_tickers:
+            placeholders = ",".join("?" for _ in intraday_tickers)
+            intraday_tradable_target_count = int(conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT ticker) AS c
+                FROM price_bars
+                WHERE market = ? AND date >= ? AND date <= ? AND volume > 0
+                  AND ticker IN ({placeholders})
+                """,
+                (market, start_date, end_date, *intraday_tickers),
+            ).fetchone()["c"] or 0)
+            intraday_tradable_symbol_count = int(conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT i.ticker) AS c
+                FROM intraday_bars i
+                WHERE i.market = ? AND i.date >= ? AND i.date <= ?
+                  AND i.ticker IN ({placeholders})
+                  AND EXISTS (
+                      SELECT 1
+                      FROM price_bars p
+                      WHERE p.market = i.market
+                        AND p.ticker = i.ticker
+                        AND p.date >= ?
+                        AND p.date <= ?
+                        AND p.volume > 0
+                  )
+                """,
+                (market, start_date, end_date, *intraday_tickers, start_date, end_date),
+            ).fetchone()["c"] or 0)
+        else:
+            intraday_tradable_target_count = 0
+            intraday_tradable_symbol_count = 0
+    else:
+        intraday_tradable_target_count = int(conn.execute(
+            """
+            SELECT COUNT(DISTINCT ticker) AS c
+            FROM price_bars
+            WHERE market = ? AND date >= ? AND date <= ? AND volume > 0
+            """,
+            (market, start_date, end_date),
+        ).fetchone()["c"] or 0)
+        intraday_tradable_symbol_count = int(conn.execute(
+            """
+            SELECT COUNT(DISTINCT i.ticker) AS c
+            FROM intraday_bars i
+            WHERE i.market = ? AND i.date >= ? AND i.date <= ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM price_bars p
+                  WHERE p.market = i.market
+                    AND p.ticker = i.ticker
+                    AND p.date >= ?
+                    AND p.date <= ?
+                    AND p.volume > 0
+              )
+            """,
+            (market, start_date, end_date, start_date, end_date),
+        ).fetchone()["c"] or 0)
     intraday_tradable_missing_count = max(
         intraday_tradable_target_count - intraday_tradable_symbol_count,
         0,
@@ -503,9 +730,19 @@ def audit_data_coverage(
     if benchmark_pct < 95.0:
         notes.append(f"分层基准覆盖不足：{benchmark_pct:.1f}%。")
     if intraday_tradable_missing_count:
+        if intraday_scope == "signal":
+            notes.append(
+                f"信号池分时覆盖不足：目标信号 {intraday_tradable_target_count} 只，"
+                f"已覆盖 {intraday_tradable_symbol_count} 只，缺 {intraday_tradable_missing_count} 只。"
+            )
+        else:
+            notes.append(
+                f"分时覆盖不足：目标期有成交标的 {intraday_tradable_target_count} 只，"
+                f"已覆盖 {intraday_tradable_symbol_count} 只，缺 {intraday_tradable_missing_count} 只。"
+            )
+    elif intraday_scope == "signal" and intraday_tradable_target_count:
         notes.append(
-            f"分时覆盖不足：目标期有成交标的 {intraday_tradable_target_count} 只，"
-            f"已覆盖 {intraday_tradable_symbol_count} 只，缺 {intraday_tradable_missing_count} 只。"
+            f"信号池分时覆盖完整：{intraday_tradable_symbol_count}/{intraday_tradable_target_count}。"
         )
     elif intraday_no_trade_symbol_count:
         notes.append(
@@ -611,6 +848,7 @@ def data_update(
     throttle_seconds: float = 0.15,
     fetch_events: bool = True,
     fetch_intraday: bool = True,
+    intraday_period: str = "5",
     price_mode: str = "full",
     repair_coverage: bool = False,
     repair_scope: str = REPAIR_SCOPE_BENCHMARKS,
@@ -636,20 +874,91 @@ def data_update(
     fin_metrics = 0
     money_flows = 0
     errors: list[str] = []
+    source_notes: list[str] = []
 
-    fetched_full_missing_range = price_mode != "none" and (latest is None or latest < as_of_date)
+    can_use_same_day_snapshot = as_of_date == date.today().isoformat()
+    needs_core_amount_repair = (
+        price_mode == "core"
+        and can_use_same_day_snapshot
+        and _amount_coverage_pct(conn, "CN_A", as_of_date) < 95.0
+    )
+    fetched_full_missing_range = price_mode != "none" and (
+        latest is None or latest < as_of_date or needs_core_amount_repair
+    )
     if fetched_full_missing_range:
-        bars, price_errors = fetch_bars(
-            instruments,
-            start=parse_date(start),
-            end=parse_date(as_of_date),
-            throttle_seconds=throttle_seconds,
-            adjust=adjust,
-        )
+        if price_mode == "core" and start == as_of_date:
+            try:
+                bars, price_errors = fetch_akshare_cn_spot_bars(instruments, parse_date(as_of_date))
+                source_notes.append(f"primary=akshare_sina_spot rows={len(bars)} errors={len(price_errors)}")
+            except Exception as exc:
+                primary_error = f"AkShare/Sina spot failed: {exc}"
+                source_notes.append(primary_error)
+                try:
+                    bars, price_errors = fetch_tonghuashun_cn_spot_bars(
+                        instruments,
+                        parse_date(as_of_date),
+                        throttle_seconds=throttle_seconds,
+                    )
+                    price_errors = [primary_error, *price_errors]
+                    source_notes.append(f"fallback=tonghuashun_js rows={len(bars)} errors={len(price_errors)}")
+                except Exception as fallback_exc:
+                    bars = []
+                    price_errors = [primary_error, f"Tonghuashun JS fallback failed: {fallback_exc}"]
+                    source_notes.append("fallback=tonghuashun_js failed")
+            benchmark_bars, benchmark_errors = fetch_bars(
+                CN_A_BENCHMARKS,
+                start=parse_date(as_of_date),
+                end=parse_date(as_of_date),
+                throttle_seconds=throttle_seconds,
+                adjust=None,
+            )
+            source_notes.append(
+                f"benchmarks=sina rows={len(benchmark_bars)} expected={len(CN_A_BENCHMARKS)} errors={len(benchmark_errors)}"
+            )
+            if len(benchmark_bars) < len(CN_A_BENCHMARKS):
+                benchmark_errors = [
+                    *benchmark_errors,
+                    f"layered benchmark coverage incomplete: {len(benchmark_bars)}/{len(CN_A_BENCHMARKS)} rows for {as_of_date}",
+                ]
+            bars.extend(benchmark_bars)
+            price_errors.extend(benchmark_errors)
+        else:
+            bars, price_errors = fetch_bars(
+                instruments,
+                start=parse_date(start),
+                end=parse_date(as_of_date),
+                throttle_seconds=throttle_seconds,
+                adjust=adjust,
+            )
         price_count = upsert_many(conn, "price_bars", bars, ("market", "ticker", "date"))
         errors.extend(price_errors)
         _record_errors(conn, run_id, "CN_A", "price_bars", price_errors)
         _update_source_health(conn, "CN_A", "price_bars", price_errors)
+
+        if price_mode == "core":
+            coverage = _amount_coverage_pct(conn, "CN_A", as_of_date)
+            if coverage < 95.0:
+                missing = _missing_amount_instruments(conn, instruments, as_of_date, limit=80)
+                if missing:
+                    repair_bars, repair_errors = fetch_tonghuashun_cn_spot_bars(
+                        missing,
+                        parse_date(as_of_date),
+                        throttle_seconds=throttle_seconds,
+                    )
+                    if repair_bars:
+                        price_count += upsert_many(conn, "price_bars", repair_bars, ("market", "ticker", "date"))
+                    errors.extend(repair_errors)
+                    _record_errors(conn, run_id, "CN_A", "tonghuashun_amount_repair", repair_errors)
+                    _update_source_health(conn, "CN_A", "tonghuashun_amount_repair", repair_errors)
+                coverage = _amount_coverage_pct(conn, "CN_A", as_of_date)
+            if coverage < 95.0:
+                missing = _missing_amount_instruments(conn, instruments, as_of_date, limit=50)
+                if missing:
+                    repaired, repair_errors = _repair_amount_with_baostock(conn, missing, as_of_date)
+                    source_notes.append(f"repair=baostock_amount updated={repaired} errors={len(repair_errors)}")
+                    errors.extend(repair_errors)
+                    _record_errors(conn, run_id, "CN_A", "baostock_amount_repair", repair_errors)
+                    _update_source_health(conn, "CN_A", "baostock_amount_repair", repair_errors)
 
     if price_mode != "none" and repair_coverage:
         repair_start = _earliest_price_date(conn, "CN_A") or start
@@ -694,7 +1003,7 @@ def data_update(
                 candidates,
                 start=parse_date(as_of_date),
                 end=parse_date(as_of_date),
-                period="5",
+                period=intraday_period,
                 throttle_seconds=throttle_seconds,
             )
             intraday_count = upsert_many(conn, "intraday_bars", bars, ("market", "ticker", "datetime"))
@@ -702,7 +1011,14 @@ def data_update(
             _record_errors(conn, run_id, "CN_A", "intraday_bars", intraday_errors)
             _update_source_health(conn, "CN_A", "intraday_bars", intraday_errors)
 
-    status = "SUCCESS" if not errors else ("PARTIAL_SUCCESS" if price_count or corp_events or intraday_count else "FAILED")
+    if price_mode == "core":
+        final_amount_coverage = _amount_coverage_pct(conn, "CN_A", as_of_date)
+        source_notes.append(f"amount_coverage={final_amount_coverage:.1f}%")
+        if final_amount_coverage < 95.0:
+            errors.append(f"core amount coverage below 95%: {final_amount_coverage:.1f}%")
+
+    partial_progress = price_count or corp_events or intraday_count or price_mode == "core"
+    status = "SUCCESS" if not errors else ("PARTIAL_SUCCESS" if partial_progress else "FAILED")
     _finish_run(
         conn,
         run_id,
@@ -714,7 +1030,7 @@ def data_update(
         financial_metrics=fin_metrics,
         money_flows=money_flows,
         error_count=len(errors),
-        notes="; ".join(errors[:3]),
+        notes="; ".join([*source_notes, *errors[:3]]),
     )
     audit_data_coverage(conn, as_of_date, as_of_date, "CN_A", write=True)
     return DataUpdateResult(
@@ -729,6 +1045,7 @@ def data_update(
         financial_metrics=fin_metrics,
         money_flows=money_flows,
         error_count=len(errors),
+        source_summary="; ".join(source_notes),
     )
 
 
@@ -869,3 +1186,152 @@ def daily_run(conn: sqlite3.Connection, as_of_date: str) -> tuple[DataUpdateResu
         ignore_adjustment_for_short_term=True,
     )
     return update, audit if audit else pre_audit, candidate_count, confirmation
+
+
+# ---------------------------------------------------------------------------
+# 北向资金
+# ---------------------------------------------------------------------------
+
+def fetch_northbound_flows(
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+) -> int:
+    """拉取北向资金（沪深港通）日度净买入数据。
+
+    数据源: AkShare stock_hsgt_hist_em (东方财富)
+    返回写入行数。
+    """
+    import akshare as ak
+
+    df = ak.stock_hsgt_hist_em(symbol="北向资金")
+    if df is None or df.empty:
+        return 0
+
+    written = 0
+    for _, row in df.iterrows():
+        d = str(row["日期"])[:10]
+        if start_date and d < start_date:
+            continue
+        conn.execute(
+            """INSERT OR REPLACE INTO northbound_flows
+               (date, net_buy_amount, buy_amount, sell_amount, cumulative_net_buy,
+                fund_inflow, remaining_quota, holding_mv,
+                leading_stock, leading_stock_change_pct, hs300, hs300_change_pct)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                d,
+                _safe_float(row.get("当日成交净买额")),
+                _safe_float(row.get("买入成交额")),
+                _safe_float(row.get("卖出成交额")),
+                _safe_float(row.get("历史累计净买额")),
+                _safe_float(row.get("当日资金流入")),
+                _safe_float(row.get("当日余额")),
+                _safe_float(row.get("持股市值")),
+                _safe_str(row.get("领涨股")),
+                _safe_float(row.get("领涨股-涨跌幅")),
+                _safe_float(row.get("沪深300")),
+                _safe_float(row.get("沪深300-涨跌幅")),
+            ),
+        )
+        written += 1
+    conn.commit()
+    return written
+
+
+# ---------------------------------------------------------------------------
+# 融资融券
+# ---------------------------------------------------------------------------
+
+def fetch_margin_trading(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+) -> int:
+    """拉取某日融资融券明细（沪市 + 深市）。
+
+    数据源: AkShare stock_margin_detail_sse / stock_margin_detail_szse
+    返回写入行数。
+    """
+    import akshare as ak
+
+    date_param = as_of_date.replace("-", "")
+    written = 0
+
+    # 沪市
+    try:
+        df_sh = ak.stock_margin_detail_sse(date=date_param)
+        if df_sh is not None and not df_sh.empty:
+            for _, row in df_sh.iterrows():
+                code = str(row.get("标的证券代码", "")).strip()
+                if not code:
+                    continue
+                ticker = f"{code}.SS"
+                conn.execute(
+                    """INSERT OR REPLACE INTO margin_trading
+                       (market, ticker, date, name,
+                        margin_balance, margin_buy, margin_repay,
+                        short_volume, short_sell_volume, short_repay_volume)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "CN_A", ticker, as_of_date,
+                        _safe_str(row.get("标的证券简称")),
+                        _safe_float(row.get("融资余额")),
+                        _safe_float(row.get("融资买入额")),
+                        _safe_float(row.get("融资偿还额")),
+                        _safe_float(row.get("融券余量")),
+                        _safe_float(row.get("融券卖出量")),
+                        _safe_float(row.get("融券偿还量")),
+                    ),
+                )
+                written += 1
+    except Exception:
+        pass  # SSE 接口近期日期可能报错
+
+    # 深市
+    try:
+        df_sz = ak.stock_margin_detail_szse(date=date_param)
+        if df_sz is not None and not df_sz.empty:
+            for _, row in df_sz.iterrows():
+                code = str(row.get("证券代码", "")).strip()
+                if not code:
+                    continue
+                ticker = f"{code}.SZ"
+                conn.execute(
+                    """INSERT OR REPLACE INTO margin_trading
+                       (market, ticker, date, name,
+                        margin_balance, margin_buy,
+                        short_volume, short_sell_volume,
+                        short_balance, total_balance)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "CN_A", ticker, as_of_date,
+                        _safe_str(row.get("证券简称")),
+                        _safe_float(row.get("融资余额")),
+                        _safe_float(row.get("融资买入额")),
+                        _safe_float(row.get("融券余量")),
+                        _safe_float(row.get("融券卖出量")),
+                        _safe_float(row.get("融券余额")),
+                        _safe_float(row.get("融资融券余额")),
+                    ),
+                )
+                written += 1
+    except Exception:
+        pass
+
+    conn.commit()
+    return written
+
+
+def _safe_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_str(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s else None

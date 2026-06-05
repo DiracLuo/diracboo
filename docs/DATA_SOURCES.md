@@ -10,16 +10,40 @@ Alpha Ledger 已经接入三类公开日线行情源，并统一写入 `price_ba
 |---|---|---|---|
 | 美股 | 新浪美股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
 | 港股 | 腾讯港股日K接口 | 日线 OHLCV | 实验保留，暂不进入正式收益结论 |
-| A股 | 新浪 A 股日K接口 + BaoStock 前复权（AkShare 兜底） | 原始 OHLCV + 复权收益价 | 原始价用于成交展示，`adj_*` 用于收益统计；BaoStock `query_history_k_data_plus`(`adjustflag="2"`) 为前复权主源，AkShare `stock_zh_a_hist`(`adjust="qfq"`) 仅在 BaoStock 返回空时兜底 |
+| A股 | 新浪/AkShare 快照 + pre_close 因子修复 + BaoStock 维护兜底 | 原始 OHLCV + pre_close + adj_factor | 原始价用于成交展示；每日用 `pre_close / previous_raw_close` 维护前复权因子；BaoStock `adjustflag="2"` 只作为疑似样本、失败样本和历史补漏源 |
 | A股换手率/成交额 | BaoStock `query_history_k_data_plus`(`adjustflag="3"`) | 补充 `amount` 和 `turnover_pct` | 通过 `enrich-daily-bars` 命令写入 |
 | A股基准 | 新浪 A 股日K接口 | 沪深300 `000300.SS`、中证500 `000905.SS`、中证1000 `000852.SS`、创业板指 `399006.SZ`、科创50 `000688.SS`、北证50 `899050.BJ` | 分层基准，`cn_a_benchmark_for_ticker()` 按股票代码前缀自动映射 |
 
-A 股回放还支持 5 分钟线，统一写入 `intraday_bars`：
+前复权不再依赖每日全量 BaoStock 回填。生产快路径先保存 `pre_close`，随后只对发生除权断点的股票做快速因子修复：
+
+```bash
+python -m alpha_ledger detect-adjustment-breaks --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-repair-daily --as-of YYYY-MM-DD
+```
+
+每周或半月再做一次补漏维护，默认扫描最近 45 天，BaoStock 只处理失败/疑似样本和历史补漏：
+
+```bash
+python -m alpha_ledger qfq-maintenance \
+  --as-of YYYY-MM-DD \
+  --interval-days 14 \
+  --lookback-days 45 \
+  --mode scan-and-repair \
+  --source auto
+```
+
+需要每周维护时把 `--interval-days` 改成 `7`；需要手动提前执行时加 `--force`。维护结果写入 `data_fetch_runs`，报告写入 `reports/qfq_maintenance/`。短线日报允许继续使用 `RAW_FALLBACK`，但中长期回测、策略升权和正式 walk-forward 仍应关注前复权覆盖。
+
+通达信数据源已作为候选源探索：本机具备 `pytdx` / `mootdx` 依赖，理论上可取原始行情、历史 K 线和除权除息资料；但它通常不直接返回前复权日线，需要基于除权资料自行计算复权因子。本轮公开 TDX 主机连接探测未通过，因此暂不作为生产前复权替代源。后续若要接入，应先实现 `tdx-probe`、稳定主机池和除权因子校验，再考虑替代 BaoStock。
+
+A 股回放还支持分钟线，统一写入 `intraday_bars`：
 
 | 市场 | 当前源 | 用途 | 备注 |
 |---|---|---|---|
-| A股 | 新浪 A 股分钟 K 线 | 5 分钟入场、止损/止盈路径 | 当前优先源 |
+| A股 | 新浪 A 股分钟 K 线 | 回放 5 分钟路径 / 生产 1 分钟日内结论 | 当前优先源 |
 | A股 | AkShare `stock_zh_a_hist_min_em` | 备用分钟线 | 网络可用时作为兜底 |
+
+生产 `production-run` 信号分时复核步骤使用 1 分钟 K 线（`intraday_period='1'`），用于 VWAP 支撑、尾盘强度、高点回撤和弱势收盘等简易日内结论。分时数据仅作为执行上下文，不改变选股逻辑。`production-async` 不再拉取分时数据。
 
 另已通过 AkShare 接入 A 股事件数据：
 
@@ -80,7 +104,7 @@ python -m alpha_ledger import-events-csv \
 data/universe/default_universe.csv
 ```
 
-拉取正式 A 股行情：
+研究/维护手工拉取 A 股行情（非生产入口）：
 
 ```bash
 python -m alpha_ledger fetch-prices \
@@ -88,7 +112,7 @@ python -m alpha_ledger fetch-prices \
   --end 2026-05-25 \
   --markets CN_A \
   --include-benchmarks \
-  --adjust qfq
+  --adjust none
 ```
 
 如果只想补沪深 300 基准：
@@ -100,8 +124,10 @@ python -m alpha_ledger fetch-prices \
   --markets CN_A \
   --symbols 000300.SS \
   --include-benchmarks \
-  --adjust qfq
+  --adjust none
 ```
+
+正式生产不要用上述手工命令替代 `production-run`。前复权日常主路径是 `detect-adjustment-breaks` + `qfq-repair-daily` 维护 `adj_factor`，不是在拉行情时全市场请求 qfq。
 
 筛选候选：
 
@@ -148,12 +174,25 @@ python -m alpha_ledger walk-forward \
 每日收盘后运行：
 
 ```bash
-python -m alpha_ledger data-update --as-of 2026-05-27 --markets CN_A --adjust none
-python -m alpha_ledger data-audit --start 2026-04-01 --end 2026-05-27 --markets CN_A
-python -m alpha_ledger daily-run --as-of 2026-05-27
+python -m alpha_ledger production-run --as-of 2026-05-27
 ```
 
-已有历史行情不缺日期、但缺分层基准或复权覆盖时，使用覆盖修复模式。默认只修分层基准，不重拉全市场复权：
+`production-run` 是唯一推荐生产入口，会编排核心行情快路径、除权断点检测、复权因子快修、数据审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和只读日报生成。
+
+当前生产编排的关键底层步骤为：
+
+```text
+data-update --core-only --adjust none
+-> detect-adjustment-breaks
+-> qfq-repair-daily
+-> data-audit
+-> qlib-refresh --mode incremental
+-> model-predict --models production
+-> screen + 1m 分时复核
+-> production-daily
+```
+
+已有历史行情不缺日期、但缺分层基准时，使用覆盖修复模式。默认只修分层基准，不重拉全市场复权：
 
 ```bash
 python -m alpha_ledger data-update \
@@ -168,10 +207,10 @@ python -m alpha_ledger data-update \
 该模式会重新检查已有日期范围内的覆盖缺口：
 
 - 分层基准缺失时补沪深300、中证500、中证1000、创业板指、科创50、北证50。
-- 仅当使用 `--repair-scope adjustments` 或 `--repair-scope all` 时，才尝试把已有 A 股 `RAW_FALLBACK` 日线重新拉取为前复权。
+- 不推荐再用旧的全市场 adjustment repair 入口作为每日复权路径。前复权优先使用 `detect-adjustment-breaks` + `qfq-repair-daily`，只修发生断点的股票。
 - 修复结果继续写入 `data_fetch_runs` 和 `data_fetch_errors`。
 
-复权接口可用性先用小样本探测：
+旧的复权接口探测仍可用于排查 BaoStock/AkShare 是否可作为维护源，但不是每日生产必跑步骤：
 
 ```bash
 python -m alpha_ledger data-audit \
@@ -182,7 +221,7 @@ python -m alpha_ledger data-audit \
   --ignore-adjustment-for-short-term
 ```
 
-如果探测成功率较高，应补库修复复权；如果多源持续失败，短线 T+5/T+10 研究可临时使用 `RAW_FALLBACK`，但正式升权、长周期结论和 walk-forward 仍需复权覆盖达标。
+如果探测成功率较高，可用于补漏维护；如果多源持续失败，短线 T+5/T+10 研究可临时使用 `RAW_FALLBACK`，但正式升权、长周期结论和 walk-forward 仍需复权覆盖达标。
 
 短线忽略复权时，系统会标记“未复权短线研究口径”，并把置信度上限限制在 `MEDIUM_CONFIDENCE`；正式买入清单仍要求 `HIGH_CONFIDENCE`。
 
@@ -192,7 +231,7 @@ python -m alpha_ledger data-audit \
 python -m alpha_ledger data-backfill --start 2025-12-01 --end 2026-05-26 --markets CN_A --batch-days 180 --adjust none --throttle 0.3
 ```
 
-当前补库主线使用 `--adjust none`，只维护原始价格短线研究库。需要修复复权时单独使用 `--adjust qfq` 或 `--repair-scope adjustments`，不要和日常补库混跑。
+当前补库主线使用 `--adjust none`，只维护原始价格和 `pre_close/change_pct`。需要修复复权时优先运行 `detect-adjustment-breaks`、`qfq-repair-daily` 或 `qfq-maintenance --mode scan-and-repair`，不要和日常补库混跑。
 
 新增数据任务表：
 
@@ -220,9 +259,9 @@ python -m alpha_ledger tune-weights \
 
 ## BaoStock、AkShare 与 Tushare
 
-BaoStock 已安装并用于 A 股前复权（主源）和日线换手率/成交额补充。前复权通过 `query_history_k_data_plus` 的 `adjustflag="2"` 获取；换手率通过 `adjustflag="3"` 获取（无复权，仅取原始指标）。`backfill-qfq` 命令也使用 BaoStock 批量回补前复权价格。
+BaoStock 已安装并用于 A 股日线换手率/成交额补充，以及前复权补漏和校验。前复权生产主路径不再每日调用 BaoStock 全量 qfq；只有 `qfq-maintenance --mode scan-and-repair` 遇到失败/疑似样本或历史补漏时，才应使用 BaoStock `adjustflag="2"`。
 
-AkShare 已安装并用于事件、财务、当前资金流和 A 股分钟线兜底；但本环境中 AkShare 的东方财富链路偶尔会出现 `ProxyError / RemoteDisconnected`，所以 A 股分钟线当前优先使用新浪直连源，前复权优先使用 BaoStock。
+AkShare 已安装并用于事件、财务、当前资金流和 A 股分钟线兜底；但本环境中 AkShare 的东方财富链路偶尔会出现 `ProxyError / RemoteDisconnected`，所以 A 股分钟线当前优先使用新浪直连源。当前前复权优先使用 `pre_close` 推导因子，AkShare/BaoStock 只做维护源。
 
 Tushare 适合后续补充结构化 A股基础数据、财务指标、行情和公司事件；通常需要 token。
 

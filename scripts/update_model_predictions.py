@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Refresh Qlib model predictions and import them into Alpha Ledger."""
+"""Legacy/research Qlib prediction updater.
+
+WARNING:
+    This script is not the production path. It can mutate workflow YAML files
+    and run dump_all-style refreshes. Use the production pipeline instead:
+
+        python -m alpha_ledger production-run --as-of YYYY-MM-DD
+
+    Keep this only for maintenance/research migration work.
+"""
 
 from __future__ import annotations
 

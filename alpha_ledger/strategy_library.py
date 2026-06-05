@@ -161,7 +161,7 @@ STRATEGIES = [
                 "surprise": "实际值在预告上沿70%以上，或净利高于一致预期>=10%",
                 "post_announcement": "公告后首日涨幅-2%到+7%，非一字涨停，量比1.2-2.8，收盘在MA20上方",
                 "not_overextended": "过去20日涨幅<=25%，过去5日涨停次数<=1",
-                "model_requirement": "M2或M3>=60%",
+                "model_requirement": "3个Production模型中至少2个>=60%，或至少1个>=70%",
             }
         ),
         "exit_rules_json": dump_json(

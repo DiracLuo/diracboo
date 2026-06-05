@@ -664,10 +664,13 @@ def fetch_notice_events(date_value: date, limit: int | None = None) -> tuple[lis
     rows: list[dict[str, object]] = []
     instruments: dict[tuple[str, str], Instrument] = {}
     for _, item in df.iterrows():
-        ticker, _, _ = normalize_cn_code(str(item["代码"]))
-        name = str(item["名称"])
-        event_type = str(item["公告类型"])
-        title = str(item["公告标题"])
+        try:
+            ticker, _, _ = normalize_cn_code(str(item["代码"]))
+            name = str(item["名称"])
+            event_type = str(item["公告类型"])
+            title = str(item["公告标题"])
+        except Exception:
+            continue
         rows.append(
             {
                 "market": "CN_A",
@@ -800,22 +803,47 @@ def fetch_research_reports(instruments: list[Instrument], limit_per_symbol: int 
 
 def fetch_current_money_flow(as_of: date, limit: int = 300) -> list[dict[str, object]]:
     ak = _akshare()
-    df = ak.stock_fund_flow_individual(symbol="即时")
+    try:
+        df = ak.stock_fund_flow_individual(symbol="即时")
+        source = "akshare.stock_fund_flow_individual"
+        code_column = "股票代码"
+        name_column = "股票简称"
+        net_column = "净额"
+        inflow_column = "流入资金"
+        outflow_column = "流出资金"
+        amount_column = "成交额"
+        turnover_column = "换手率"
+    except Exception:
+        try:
+            df = ak.stock_individual_fund_flow_rank(indicator="今日")
+            source = "akshare.stock_individual_fund_flow_rank"
+            code_column = "代码"
+            name_column = "名称"
+            net_column = "今日主力净流入-净额"
+            inflow_column = "今日超大单净流入-净额"
+            outflow_column = "今日小单净流入-净额"
+            amount_column = "今日主力净流入-净占比"
+            turnover_column = "今日涨跌幅"
+        except Exception:
+            return []
     rows: list[dict[str, object]] = []
     for _, item in df.head(limit).iterrows():
-        ticker, _, _ = normalize_cn_code(str(item["股票代码"]))
+        try:
+            ticker, _, _ = normalize_cn_code(str(item[code_column]))
+        except Exception:
+            continue
         rows.append(
             {
                 "market": "CN_A",
                 "ticker": ticker,
                 "date": as_of.isoformat(),
-                "name": str(item["股票简称"]),
-                "net_inflow": _safe_float(item.get("净额")),
-                "inflow": _safe_float(item.get("流入资金")),
-                "outflow": _safe_float(item.get("流出资金")),
-                "turnover_amount": _safe_float(item.get("成交额")),
-                "turnover_rate": _safe_float(item.get("换手率")),
-                "source": "akshare.stock_fund_flow_individual",
+                "name": str(item.get(name_column, ticker)),
+                "net_inflow": _safe_float(item.get(net_column)),
+                "inflow": _safe_float(item.get(inflow_column)),
+                "outflow": _safe_float(item.get(outflow_column)),
+                "turnover_amount": _safe_float(item.get(amount_column)),
+                "turnover_rate": _safe_float(item.get(turnover_column)),
+                "source": source,
                 "created_at": now_utc(),
             }
         )

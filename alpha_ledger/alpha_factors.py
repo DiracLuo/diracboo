@@ -161,12 +161,54 @@ POSITIVE_FACTORS = {"breakout_20d", "volume_ratio_10d", "momentum_5d", "momentum
 # Factors where LOWER raw value = BETTER signal
 NEGATIVE_FACTORS = {"volatility_20d"}
 
-# 多模型评分配置：(model_name, model_version, score_field, percentile_field)
-MULTI_MODEL_CONFIGS = [
-    ("qlib_alpha360", "t2_18m", "model_score", "model_percentile"),
-    ("qlib_alpha360_20250101", "t2_15m", "model_score_2", "model_percentile_2"),
-    ("qlib_alpha360_20260101", "t2_4m", "model_score_3", "model_percentile_3"),
-]
+MODEL_SCORE_FIELDS = (
+    ("model_score", "model_percentile"),
+    ("model_score_2", "model_percentile_2"),
+    ("model_score_3", "model_percentile_3"),
+)
+
+
+def production_model_configs(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    """Return up to three active production model configs for candidate/report fields.
+
+    The database registry is the only production source of truth. If no
+    production models are registered, callers should treat model scores as
+    unavailable instead of falling back to retired legacy models.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT model_name, model_version
+            FROM model_registry
+            WHERE status = 'PRODUCTION'
+            ORDER BY id
+            LIMIT 3
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    configs: list[tuple[str, str, str, str]] = []
+    for row, (score_field, percentile_field) in zip(rows, MODEL_SCORE_FIELDS):
+        configs.append((str(row["model_name"]), str(row["model_version"]), score_field, percentile_field))
+    return configs
+
+
+def production_model_labels(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return display metadata for the three production model columns."""
+    configs = production_model_configs(conn)
+    labels: list[dict[str, str]] = []
+    for idx, (model_name, model_version, score_field, percentile_field) in enumerate(configs, start=1):
+        labels.append(
+            {
+                "short_label": f"M{idx}",
+                "model_name": model_name,
+                "model_version": model_version,
+                "score_field": score_field,
+                "percentile_field": percentile_field,
+                "display_label": f"M{idx} ({model_name} {model_version})",
+            }
+        )
+    return labels
 
 
 def _version_prefix(model_version: str) -> str:
@@ -370,7 +412,7 @@ def attach_model_scores(
             "model_percentile",
         )]
     else:
-        configs = model_configs or MULTI_MODEL_CONFIGS
+        configs = model_configs or production_model_configs(conn)
 
     for cfg_model_name, cfg_model_version, score_field, percentile_field in configs:
         resolved_version = _resolve_model_version(conn, cfg_model_name, cfg_model_version, as_of_date)

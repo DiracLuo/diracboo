@@ -32,6 +32,7 @@ SINA_US_DAILY_URL = (
     "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20_data=/"
     "US_MinKService.getDailyK?symbol={symbol}&___qn=3n"
 )
+TONGHUASHUN_CN_TODAY_URL = "http://d.10jqka.com.cn/v6/line/hs_{code}/01/today.js"
 TENCENT_HK_DAILY_URL = (
     "https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get?"
     "param={symbol},day,,,{datalen},qfq"
@@ -387,6 +388,7 @@ def _row_to_bar(
         "low": low_float,
         "volume": float(volume),
         "amount": amount_float,
+        "pre_close": previous_close,
         "amplitude_pct": amplitude_pct,
         "change_pct": _pct_change(
             previous_adj_close if previous_adj_close not in (None, 0) else previous_close,
@@ -544,6 +546,150 @@ def fetch_sina_cn_bars(instrument: Instrument, start: date, end: date) -> list[d
     return bars
 
 
+def _cn_a_spot_ticker(value: object) -> str:
+    text = str(value).strip().lower()
+    match = re.search(r"(\d{6})", text)
+    if not match:
+        raise MarketDataError(f"Could not derive A-share ticker from spot code: {value}")
+    code = match.group(1)
+    if text.startswith("sh"):
+        return f"{code}.SS"
+    if text.startswith("sz"):
+        return f"{code}.SZ"
+    if text.startswith("bj"):
+        return f"{code}.BJ"
+    if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+        return f"{code}.SS"
+    if code.startswith(("8", "920", "430")):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def fetch_akshare_cn_spot_bars(
+    instruments: Iterable[Instrument],
+    as_of: date,
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Fetch same-day CN_A OHLCV/amount using AkShare's all-market snapshot.
+
+    This is the production fast path for the daily update. It avoids one HTTP
+    request per stock and uses the snapshot's traded amount directly.
+    """
+    instrument_by_ticker = {
+        item.ticker: item
+        for item in instruments
+        if item.market == "CN_A" and "index" not in item.tags and "benchmark" not in item.tags
+    }
+    if not instrument_by_ticker:
+        return [], []
+
+    ak = _akshare()
+    try:
+        frame = ak.stock_zh_a_spot()
+    except Exception as exc:
+        raise MarketDataError(f"AkShare CN_A spot error: {exc}") from exc
+    if frame is None or getattr(frame, "empty", False):
+        return [], ["AkShare CN_A spot returned no rows"]
+
+    bars: list[dict[str, object]] = []
+    errors: list[str] = []
+    for _, row in frame.iterrows():
+        try:
+            ticker = _cn_a_spot_ticker(_series_get(row, ("代码", "code", "symbol")))
+        except MarketDataError as exc:
+            errors.append(str(exc))
+            continue
+        instrument = instrument_by_ticker.get(ticker)
+        if instrument is None:
+            continue
+        try:
+            previous_close = float(_series_get(row, ("昨收", "previous_close")))
+            close = float(_series_get(row, ("最新价", "close", "最新")))
+            bars.append(
+                _row_to_bar(
+                    instrument,
+                    as_of.isoformat(),
+                    _series_get(row, ("今开", "open")),
+                    close,
+                    _series_get(row, ("最高", "high")),
+                    _series_get(row, ("最低", "low")),
+                    _series_get(row, ("成交量", "volume")),
+                    previous_close,
+                    amount=_series_get(row, ("成交额", "amount", "money")),
+                    adjustment_status="RAW_FALLBACK",
+                )
+            )
+        except (MarketDataError, ValueError, TypeError) as exc:
+            errors.append(f"{ticker} spot parse error: {exc}")
+    return bars, errors
+
+
+def fetch_tonghuashun_cn_spot_bars(
+    instruments: Iterable[Instrument],
+    as_of: date,
+    *,
+    throttle_seconds: float = 0.03,
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Best-effort same-day CN_A OHLCV/amount fallback via Tonghuashun JS.
+
+    Tonghuashun changes its public JS endpoints frequently, so this is a
+    fallback/repair source rather than the normal production primary.
+    """
+    bars: list[dict[str, object]] = []
+    errors: list[str] = []
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "http://q.10jqka.com.cn/",
+    }
+    for instrument in instruments:
+        if instrument.market != "CN_A" or "index" in instrument.tags or "benchmark" in instrument.tags:
+            continue
+        code = re.search(r"(\d{6})", instrument.ticker)
+        if not code:
+            errors.append(f"{instrument.ticker} Tonghuashun ticker parse failed")
+            continue
+        url = TONGHUASHUN_CN_TODAY_URL.format(code=code.group(1))
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = response.read().decode("utf-8", errors="ignore")
+            match = re.search(r"(\{.*\})", payload)
+            if not match:
+                errors.append(f"{instrument.ticker} Tonghuashun returned no JSON")
+                continue
+            data = json.loads(match.group(1))
+            raw = data.get("data") or data.get("flash") or data.get("today") or ""
+            if isinstance(raw, dict):
+                raw = next(iter(raw.values()), "")
+            parts = str(raw).replace(";", ",").split(",")
+            nums = [float(x) for x in parts if re.fullmatch(r"-?\d+(?:\.\d+)?", x.strip())]
+            if len(nums) < 5:
+                errors.append(f"{instrument.ticker} Tonghuashun payload parse failed")
+                continue
+            open_, high, low, close = nums[0], nums[1], nums[2], nums[3]
+            volume = nums[4] if len(nums) > 4 else 0.0
+            amount = nums[5] if len(nums) > 5 else None
+            previous_close = nums[6] if len(nums) > 6 else close
+            bars.append(
+                _row_to_bar(
+                    instrument,
+                    as_of.isoformat(),
+                    open_,
+                    close,
+                    high,
+                    low,
+                    volume,
+                    previous_close,
+                    amount=amount,
+                    adjustment_status="RAW_FALLBACK",
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{instrument.ticker} Tonghuashun spot error: {exc}")
+        if throttle_seconds > 0:
+            time.sleep(throttle_seconds)
+    return bars, errors
+
+
 def fetch_akshare_cn_adjusted_daily_map(
     instrument: Instrument,
     start: date,
@@ -612,7 +758,7 @@ def fetch_baostock_cn_adjusted_daily_map(
 
     rs = bs.query_history_k_data_plus(
         bs_symbol,
-        "date,open,high,low,close,volume,amount,turn,tradestatus,isST",
+        "date,open,high,low,close,volume,amount,turn,tradestatus,isST,peTTM,psTTM",
         start_date=start.isoformat(),
         end_date=end.isoformat(),
         frequency="d",
@@ -647,6 +793,18 @@ def fetch_baostock_cn_adjusted_daily_map(
             turn_str = row[7] if len(row) > 7 else None
             if turn_str not in (None, ""):
                 entry["turnover_pct"] = float(turn_str)
+        except (ValueError, IndexError):
+            pass
+        try:
+            pe_str = row[10] if len(row) > 10 else None
+            if pe_str not in (None, ""):
+                entry["pe_ttm"] = float(pe_str)
+        except (ValueError, IndexError):
+            pass
+        try:
+            ps_str = row[11] if len(row) > 11 else None
+            if ps_str not in (None, ""):
+                entry["ps_ttm"] = float(ps_str)
         except (ValueError, IndexError):
             pass
         rows[row_date] = entry

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 from .audit import audit_all, latest_audits
@@ -11,11 +11,16 @@ from .ticker_repair import audit_ticker_repair, repair_tickers, write_ticker_rep
 from .qlib_import import import_qlib_predictions, write_import_report
 from .daily_enrichment import enrich_daily_bars, write_enrichment_report
 from .qfq_backfill import qfq_backfill, write_qfq_backfill_report
+from .adjustments import (
+    detect_adjustment_breaks,
+    qfq_maintenance_scan_and_repair,
+    qfq_repair_daily,
+)
 from .benchmarks import CN_A_BENCHMARKS
 from .data_ops import REPAIR_SCOPES, audit_data_coverage, data_update, probe_adjustment_sources
 from .db import DEFAULT_DB_PATH, connect, init_db, upsert_many
 from .event_data import fetch_events_to_db, import_events_csv
-from .ledger import verify_signals
+from .ledger import now_utc, verify_signals
 from .loss_review import write_loss_review
 from .market_data import (
     DEFAULT_UNIVERSE_PATH,
@@ -33,6 +38,16 @@ from .metrics import (
     suggest_strategy_weight_adjustments,
 )
 from .portfolio_backtest import run_portfolio_backtest, write_portfolio_report
+from .pipeline_ops import (
+    model_arena,
+    model_evaluate,
+    model_governance_review,
+    model_predict,
+    production_async,
+    production_daily,
+    production_run,
+    qlib_refresh,
+)
 from .replay import replay_candidates
 from .validation import write_validation_report
 from .reporting import write_daily_plan, write_replay_report
@@ -106,6 +121,17 @@ def build_parser() -> argparse.ArgumentParser:
     data_update_parser.add_argument("--skip-events", action="store_true")
     data_update_parser.add_argument("--skip-intraday", action="store_true")
     data_update_parser.add_argument(
+        "--intraday-period",
+        choices=("1", "5", "15", "30", "60"),
+        default="5",
+        help="Intraday bar period in minutes (default: 5)",
+    )
+    data_update_parser.add_argument(
+        "--core-only",
+        action="store_true",
+        help="Production fast path: prices/benchmarks only; skip slow events, intraday, and qfq adjustment",
+    )
+    data_update_parser.add_argument(
         "--repair-coverage",
         action="store_true",
         help="Repair existing CN_A coverage gaps such as missing layered benchmarks and RAW_FALLBACK bars",
@@ -130,10 +156,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     data_audit.add_argument("--throttle", type=float, default=0.15)
 
-    daily_run_parser = subparsers.add_parser("daily-run", help="Run local daily data, screen, confirm, and report flow")
+    daily_run_parser = subparsers.add_parser(
+        "daily-run",
+        help="Legacy/research daily flow; use production-run for production",
+    )
     daily_run_parser.add_argument("--as-of", required=True)
     daily_run_parser.add_argument("--throttle", type=float, default=0.15)
     daily_run_parser.add_argument("--fast", action="store_true", help="Fast mode: prices + screening + report only, skip slow event fetching")
+    daily_run_parser.add_argument("--skip-model-update", action="store_true", help="Deprecated no-op; legacy model auto-update is disabled")
 
     daily_events_parser = subparsers.add_parser("daily-events", help="Fetch events, re-screen with fresh data, and update report")
     daily_events_parser.add_argument("--as-of", required=True)
@@ -243,7 +273,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit", help="Audit strategy health and decay risk")
     audit.add_argument("--as-of", required=True, help="Audit date")
 
-    daily_plan = subparsers.add_parser("daily-plan", help="Generate daily actionable candidate plan")
+    daily_plan = subparsers.add_parser(
+        "daily-plan",
+        help="Legacy/research daily plan; production uses production-run -> production-daily",
+    )
     daily_plan.add_argument("--as-of", required=True, help="Candidate date")
     daily_plan.add_argument("--out", help="Output markdown path")
 
@@ -328,6 +361,66 @@ def build_parser() -> argparse.ArgumentParser:
     import_pred.add_argument("--market", default="CN_A", help="Market identifier")
     import_pred.add_argument("--out-dir", default="reports", help="Output directory for import report")
 
+    qlib_refresh_cmd = subparsers.add_parser("qlib-refresh", help="Refresh Qlib bin data and record dataset version")
+    qlib_refresh_cmd.add_argument("--as-of", required=True)
+    qlib_refresh_cmd.add_argument("--mode", choices=("incremental", "full"), default="incremental")
+    qlib_refresh_cmd.add_argument("--max-workers", type=int, default=8)
+    qlib_refresh_cmd.add_argument("--output-root", default=None)
+
+    model_predict_cmd = subparsers.add_parser("model-predict", help="Run production model inference without training")
+    model_predict_cmd.add_argument("--as-of", required=True)
+    model_predict_cmd.add_argument("--models", choices=("production",), default="production")
+    model_predict_cmd.add_argument("--output-dir", default=None)
+
+    production_daily_cmd = subparsers.add_parser("production-daily", help="Run production daily report from prepared data")
+    production_daily_cmd.add_argument("--as-of", required=True)
+    production_daily_cmd.add_argument(
+        "--skip-data-update",
+        action="store_true",
+        help="Deprecated no-op: production-daily is read-only by default",
+    )
+    production_daily_cmd.add_argument(
+        "--allow-inline-data-update",
+        action="store_true",
+        help="Explicitly allow a core-only inline data update before report generation",
+    )
+    production_daily_cmd.add_argument("--output-dir", default=None)
+    production_daily_cmd.add_argument("--no-overwrite", action="store_true")
+
+    production_run_cmd = subparsers.add_parser("production-run", help="Run the single production data/model/report pipeline")
+    production_run_cmd.add_argument("--as-of", required=True)
+    production_run_cmd.add_argument("--skip-data-update", action="store_true")
+    production_run_cmd.add_argument("--no-overwrite", action="store_true")
+    production_run_cmd.add_argument("--output-root", default=None)
+
+    production_async_cmd = subparsers.add_parser(
+        "production-async",
+        help="Run slow production-adjacent data tasks without blocking/overwriting the formal daily report",
+    )
+    production_async_cmd.add_argument("--as-of", required=True)
+    production_async_cmd.add_argument("--output-dir", default=None)
+
+    governance = subparsers.add_parser("model-governance", help="Model governance utilities")
+    governance_sub = governance.add_subparsers(dest="governance_command", required=True)
+    governance_review = governance_sub.add_parser("review", help="Review recent production model health")
+    governance_review.add_argument("--as-of", required=True)
+    governance_review.add_argument("--output-dir", default=None)
+
+    model_arena_cmd = subparsers.add_parser("model-arena", help="Train and compare research model pool")
+    model_arena_cmd.add_argument("--as-of", required=True)
+    model_arena_cmd.add_argument("--pool", choices=("baseline18",), default="baseline18")
+    model_arena_cmd.add_argument("--max-workers", type=int, default=1)
+    model_arena_cmd.add_argument("--dry-run", action="store_true")
+    model_arena_cmd.add_argument("--output-dir", default=None)
+    model_arena_cmd.add_argument("--resume-run-id", default=None)
+
+    model_evaluate_cmd = subparsers.add_parser("model-evaluate", help="Run fixed-test validation for research model artifacts")
+    model_evaluate_cmd.add_argument("--pool", choices=("baseline18",), default="baseline18")
+    model_evaluate_cmd.add_argument("--model-version", required=True)
+    model_evaluate_cmd.add_argument("--as-of", required=True)
+    model_evaluate_cmd.add_argument("--mode", choices=("fixed-test",), default="fixed-test")
+    model_evaluate_cmd.add_argument("--output-dir", default=None)
+
     audit_tickers = subparsers.add_parser("audit-tickers", help="Dry-run audit of ticker normalization (.SH → .SS)")
     audit_tickers.add_argument("--out-dir", default="reports", help="Output directory for audit report")
     audit_tickers.add_argument("--limit", type=int, default=20, help="Max issues to print to stdout")
@@ -353,6 +446,46 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_qfq.add_argument("--out-dir", default="reports", help="Output directory for backfill report")
     backfill_qfq.add_argument("--dry-run", action="store_true", help="Report targets without network or DB writes")
 
+    qfq_maintenance = subparsers.add_parser(
+        "qfq-maintenance",
+        help="Run periodic CN_A forward-adjustment maintenance when the interval has elapsed",
+    )
+    qfq_maintenance.add_argument("--as-of", required=True, help="Maintenance date YYYY-MM-DD")
+    qfq_maintenance.add_argument("--interval-days", type=int, default=14, help="Minimum days between successful runs")
+    qfq_maintenance.add_argument("--lookback-days", type=int, default=45, help="Recent window to repair")
+    qfq_maintenance.add_argument(
+        "--mode",
+        choices=("backfill", "scan-and-repair"),
+        default="backfill",
+        help="backfill keeps the legacy BaoStock/AkShare path; scan-and-repair detects pre_close breaks first",
+    )
+    qfq_maintenance.add_argument("--throttle", type=float, default=0.3, help="Seconds between API calls")
+    qfq_maintenance.add_argument("--limit", type=int, default=None, help="Max tickers to process")
+    qfq_maintenance.add_argument("--commit-every", type=int, default=50, help="Commit batch size")
+    qfq_maintenance.add_argument(
+        "--source",
+        choices=["baostock", "auto"],
+        default="auto",
+        help="Adjustment source: auto uses BaoStock first and AkShare fallback",
+    )
+    qfq_maintenance.add_argument("--out-dir", default="reports/qfq_maintenance", help="Output directory")
+    qfq_maintenance.add_argument("--force", action="store_true", help="Run even if the maintenance interval has not elapsed")
+    qfq_maintenance.add_argument("--dry-run", action="store_true", help="Report targets without network or DB writes")
+
+    detect_adj = subparsers.add_parser(
+        "detect-adjustment-breaks",
+        help="Detect CN_A ex-right/ex-dividend adjustment breaks from pre_close",
+    )
+    detect_adj.add_argument("--as-of", required=True, help="Detection date YYYY-MM-DD")
+    detect_adj.add_argument("--market", default="CN_A")
+
+    repair_daily = subparsers.add_parser(
+        "qfq-repair-daily",
+        help="Repair queued CN_A qfq factors using pre_close-derived factor ratios",
+    )
+    repair_daily.add_argument("--as-of", required=True, help="Repair date YYYY-MM-DD")
+    repair_daily.add_argument("--market", default="CN_A")
+
     enrich_daily = subparsers.add_parser(
         "enrich-daily-bars",
         help="Enrich CN_A price_bars with BaoStock amount and turnover_pct",
@@ -365,6 +498,12 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_daily.add_argument("--commit-every", type=int, default=50, help="Commit batch size")
     enrich_daily.add_argument("--out-dir", default="reports", help="Output directory for enrichment report")
     enrich_daily.add_argument("--dry-run", action="store_true", help="Report targets without network or DB writes")
+
+    fetch_nb = subparsers.add_parser("fetch-northbound", help="Fetch northbound (HSGT) daily flow data")
+    fetch_nb.add_argument("--start", default=None, help="Start date YYYY-MM-DD (default: fetch all history)")
+
+    fetch_mt = subparsers.add_parser("fetch-margin", help="Fetch margin trading daily detail")
+    fetch_mt.add_argument("--as-of", required=True, help="Date YYYY-MM-DD")
 
     return parser
 
@@ -469,8 +608,10 @@ def command_data_update(
     adjust: str,
     skip_events: bool,
     skip_intraday: bool,
+    intraday_period: str,
     repair_coverage: bool,
     repair_scope: str,
+    core_only: bool = False,
 ) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
@@ -479,11 +620,13 @@ def command_data_update(
             as_of,
             markets,
             throttle_seconds=throttle,
-            fetch_events=not skip_events,
-            fetch_intraday=not skip_intraday,
+            fetch_events=False if core_only else not skip_events,
+            fetch_intraday=False if core_only else not skip_intraday,
+            intraday_period=intraday_period,
+            price_mode="core" if core_only else "full",
             repair_coverage=repair_coverage,
             repair_scope=repair_scope,
-            adjust=None if adjust == "none" else adjust,
+            adjust=None if core_only or adjust == "none" else adjust,
         )
     print(
         f"Data update #{result.run_id}: status={result.status}, range={result.start_date}..{result.end_date}, "
@@ -491,6 +634,8 @@ def command_data_update(
         f"events={result.corporate_events}, financials={result.financial_metrics}, money_flows={result.money_flows}, "
         f"errors={result.error_count}"
     )
+    if getattr(result, "source_summary", ""):
+        print(f"Source summary: {result.source_summary}")
 
 
 def command_data_audit(
@@ -554,24 +699,25 @@ def command_data_audit(
 
 
 def _missing_model_predictions(conn, as_of: str, market: str = "CN_A") -> list[str]:
-    try:
-        from .alpha_factors import MULTI_MODEL_CONFIGS
-    except Exception:
-        return []
-
     missing: list[str] = []
-    seen: set[str] = set()
-    for model_name, _model_version, _score_field, _percentile_field in MULTI_MODEL_CONFIGS:
-        if model_name in seen:
-            continue
-        seen.add(model_name)
+    rows = conn.execute(
+        """
+        SELECT model_name, model_version
+        FROM model_registry
+        WHERE status = 'PRODUCTION'
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        model_name = str(row["model_name"])
+        model_version = str(row["model_version"])
         row = conn.execute(
             """
             SELECT COUNT(*) AS count
             FROM model_scores
-            WHERE market = ? AND model_name = ? AND score_date = ?
+            WHERE market = ? AND model_name = ? AND model_version = ? AND score_date = ?
             """,
-            (market, model_name, as_of),
+            (market, model_name, model_version, as_of),
         ).fetchone()
         if not row or int(row["count"]) == 0:
             missing.append(model_name)
@@ -581,16 +727,15 @@ def _missing_model_predictions(conn, as_of: str, market: str = "CN_A") -> list[s
 def _print_model_prediction_hint(missing_models: list[str], as_of: str) -> None:
     if not missing_models:
         return
-    script_path = Path("scripts/update_model_predictions.py")
     print(
         "WARNING: model_scores 缺少 "
         f"{as_of} 的模型预测 ({', '.join(missing_models)}). "
-        "建议运行 "
-        f"/opt/anaconda3/bin/python3 {script_path} --as-of {as_of}"
+        "正式生产请运行 python -m alpha_ledger production-run --as-of "
+        f"{as_of}"
     )
 
 
-def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = False) -> None:
+def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = False, skip_model_update: bool = False) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
         update = data_update(
@@ -609,9 +754,11 @@ def command_daily_run(db_path: str, as_of: str, throttle: float, fast: bool = Fa
             write=True,
             ignore_adjustment_for_short_term=True,
         )
-        candidate_count = screen_all(conn, as_of)
         missing_models = _missing_model_predictions(conn, as_of)
+        if missing_models and not skip_model_update:
+            print("WARNING: daily-run is legacy/research; automatic legacy model update is disabled.")
         _print_model_prediction_hint(missing_models, as_of)
+        candidate_count = screen_all(conn, as_of)
         confirmed = confirm_candidates(conn, as_of)
         confirmed_pb = confirm_pullback_candidates(conn, as_of)
         report_path = write_daily_plan(conn, as_of)
@@ -1058,6 +1205,207 @@ def command_backfill_qfq(
             print(f"  - {e}")
 
 
+def command_qfq_maintenance(
+    db_path: str,
+    as_of: str,
+    interval_days: int,
+    lookback_days: int,
+    source: str,
+    throttle: float,
+    limit: int | None,
+    commit_every: int,
+    out_dir: str,
+    force: bool,
+    dry_run: bool,
+    mode: str = "backfill",
+) -> None:
+    """Run periodic qfq maintenance for a recent CN_A window.
+
+    This is intentionally separate from the daily production pipeline.  It is a
+    maintenance job for keeping short/medium-horizon research prices clean after
+    dividends and ex-right events, not a blocking prerequisite for daily reports.
+    """
+    as_of_date = date.fromisoformat(as_of)
+    start_date = as_of_date - timedelta(days=max(lookback_days, 0))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        last_row = conn.execute(
+            """
+            SELECT end_date FROM data_fetch_runs
+            WHERE run_type = 'qfq-maintenance'
+              AND market = 'CN_A'
+              AND status = 'SUCCESS'
+            ORDER BY end_date DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if last_row is not None and not force:
+            last_date = date.fromisoformat(str(last_row["end_date"]))
+            elapsed_days = (as_of_date - last_date).days
+            if elapsed_days < interval_days:
+                report_path = out_path / f"qfq_maintenance_{as_of_date:%Y%m%d}_SKIPPED.md"
+                report_path.write_text(
+                    "\n".join(
+                        [
+                            f"# QFQ Maintenance {as_of}",
+                            "",
+                            "- status: SKIPPED",
+                            f"- last_success: {last_date.isoformat()}",
+                            f"- elapsed_days: {elapsed_days}",
+                            f"- interval_days: {interval_days}",
+                            "",
+                            "Use `--force` to run before the interval elapses.",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                print(
+                    f"QFQ maintenance skipped: last_success={last_date.isoformat()}, "
+                    f"elapsed_days={elapsed_days}, interval_days={interval_days}, report={report_path}"
+                )
+                return
+
+        run_id: int | None = None
+        if not dry_run:
+            cursor = conn.execute(
+                """
+                INSERT INTO data_fetch_runs
+                    (run_type, market, start_date, end_date, status, requested_symbols, started_at)
+                VALUES ('qfq-maintenance', 'CN_A', ?, ?, 'RUNNING', 0, ?)
+                """,
+                (start_date.isoformat(), as_of_date.isoformat(), now_utc()),
+            )
+            run_id = int(cursor.lastrowid)
+            conn.commit()
+
+        result = qfq_backfill(
+            conn,
+            start_date.isoformat(),
+            as_of_date.isoformat(),
+            source=source,
+            throttle=throttle,
+            limit=limit,
+            commit_every=commit_every,
+            dry_run=dry_run,
+        ) if mode == "backfill" else None
+        if mode == "scan-and-repair":
+            if dry_run:
+                scan_dir = out_path / as_of
+                scan_dir.mkdir(parents=True, exist_ok=True)
+                md_path = scan_dir / "summary.md"
+                json_path = scan_dir / "details.json"
+                md_path.write_text(
+                    "\n".join(
+                        [
+                            f"# QFQ Maintenance Scan {as_of}",
+                            "",
+                            "- status: DRY_RUN",
+                            "- no database changes were made",
+                            "- run without --dry-run to detect breaks and repair queued factors",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                json_path.write_text('{"status":"DRY_RUN"}\n', encoding="utf-8")
+                result = type("ScanSummary", (), {
+                    "target_count": 0,
+                    "updated_rows": 0,
+                    "skipped_errors": 0,
+                    "ticker_errors": [],
+                })()
+            else:
+                scan_result = qfq_maintenance_scan_and_repair(
+                    conn,
+                    as_of=as_of,
+                    start_date=start_date.isoformat(),
+                    end_date=as_of_date.isoformat(),
+                    out_dir=out_path,
+                )
+                md_path = Path(scan_result.report_path)
+                json_path = Path(scan_result.json_path)
+                result = type("ScanSummary", (), {
+                    "target_count": scan_result.repaired.target_count,
+                    "updated_rows": scan_result.repaired.updated_rows,
+                    "skipped_errors": scan_result.repaired.failed_count,
+                    "ticker_errors": scan_result.repaired.errors,
+                })()
+        else:
+            assert result is not None
+            md_path, json_path = write_qfq_backfill_report(result, out_path)
+
+        if not dry_run and run_id is not None:
+            status = "SUCCESS" if result.skipped_errors == 0 else ("PARTIAL_SUCCESS" if result.target_count else "FAILED")
+            conn.execute(
+                """
+                UPDATE data_fetch_runs
+                SET status = ?,
+                    requested_symbols = ?,
+                    price_bars = ?,
+                    error_count = ?,
+                    notes = ?,
+                    finished_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    result.target_count,
+                    result.updated_rows,
+                    result.skipped_errors,
+                    f"mode={mode}; source={source}; report={md_path}; json={json_path}",
+                    now_utc(),
+                    run_id,
+                ),
+            )
+            for error in result.ticker_errors:
+                conn.execute(
+                    """
+                    INSERT INTO data_fetch_errors (run_id, market, ticker, source, error_message, created_at)
+                    VALUES (?, 'CN_A', ?, 'qfq-maintenance', ?, ?)
+                    """,
+                    (run_id, error.split(" ", 1)[0], error[:1000], now_utc()),
+                )
+            conn.commit()
+
+    run_mode = f"{mode} DRY-RUN" if dry_run else mode
+    print(
+        f"QFQ maintenance ({run_mode}): "
+        f"window={start_date.isoformat()}..{as_of_date.isoformat()}, "
+        f"target={result.target_count}, updated_rows={result.updated_rows}, "
+        f"errors={result.skipped_errors}, report={md_path}, json={json_path}"
+    )
+
+
+def command_detect_adjustment_breaks(db_path: str, as_of: str, market: str) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = detect_adjustment_breaks(conn, as_of, market=market)
+    print(
+        f"Adjustment breaks: as_of={as_of}, scanned={result.scanned}, "
+        f"confirmed={result.confirmed}, suspected={result.suspected}, "
+        f"ignored={result.ignored}, queued={result.queued}"
+    )
+
+
+def command_qfq_repair_daily(db_path: str, as_of: str, market: str) -> None:
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        result = qfq_repair_daily(conn, as_of, market=market)
+    print(
+        f"QFQ repair daily: as_of={as_of}, targets={result.target_count}, "
+        f"repaired={result.repaired_count}, failed={result.failed_count}, "
+        f"updated_rows={result.updated_rows}"
+    )
+    if result.failed_count:
+        for error in result.errors[:20]:
+            print(f"  - {error}")
+        raise SystemExit(1)
+
+
 def command_enrich_daily_bars(
     db_path: str,
     start: str,
@@ -1113,6 +1461,22 @@ def command_enrich_daily_bars(
         print(f"Errors (showing {len(shown)} of {len(result.ticker_errors)}):")
         for e in shown:
             print(f"  - {e}")
+
+
+def command_fetch_northbound(db_path: str, start: str | None) -> None:
+    from .data_ops import fetch_northbound_flows
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        written = fetch_northbound_flows(conn, start_date=start)
+    print(f"Northbound flows: {written} rows written")
+
+
+def command_fetch_margin(db_path: str, as_of: str) -> None:
+    from .data_ops import fetch_margin_trading
+    with closing(connect(db_path)) as conn:
+        init_db(conn)
+        written = fetch_margin_trading(conn, as_of)
+    print(f"Margin trading ({as_of}): {written} rows written")
 
 
 def command_verify(db_path: str) -> None:
@@ -1250,8 +1614,10 @@ def main(argv: list[str] | None = None) -> int:
             args.adjust,
             args.skip_events,
             args.skip_intraday,
+            args.intraday_period,
             args.repair_coverage,
             args.repair_scope,
+            args.core_only,
         )
     elif args.command == "data-audit":
         command_data_audit(
@@ -1265,7 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
             args.throttle,
         )
     elif args.command == "daily-run":
-        command_daily_run(args.db, args.as_of, args.throttle, fast=args.fast)
+        command_daily_run(args.db, args.as_of, args.throttle, fast=args.fast, skip_model_update=args.skip_model_update)
     elif args.command == "daily-events":
         command_daily_events(args.db, args.as_of, args.throttle)
     elif args.command == "data-backfill":
@@ -1383,6 +1749,127 @@ def main(argv: list[str] | None = None) -> int:
             f"Date range: {result.date_range}. Failures: {result.ticker_mapping_failures}. "
             f"Reports: {md_path}, {json_path}"
         )
+    elif args.command == "qlib-refresh":
+        with closing(connect(args.db)) as conn:
+            init_db(conn)
+            result = qlib_refresh(
+                conn,
+                args.as_of,
+                mode=args.mode,
+                max_workers=args.max_workers,
+                output_root=Path(args.output_root) if args.output_root else None,
+            )
+        print(
+            f"Qlib refresh: version={result.version}, mode={result.mode}, status={result.status}, "
+            f"range={result.start_date}..{result.end_date}, rows={result.row_count}, "
+            f"tickers={result.ticker_count}, staging={result.staging_dir}"
+        )
+        if result.status != "SUCCESS":
+            raise SystemExit(1)
+    elif args.command == "model-predict":
+        result = model_predict(
+            args.db,
+            args.as_of,
+            models=args.models,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+        print(
+            f"Model predict: run_id={result.run_id}, status={result.status}, "
+            f"models={result.model_count}, scores={result.score_count}, output={result.output_dir}"
+        )
+        if result.status != "SUCCESS":
+            raise SystemExit(1)
+    elif args.command == "production-daily":
+        result = production_daily(
+            args.db,
+            args.as_of,
+            allow_inline_data_update=args.allow_inline_data_update,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            no_overwrite=args.no_overwrite,
+        )
+        if args.skip_data_update:
+            print("Note: --skip-data-update is deprecated; production-daily is read-only by default.")
+        print(f"Production daily: status={result.status}, report={result.report_path}")
+        if result.status != "SUCCESS":
+            print(result.error_message)
+            raise SystemExit(1)
+    elif args.command == "production-run":
+        result = production_run(
+            args.db,
+            args.as_of,
+            skip_data_update=args.skip_data_update,
+            no_overwrite=args.no_overwrite,
+            output_root=Path(args.output_root) if args.output_root else None,
+        )
+        print(
+            f"Production run: run_id={result.run_id}, status={result.status}, "
+            f"report={result.report_path}, summary={result.summary_path}"
+        )
+        if result.status != "SUCCESS":
+            print(result.error_message)
+            raise SystemExit(1)
+    elif args.command == "production-async":
+        result = production_async(
+            args.db,
+            args.as_of,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+        print(
+            f"Production async: status={result.status}, tasks={result.task_count}, "
+            f"failed={result.failed_count}, report={result.report_path}"
+        )
+        if result.status == "FAILED":
+            print(result.error_message)
+            raise SystemExit(1)
+    elif args.command == "model-governance":
+        if args.governance_command == "review":
+            result = model_governance_review(
+                args.db,
+                args.as_of,
+                output_dir=Path(args.output_dir) if args.output_dir else None,
+            )
+            print(
+                f"Model governance review: status={result.status}, models={result.model_count}, "
+                f"needs_review={result.needs_review_count}, report={result.report_path}"
+            )
+            if result.status != "SUCCESS":
+                print(result.error_message)
+                raise SystemExit(1)
+    elif args.command == "model-arena":
+        result = model_arena(
+            args.db,
+            args.as_of,
+            pool=args.pool,
+            max_workers=args.max_workers,
+            dry_run=args.dry_run,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            resume_run_id=args.resume_run_id,
+        )
+        print(
+            f"Model arena: run_id={result.run_id}, status={result.status}, "
+            f"completed={result.completed_models}/{result.total_models}, failed={result.failed_models}, "
+            f"report={result.report_path}, recommended={result.recommended_model}"
+        )
+        if result.status == "FAILED":
+            raise SystemExit(1)
+    elif args.command == "model-evaluate":
+        result = model_evaluate(
+            args.db,
+            pool=args.pool,
+            model_version=args.model_version,
+            as_of=args.as_of,
+            mode=args.mode,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+        print(
+            f"Model evaluate: run_id={result.run_id}, status={result.status}, "
+            f"models={result.model_count}, pass={result.pass_count}, watch={result.watch_count}, "
+            f"fail={result.fail_count}, insufficient={result.insufficient_count}, "
+            f"report={result.report_path}, metrics={result.metrics_path}"
+        )
+        if result.status != "SUCCESS":
+            print(result.error_message)
+            raise SystemExit(1)
     elif args.command == "audit-tickers":
         command_audit_tickers(args.db, args.out_dir, args.limit)
     elif args.command == "repair-tickers":
@@ -1400,6 +1887,26 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir,
             args.dry_run,
         )
+    elif args.command == "qfq-maintenance":
+        command_qfq_maintenance(
+            args.db,
+            args.as_of,
+            args.interval_days,
+            args.lookback_days,
+            args.mode,
+            args.source,
+            args.throttle,
+            args.limit,
+            args.commit_every,
+            args.out_dir,
+            args.force,
+            args.dry_run,
+            mode=args.mode,
+        )
+    elif args.command == "detect-adjustment-breaks":
+        command_detect_adjustment_breaks(args.db, args.as_of, args.market)
+    elif args.command == "qfq-repair-daily":
+        command_qfq_repair_daily(args.db, args.as_of, args.market)
     elif args.command == "enrich-daily-bars":
         command_enrich_daily_bars(
             args.db,
@@ -1412,6 +1919,10 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir,
             args.dry_run,
         )
+    elif args.command == "fetch-northbound":
+        command_fetch_northbound(args.db, args.start)
+    elif args.command == "fetch-margin":
+        command_fetch_margin(args.db, args.as_of)
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

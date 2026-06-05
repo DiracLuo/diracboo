@@ -667,19 +667,36 @@ def _latest_model_percentiles(
     conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str
 ) -> dict[str, float]:
     try:
-        from .alpha_factors import MULTI_MODEL_CONFIGS
+        from .alpha_factors import MODEL_SCORE_FIELDS, _resolve_model_version
     except Exception:
         return {}
 
     percentiles: dict[str, float] = {}
-    for idx, (model_name, model_version, _score_field, percentile_field) in enumerate(MULTI_MODEL_CONFIGS[1:3], start=2):
+    model_rows = conn.execute(
+        """
+        SELECT model_name, model_version
+        FROM model_registry
+        WHERE status = 'PRODUCTION'
+        ORDER BY id
+        LIMIT 3
+        """
+    ).fetchall()
+    for idx, (row, (_score_field, percentile_field)) in enumerate(
+        zip(model_rows, MODEL_SCORE_FIELDS),
+        start=1,
+    ):
+        model_name = str(row["model_name"])
+        model_version = str(row["model_version"])
+        resolved_version = _resolve_model_version(conn, model_name, model_version, as_of_date)
+        if resolved_version is None:
+            continue
         row = conn.execute(
             """
             SELECT MAX(score_date) AS d
             FROM model_scores
             WHERE model_name = ? AND model_version = ? AND score_date <= ?
             """,
-            (model_name, model_version, as_of_date),
+            (model_name, resolved_version, as_of_date),
         ).fetchone()
         if not row or not row["d"]:
             continue
@@ -690,7 +707,7 @@ def _latest_model_percentiles(
             WHERE model_name = ? AND model_version = ?
               AND market = ? AND ticker = ? AND score_date = ?
             """,
-            (model_name, model_version, market, ticker, row["d"]),
+            (model_name, resolved_version, market, ticker, row["d"]),
         ).fetchone()
         if score_row is None or score_row["percentile"] is None:
             continue
@@ -700,6 +717,20 @@ def _latest_model_percentiles(
         percentiles[f"M{idx}"] = percentile
         percentiles[percentile_field] = percentile
     return percentiles
+
+
+def _passes_pead_model_filter(model_percentiles: dict[str, float]) -> bool:
+    production_values = [
+        float(value)
+        for key, value in model_percentiles.items()
+        if key in {"M1", "M2", "M3"}
+    ]
+    if len(production_values) < 3:
+        return False
+    return (
+        sum(1 for value in production_values if value >= 0.60) >= 2
+        or any(value >= 0.70 for value in production_values)
+    )
 
 
 def _latest_financial_flags(conn: sqlite3.Connection, market: str, ticker: str, as_of_date: str) -> list[str]:
@@ -950,9 +981,10 @@ def screen_cn_a_pead_quality_surprise(conn: sqlite3.Connection, as_of_date: str)
             continue
 
         model_percentiles = _latest_model_percentiles(conn, market, ticker, as_of_date)
-        m2 = model_percentiles.get("M2", 0.0)
-        m3 = model_percentiles.get("M3", 0.0)
-        if m2 < 0.60 and m3 < 0.60:
+        m1 = model_percentiles.get("M1")
+        m2 = model_percentiles.get("M2")
+        m3 = model_percentiles.get("M3")
+        if not _passes_pead_model_filter(model_percentiles):
             continue
 
         financial_ok, _has_financial_data, financial_values = _latest_pead_financials(conn, market, ticker, as_of_date)
@@ -1040,7 +1072,10 @@ def screen_cn_a_pead_quality_surprise(conn: sqlite3.Connection, as_of_date: str)
         if roe_ttm is not None:
             financial_parts.append(f"ROE {roe_ttm:.1f}%")
         financial_text = "；财务过滤：" + "，".join(financial_parts) if financial_parts else "；财务数据缺失，跳过基本面硬过滤"
-        model_text = f"；模型分 M2 {m2 * 100:.1f}%，M3 {m3 * 100:.1f}%"
+        model_text = (
+            f"；模型分 M1 {(m1 or 0.0) * 100:.1f}%，"
+            f"M2 {(m2 or 0.0) * 100:.1f}%，M3 {(m3 or 0.0) * 100:.1f}%"
+        )
         title = str(event["title"])
 
         candidates.append(
@@ -1085,6 +1120,7 @@ def screen_cn_a_pead_quality_surprise(conn: sqlite3.Connection, as_of_date: str)
                     },
                     {
                         "type": "model_filter",
+                        "model_percentile_1": m1,
                         "model_percentile_2": m2,
                         "model_percentile_3": m3,
                     },
@@ -1391,8 +1427,8 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
         + screen_abnormal_volume(conn, as_of_date)
     )
     try:
-        from .alpha_factors import MULTI_MODEL_CONFIGS, attach_model_scores
-        candidates = attach_model_scores(conn, as_of_date, candidates, model_configs=MULTI_MODEL_CONFIGS)
+        from .alpha_factors import attach_model_scores
+        candidates = attach_model_scores(conn, as_of_date, candidates)
     except Exception:
         pass  # Model scores are optional; screener works without them
     candidates.sort(key=lambda c: float(c.get("candidate_score", 0)), reverse=True)
@@ -1486,6 +1522,192 @@ def screen_all(conn: sqlite3.Connection, as_of_date: str, replace_existing: bool
                 ),
             )
     return len(candidates)
+
+
+def compute_intraday_metrics(bars: list) -> dict:
+    """Compute VWAP, last close, high/low from intraday bar rows.
+
+    Accepts rows with columns: open, close, high, low, volume, amount.
+    Returns dict with keys: vwap, last_close, intraday_high, intraday_low.
+    """
+    total_volume = sum(float(row["volume"] or 0.0) for row in bars)
+    total_amount = sum(float(row["amount"] or 0.0) for row in bars if row["amount"] is not None)
+    weighted_close = sum(float(row["close"]) * float(row["volume"] or 0.0) for row in bars)
+    avg_close = weighted_close / total_volume if total_volume > 0 else float(bars[-1]["close"])
+    if total_volume > 0 and total_amount > 0:
+        vwap = total_amount / total_volume
+        if avg_close > 0 and vwap > avg_close * 10:
+            vwap /= 100.0
+        if avg_close > 0 and not (avg_close * 0.2 <= vwap <= avg_close * 5):
+            vwap = avg_close
+    else:
+        vwap = avg_close
+    last_close = float(bars[-1]["close"])
+    intraday_high = max(float(row["high"]) for row in bars)
+    intraday_low = min(float(row["low"]) for row in bars)
+    return {
+        "vwap": vwap,
+        "last_close": last_close,
+        "intraday_high": intraday_high,
+        "intraday_low": intraday_low,
+    }
+
+
+def compute_intraday_conclusion(bars: list) -> str:
+    """Compute a simple intraday conclusion string from 1-minute bar rows.
+
+    Returns a Chinese-limited conclusion string joined by '；', or empty string
+    if bars are empty or no conclusions apply.  No buy zones, targets, or
+    risk-reward — conclusions only.
+    """
+    if not bars:
+        return ""
+    metrics = compute_intraday_metrics(bars)
+    vwap = metrics["vwap"]
+    last_close = metrics["last_close"]
+    intraday_high = metrics["intraday_high"]
+    intraday_low = metrics["intraday_low"]
+    intraday_range = intraday_high - intraday_low if intraday_high > intraday_low else 0.0
+    conclusions: list[str] = []
+    if vwap > 0 and intraday_range > 0:
+        if last_close >= vwap:
+            conclusions.append("VWAP 支撑")
+        else:
+            conclusions.append("VWAP 下方运行")
+    if intraday_high > 0:
+        close_vs_high_pct = (intraday_high - last_close) / intraday_high * 100
+        if close_vs_high_pct <= 0.5:
+            conclusions.append("强势收盘")
+        elif close_vs_high_pct >= 5.0:
+            conclusions.append("尾盘回落")
+    if intraday_high > 0 and intraday_range > 0:
+        pullback_pct = (intraday_high - last_close) / intraday_high * 100
+        if pullback_pct >= 3.0:
+            conclusions.append(f"高点回撤 {pullback_pct:.1f}%")
+    if intraday_range > 0:
+        mid = (intraday_high + intraday_low) / 2
+        if last_close < mid and last_close > 0:
+            conclusions.append("弱势收盘")
+    return "；".join(conclusions)
+
+
+def fetch_intraday_bars(
+    conn: sqlite3.Connection, market: str, ticker: str, date: str,
+) -> list:
+    """Fetch 1-minute intraday bars for a given market/ticker/date from DB."""
+    return conn.execute(
+        """
+        SELECT open, close, high, low, volume, amount
+        FROM intraday_bars
+        WHERE market = ? AND ticker = ? AND date = ?
+        ORDER BY datetime
+        """,
+        (market, ticker, date),
+    ).fetchall()
+
+
+def refine_candidates_with_intraday(conn: sqlite3.Connection, as_of_date: str) -> int:
+    """Use same-day intraday bars to refine candidate buy zones before report output.
+
+    This keeps screening based on daily/event/model signals, then uses intraday
+    microstructure only as execution context for the next trading day.
+    """
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM candidates
+        WHERE market = 'CN_A'
+          AND (as_of_date = ? OR confirmation_date = ?)
+          AND (
+              action = 'BUY_CANDIDATE'
+              OR action = 'WATCH_PULLBACK'
+              OR action LIKE '%CONFIRM%'
+              OR confirmation_status = 'CONFIRMED'
+          )
+        """,
+        (as_of_date, as_of_date),
+    ).fetchall()
+    updated = 0
+    for candidate in rows:
+        bars = fetch_intraday_bars(conn, candidate["market"], candidate["ticker"], as_of_date)
+        if not bars:
+            continue
+        metrics = compute_intraday_metrics(bars)
+        vwap = metrics["vwap"]
+        last_close = metrics["last_close"]
+        intraday_high = metrics["intraday_high"]
+        intraday_low = metrics["intraday_low"]
+        stop_loss = float(candidate["stop_loss"] or 0.0)
+        target_1 = float(candidate["target_1"] or 0.0)
+        signal_close = float(candidate["signal_close"] or candidate["entry_price"] or last_close)
+
+        anchor = min(last_close, vwap) if vwap > 0 else last_close
+        upper_anchor = max(last_close, vwap, signal_close)
+        buy_zone_low = round(max(stop_loss * 1.01 if stop_loss > 0 else 0.0, anchor * 0.985), 2)
+        buy_zone_high = round(min(upper_anchor * 1.01, signal_close * 1.02), 2)
+        if buy_zone_high <= buy_zone_low:
+            buy_zone_high = round(buy_zone_low * 1.015, 2)
+        reward_risk = (
+            round((target_1 - buy_zone_high) / (buy_zone_high - stop_loss), 2)
+            if target_1 > 0 and stop_loss > 0 and buy_zone_high > stop_loss
+            else float(candidate["reward_risk_ratio"] or 0.0)
+        )
+        conclusion_str = compute_intraday_conclusion(bars)
+        note = (
+            f"分时复核：VWAP {vwap:.2f}，尾盘 {last_close:.2f}，"
+            f"日内区间 {intraday_low:.2f}-{intraday_high:.2f}，"
+            f"次日参考买入区间 {buy_zone_low:.2f}-{buy_zone_high:.2f}。"
+        )
+        if conclusion_str:
+            note += f" 分时结论：{conclusion_str}。"
+        risk_notes = str(candidate["risk_notes"] or "")
+        if "分时复核：" not in risk_notes:
+            risk_notes = f"{risk_notes} {note}".strip()
+        try:
+            evidence = json.loads(candidate["evidence_json"] or "[]")
+            if not isinstance(evidence, list):
+                evidence = []
+        except Exception:
+            evidence = []
+        evidence = [
+            item for item in evidence
+            if not (isinstance(item, dict) and item.get("type") == "intraday_execution_context")
+        ]
+        evidence.append(
+            {
+                "type": "intraday_execution_context",
+                "date": as_of_date,
+                "vwap": round(vwap, 4),
+                "last_close": round(last_close, 4),
+                "intraday_high": round(intraday_high, 4),
+                "intraday_low": round(intraday_low, 4),
+                "buy_zone_low": buy_zone_low,
+                "buy_zone_high": buy_zone_high,
+                "conclusions": conclusion_str.split("；") if conclusion_str else [],
+            }
+        )
+        conn.execute(
+            """
+            UPDATE candidates
+            SET buy_zone_low = ?,
+                buy_zone_high = ?,
+                reward_risk_ratio = ?,
+                risk_notes = ?,
+                evidence_json = ?
+            WHERE id = ?
+            """,
+            (
+                buy_zone_low,
+                buy_zone_high,
+                reward_risk,
+                risk_notes,
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                candidate["id"],
+            ),
+        )
+        updated += 1
+    conn.commit()
+    return updated
 
 
 def latest_candidates(conn: sqlite3.Connection, as_of_date: str) -> list[sqlite3.Row]:

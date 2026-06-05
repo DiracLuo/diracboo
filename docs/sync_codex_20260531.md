@@ -1,5 +1,7 @@
 # Alpha Ledger 进展同步文档
 
+> 历史快照：本文仅记录 2026-05-30 ~ 2026-05-31 当时的进展，不是当前生产流程指引。当前正式生产入口、数据流和复权流程以 `README.md`、`CLAUDE.md`、`docs/DATA_MODEL_PIPELINE_DESIGN.md`、`docs/DATA_SOURCES.md` 为准。
+
 > 时间：2026-05-30 ~ 2026-05-31
 > 参与方：Codex（架构设计）、Claude（开发实现）
 

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""训练 Qlib 模型并保存到 Recorder。
+"""Legacy/research Qlib training utility.
 
-训练完成后，每个模型的 recorder 会被打上标签（model_name, model_version），
-推理脚本通过标签找到对应的 recorder。
+WARNING:
+    This script is not the production model-training entrypoint. Current model
+    competition should use:
 
-用法:
-    # 生产模型训练
-    python scripts/train_models.py --as-of 2026-06-02
-    python scripts/train_models.py --as-of 2026-06-02 --only M1
+        python -m alpha_ledger model-arena --as-of YYYY-MM-DD --pool baseline18
 
-    # Handler × Label 对比（串行，不并行）
-    python scripts/train_models.py --as-of 2026-06-03 --compare
+    The production daily flow never trains models. Production inference uses:
+
+        python -m alpha_ledger production-run --as-of YYYY-MM-DD
+
+训练 Qlib 模型并保存到 Recorder。仅供旧实验和迁移参考。
 """
 
 from __future__ import annotations

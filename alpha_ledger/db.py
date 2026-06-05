@@ -20,7 +20,10 @@ _VALID_TABLES: frozenset[str] = frozenset({
     "financial_metrics", "money_flows", "candidates", "candidate_evaluations",
     "candidate_horizon_evaluations", "strategy_audits", "data_fetch_runs",
     "data_fetch_errors", "data_coverage_daily", "data_source_health",
-    "model_scores",
+    "model_scores", "qlib_dataset_versions", "model_registry",
+    "prediction_runs", "model_training_runs", "model_evaluation_runs",
+    "model_validation_runs", "model_validation_metrics",
+    "adjustment_events", "adjustment_maintenance_queue",
 })
 
 
@@ -44,6 +47,10 @@ SCHEMA_STATEMENTS = [
         source_symbol TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
         tags_json TEXT NOT NULL DEFAULT '[]',
+        industry_sw_l1 TEXT,
+        industry_sw_l2 TEXT,
+        industry_sw_l3 TEXT,
+        industry_csrc TEXT,
         created_at TEXT NOT NULL,
         PRIMARY KEY(market, ticker)
     )
@@ -102,6 +109,7 @@ SCHEMA_STATEMENTS = [
         low REAL NOT NULL,
         volume REAL NOT NULL,
         amount REAL,
+        pre_close REAL,
         amplitude_pct REAL,
         change_pct REAL,
         turnover_pct REAL,
@@ -112,7 +120,51 @@ SCHEMA_STATEMENTS = [
         adj_factor REAL,
         adjustment_status TEXT NOT NULL DEFAULT 'UNKNOWN',
         adjustment_error TEXT,
+        adjustment_source TEXT,
+        adjusted_at TEXT,
+        pe_ttm REAL,
+        ps_ttm REAL,
+        pb REAL,
+        total_mv REAL,
         PRIMARY KEY(market, ticker, date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS adjustment_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        market TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        ex_date TEXT NOT NULL,
+        previous_date TEXT NOT NULL,
+        previous_raw_close REAL NOT NULL,
+        pre_close REAL NOT NULL,
+        factor_ratio REAL NOT NULL,
+        source TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        UNIQUE(market, ticker, ex_date, source)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS adjustment_maintenance_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        market TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        detected_date TEXT NOT NULL,
+        previous_trade_date TEXT NOT NULL,
+        raw_prev_close REAL,
+        pre_close REAL,
+        close REAL,
+        change_pct REAL,
+        raw_change_pct REAL,
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(market, ticker, detected_date)
     )
     """,
     """
@@ -455,8 +507,209 @@ SCHEMA_STATEMENTS = [
         rank INTEGER,
         percentile REAL,
         source_artifact TEXT,
+        prediction_run_id INTEGER,
         created_at TEXT NOT NULL,
         UNIQUE(model_name, model_version, market, ticker, score_date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS qlib_dataset_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version TEXT NOT NULL UNIQUE,
+        as_of_date TEXT NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        provider_uri TEXT NOT NULL,
+        qlib_dir TEXT NOT NULL,
+        staging_dir TEXT,
+        markets TEXT NOT NULL DEFAULT 'CN_A',
+        fields_json TEXT NOT NULL DEFAULT '[]',
+        ticker_count INTEGER NOT NULL DEFAULT 0,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        command TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_registry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        model_family TEXT NOT NULL,
+        feature_set TEXT NOT NULL,
+        label_name TEXT NOT NULL,
+        label_expr TEXT NOT NULL,
+        horizon_days INTEGER NOT NULL,
+        train_start TEXT,
+        train_end TEXT,
+        valid_start TEXT,
+        valid_end TEXT,
+        test_start TEXT,
+        test_end TEXT,
+        status TEXT NOT NULL DEFAULT 'RESEARCH',
+        artifact_path TEXT,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(model_name, model_version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS prediction_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL UNIQUE,
+        as_of_date TEXT NOT NULL,
+        market TEXT NOT NULL DEFAULT 'CN_A',
+        models_scope TEXT NOT NULL,
+        qlib_dataset_version TEXT,
+        status TEXT NOT NULL,
+        model_count INTEGER NOT NULL DEFAULT 0,
+        score_count INTEGER NOT NULL DEFAULT 0,
+        output_dir TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_training_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL UNIQUE,
+        as_of_date TEXT NOT NULL,
+        pool TEXT NOT NULL,
+        max_workers INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL,
+        total_models INTEGER NOT NULL DEFAULT 0,
+        completed_models INTEGER NOT NULL DEFAULT 0,
+        failed_models INTEGER NOT NULL DEFAULT 0,
+        output_dir TEXT NOT NULL DEFAULT '',
+        report_path TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_evaluation_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        training_run_id TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        feature_set TEXT NOT NULL,
+        label_name TEXT NOT NULL,
+        horizon_days INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        artifact_path TEXT,
+        workflow_path TEXT,
+        ic REAL,
+        rank_ic REAL,
+        top_return REAL,
+        bottom_return REAL,
+        top_bottom_spread REAL,
+        top_win_rate REAL,
+        avg_return REAL,
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        error_message TEXT NOT NULL DEFAULT '',
+        UNIQUE(training_run_id, model_name, model_version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_validation_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL UNIQUE,
+        as_of_date TEXT NOT NULL,
+        pool TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        model_count INTEGER NOT NULL DEFAULT 0,
+        pass_count INTEGER NOT NULL DEFAULT 0,
+        watch_count INTEGER NOT NULL DEFAULT 0,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        insufficient_count INTEGER NOT NULL DEFAULT 0,
+        report_path TEXT NOT NULL DEFAULT '',
+        metrics_path TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS model_validation_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        segment TEXT NOT NULL,
+        bucket TEXT NOT NULL,
+        status TEXT NOT NULL,
+        independence_level TEXT NOT NULL DEFAULT '',
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        score_date_count INTEGER NOT NULL DEFAULT 0,
+        coverage REAL,
+        ic REAL,
+        rank_ic REAL,
+        icir REAL,
+        rank_icir REAL,
+        avg_return REAL,
+        win_rate REAL,
+        avg_excess_return REAL,
+        excess_win_rate REAL,
+        net_return REAL,
+        max_drawdown REAL,
+        worst_daily_return REAL,
+        volatility REAL,
+        consecutive_loss_days INTEGER,
+        turnover REAL,
+        top_bottom_spread REAL,
+        missing_price_count INTEGER NOT NULL DEFAULT 0,
+        missing_benchmark_count INTEGER NOT NULL DEFAULT 0,
+        industry_exposure_json TEXT NOT NULL DEFAULT '{}',
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, model_name, model_version, segment, bucket)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS northbound_flows (
+        date TEXT NOT NULL PRIMARY KEY,
+        net_buy_amount REAL,
+        buy_amount REAL,
+        sell_amount REAL,
+        cumulative_net_buy REAL,
+        fund_inflow REAL,
+        remaining_quota REAL,
+        holding_mv REAL,
+        leading_stock TEXT,
+        leading_stock_change_pct REAL,
+        hs300 REAL,
+        hs300_change_pct REAL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS margin_trading (
+        market TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        date TEXT NOT NULL,
+        name TEXT,
+        margin_balance REAL,
+        margin_buy REAL,
+        margin_repay REAL,
+        short_volume REAL,
+        short_sell_volume REAL,
+        short_repay_volume REAL,
+        short_balance REAL,
+        total_balance REAL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY(market, ticker, date)
     )
     """,
 ]
@@ -465,7 +718,7 @@ SCHEMA_STATEMENTS = [
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     ensure_schema_upgrades(conn)
@@ -641,7 +894,20 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
         return
 
     for statement in SCHEMA_STATEMENTS:
-        if "data_fetch_" in statement or "data_coverage_daily" in statement or "data_source_health" in statement:
+        if (
+            "data_fetch_" in statement
+            or "data_coverage_daily" in statement
+            or "data_source_health" in statement
+            or "qlib_dataset_versions" in statement
+            or "model_registry" in statement
+            or "prediction_runs" in statement
+            or "model_training_runs" in statement
+            or "model_evaluation_runs" in statement
+            or "model_validation_runs" in statement
+            or "model_validation_metrics" in statement
+            or "adjustment_events" in statement
+            or "adjustment_maintenance_queue" in statement
+        ):
             conn.execute(statement)
 
     if not _table_exists(conn, "intraday_bars"):
@@ -664,6 +930,15 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             """
         )
 
+    if _table_exists(conn, "instruments"):
+        for column, definition in (
+            ("industry_sw_l1", "TEXT"),
+            ("industry_sw_l2", "TEXT"),
+            ("industry_sw_l3", "TEXT"),
+            ("industry_csrc", "TEXT"),
+        ):
+            _add_column_if_missing(conn, "instruments", column, definition)
+
     if _table_exists(conn, "data_coverage_daily"):
         for column, definition in (
             ("intraday_tradable_target_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -675,6 +950,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
 
     if _table_exists(conn, "price_bars"):
         for column, definition in (
+            ("pre_close", "REAL"),
             ("adj_open", "REAL"),
             ("adj_close", "REAL"),
             ("adj_high", "REAL"),
@@ -682,6 +958,12 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
             ("adj_factor", "REAL"),
             ("adjustment_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
             ("adjustment_error", "TEXT"),
+            ("adjustment_source", "TEXT"),
+            ("adjusted_at", "TEXT"),
+            ("pe_ttm", "REAL"),
+            ("ps_ttm", "REAL"),
+            ("pb", "REAL"),
+            ("total_mv", "REAL"),
         ):
             _add_column_if_missing(conn, "price_bars", column, definition)
 
@@ -788,6 +1070,9 @@ def ensure_schema_upgrades(conn: sqlite3.Connection) -> None:
                 if "duplicate column name" not in str(exc).lower():
                     raise
 
+    if _table_exists(conn, "model_scores"):
+        _add_column_if_missing(conn, "model_scores", "prediction_run_id", "INTEGER")
+
     _backfill_adjusted_prices(conn)
     _backfill_net_returns(conn)
     _recompute_change_pct_from_adj_close(conn)
@@ -834,7 +1119,11 @@ def upsert_many(
             row.setdefault("adjustment_status", "RAW_FALLBACK")
             row.setdefault("adjustment_error", None)
 
-    columns = list(rows[0].keys())
+    # Collect all unique keys across all rows to handle rows with varying fields
+    all_keys: set[str] = set()
+    for row in rows:
+        all_keys.update(row.keys())
+    columns = sorted(all_keys)
     for col in columns:
         _validate_identifier(col, "column name")
     for col in conflict_columns:
@@ -849,7 +1138,7 @@ def upsert_many(
         f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders}) "
         f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql}"
     )
-    values = [[row[column] for column in columns] for row in rows]
+    values = [[row.get(column) for column in columns] for row in rows]
     conn.executemany(sql, values)
     conn.commit()
     return len(rows)

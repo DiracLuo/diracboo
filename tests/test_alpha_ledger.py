@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from alpha_ledger.audit import audit_all
@@ -14,6 +15,7 @@ from alpha_ledger.db import init_db
 from alpha_ledger.event_data import import_events_csv
 from alpha_ledger.ledger import verify_signals
 from alpha_ledger.loss_review import render_loss_review
+from alpha_ledger.market_data import Instrument
 from alpha_ledger.metrics import (
     candidate_action_leaderboard,
     candidate_horizon_strategy_leaderboard,
@@ -97,6 +99,123 @@ class AlphaLedgerMvpTest(unittest.TestCase):
                     1.0,
                     "ADJUSTED",
                 ),
+            )
+
+    def _insert_pead_test_stock(self, ticker: str = "301113.SZ", name: str = "财报测试") -> str:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO instruments
+                (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+            VALUES ('CN_A', ?, ?, 'test', ?, 1, '[]', 'now')
+            """,
+            (ticker, name, ticker),
+        )
+        previous_close = 10.0
+        for day in range(1, 30):
+            date_value = f"2026-05-{day:02d}"
+            if day == 28:
+                close = previous_close * 1.03
+                volume = 1_700_000
+                change_pct = 3.0
+                high = close * 1.03
+                low = close * 0.96
+            elif day == 29:
+                close = previous_close * 1.01
+                volume = 1_200_000
+                change_pct = 1.0
+                high = close * 1.02
+                low = close * 0.98
+            else:
+                close = 10.0 + day * 0.03
+                volume = 1_000_000
+                change_pct = 0.3
+                high = close * 1.02
+                low = close * 0.98
+            self.conn.execute(
+                """
+                INSERT INTO price_bars (
+                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "CN_A",
+                    ticker,
+                    date_value,
+                    close * 0.99,
+                    close,
+                    high,
+                    low,
+                    volume,
+                    65_000_000,
+                    change_pct,
+                    close * 0.99,
+                    close,
+                    high,
+                    low,
+                    1.0,
+                    "ADJUSTED",
+                ),
+            )
+            previous_close = close
+
+        self.conn.execute(
+            """
+            INSERT INTO corporate_events (
+                market, ticker, name, event_date, event_type, title, source, source_url,
+                importance_score, summary, created_at
+            ) VALUES ('CN_A', ?, ?, '2026-05-28', 'EARNINGS_REPORT',
+                      '2026年一季报净利润超预期增长', 'test', '', 0.90, '', 'now')
+            """,
+            (ticker, name),
+        )
+        for metric_name, metric_value in [
+            ("净利润增长率(%)", 40.0),
+            ("主营业务收入增长率(%)", 18.0),
+            ("加权净资产收益率(%)", 12.0),
+        ]:
+            self.conn.execute(
+                """
+                INSERT INTO financial_metrics (
+                    market, ticker, report_date, published_date, metric_name,
+                    metric_value, unit, source, created_at
+                ) VALUES ('CN_A', ?, '2026-03-31', '2026-05-28', ?, ?, '%', 'test', 'now')
+                """,
+                (ticker, metric_name, metric_value),
+            )
+        return ticker
+
+    def _set_production_models_for_test(self) -> list[tuple[str, str]]:
+        self.conn.execute("DELETE FROM model_registry")
+        models = [
+            ("arena_alpha360_2024_t2", "baseline18_20260603", "Alpha360"),
+            ("arena_alpha360_2025_t2", "baseline18_20260603", "Alpha360"),
+            ("arena_alpha158_2026_t2", "baseline18_20260603", "Alpha158"),
+        ]
+        for model_name, model_version, feature_set in models:
+            self.conn.execute(
+                """
+                INSERT INTO model_registry (
+                    model_name, model_version, model_family, feature_set, label_name,
+                    label_expr, horizon_days, status, metrics_json, created_at, updated_at
+                ) VALUES (?, ?, 'qlib_lgbm', ?, 'T+2',
+                          'Ref($close, -2) / Ref($open, -1) - 1',
+                          2, 'PRODUCTION', '{}', 'now', 'now')
+                """,
+                (model_name, model_version, feature_set),
+            )
+        return [(model_name, model_version) for model_name, model_version, _feature_set in models]
+
+    def _insert_production_model_scores(self, ticker: str, percentiles: list[float]) -> None:
+        for (model_name, model_version), percentile in zip(self._set_production_models_for_test(), percentiles):
+            self.conn.execute(
+                """
+                INSERT INTO model_scores (
+                    model_name, model_version, market, ticker, score_date, score,
+                    rank, percentile, source_artifact, created_at
+                ) VALUES (?, ?, 'CN_A', ?, '2026-05-29', 0.1, 1, ?, 'test', 'now')
+                """,
+                (model_name, model_version, ticker, percentile),
             )
 
     def test_default_seed_has_no_manual_signals(self) -> None:
@@ -987,106 +1106,42 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         self.assertGreaterEqual(stop_distance, 0.03)
         self.assertLessEqual(stop_distance, 0.10)
 
-    def test_cn_a_pead_quality_surprise_requires_event_price_and_m2_m3(self) -> None:
-        ticker = "301113.SZ"
-        name = "财报测试"
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO instruments
-                (market, ticker, name, source, source_symbol, active, tags_json, created_at)
-            VALUES ('CN_A', ?, ?, 'test', ?, 1, '[]', 'now')
-            """,
-            (ticker, name, ticker),
-        )
-        previous_close = 10.0
-        for day in range(1, 30):
-            date_value = f"2026-05-{day:02d}"
-            if day == 28:
-                close = previous_close * 1.03
-                volume = 1_700_000
-                change_pct = 3.0
-                high = close * 1.03
-                low = close * 0.96
-            elif day == 29:
-                close = previous_close * 1.01
-                volume = 1_200_000
-                change_pct = 1.0
-                high = close * 1.02
-                low = close * 0.98
-            else:
-                close = 10.0 + day * 0.03
-                volume = 1_000_000
-                change_pct = 0.3
-                high = close * 1.02
-                low = close * 0.98
-            self.conn.execute(
-                """
-                INSERT INTO price_bars (
-                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
-                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "CN_A",
-                    ticker,
-                    date_value,
-                    close * 0.99,
-                    close,
-                    high,
-                    low,
-                    volume,
-                    65_000_000,
-                    change_pct,
-                    close * 0.99,
-                    close,
-                    high,
-                    low,
-                    1.0,
-                    "ADJUSTED",
-                ),
-            )
-            previous_close = close
-
-        self.conn.execute(
-            """
-            INSERT INTO corporate_events (
-                market, ticker, name, event_date, event_type, title, source, source_url,
-                importance_score, summary, created_at
-            ) VALUES ('CN_A', ?, ?, '2026-05-28', 'EARNINGS_REPORT',
-                      '2026年一季报净利润超预期增长', 'test', '', 0.90, '', 'now')
-            """,
-            (ticker, name),
-        )
-        for metric_name, metric_value in [
-            ("净利润增长率(%)", 40.0),
-            ("主营业务收入增长率(%)", 18.0),
-            ("加权净资产收益率(%)", 12.0),
-        ]:
-            self.conn.execute(
-                """
-                INSERT INTO financial_metrics (
-                    market, ticker, report_date, published_date, metric_name,
-                    metric_value, unit, source, created_at
-                ) VALUES ('CN_A', ?, '2026-03-31', '2026-05-28', ?, ?, '%', 'test', 'now')
-                """,
-                (ticker, metric_name, metric_value),
-            )
-        for model_name, model_version, percentile in [
-            ("qlib_alpha158_20250101", "t10_v3", 0.62),
-            ("qlib_alpha158_20260101", "t10_v3", 0.41),
-        ]:
-            self.conn.execute(
-                """
-                INSERT INTO model_scores (
-                    model_name, model_version, market, ticker, score_date, score,
-                    rank, percentile, source_artifact, created_at
-                ) VALUES (?, ?, 'CN_A', ?, '2026-05-29', 0.1, 1, ?, 'test', 'now')
-                """,
-                (model_name, model_version, ticker, percentile),
-            )
+    def test_cn_a_pead_quality_surprise_requires_production_model_scores(self) -> None:
+        ticker = self._insert_pead_test_stock()
+        self._set_production_models_for_test()
 
         rows = screen_cn_a_pead_quality_surprise(self.conn, "2026-05-29")
         row = next((candidate for candidate in rows if candidate["ticker"] == ticker), None)
+
+        self.assertIsNone(row)
+
+    def test_cn_a_pead_quality_surprise_rejects_single_60_model_signal(self) -> None:
+        ticker = self._insert_pead_test_stock()
+        self._insert_production_model_scores(ticker, [0.60, 0.40, 0.40])
+
+        rows = screen_cn_a_pead_quality_surprise(self.conn, "2026-05-29")
+        row = next((candidate for candidate in rows if candidate["ticker"] == ticker), None)
+
+        self.assertIsNone(row)
+
+    def test_cn_a_pead_quality_surprise_accepts_two_60_model_signals(self) -> None:
+        ticker = self._insert_pead_test_stock()
+        self._insert_production_model_scores(ticker, [0.60, 0.60, 0.40])
+
+        rows = screen_cn_a_pead_quality_surprise(self.conn, "2026-05-29")
+        row = next((candidate for candidate in rows if candidate["ticker"] == ticker), None)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["strategy_id"], "cn_a_pead_quality_surprise")
+        self.assertGreaterEqual(float(row["candidate_score"]), 75.0)
+
+    def test_cn_a_pead_quality_surprise_accepts_single_70_model_signal(self) -> None:
+        ticker = self._insert_pead_test_stock()
+        self._insert_production_model_scores(ticker, [0.70, 0.40, 0.40])
+
+        rows = screen_cn_a_pead_quality_surprise(self.conn, "2026-05-29")
+        row = next((candidate for candidate in rows if candidate["ticker"] == ticker), None)
+
         self.assertIsNotNone(row)
         self.assertEqual(row["strategy_id"], "cn_a_pead_quality_surprise")
         self.assertGreaterEqual(float(row["candidate_score"]), 75.0)
@@ -1368,6 +1423,72 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         self.assertIn("000905.SS", fetched)
         self.assertGreater(result.price_bars, 0)
 
+    def test_data_update_repair_coverage_detects_missing_benchmark_on_market_date(self) -> None:
+        import alpha_ledger.data_ops as data_ops_module
+
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO instruments (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+            VALUES ('CN_A', '600519.SS', '贵州茅台', 'test', 'sh600519', 1, '[]', 'now')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO price_bars (
+                market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+            ) VALUES ('CN_A', '600519.SS', '2026-06-05', 10, 10, 10, 10, 1000, 10000, 0,
+                      10, 10, 10, 10, 1, 'RAW_FALLBACK')
+            """
+        )
+
+        calls: list[list[str]] = []
+        original_fetch_bars = data_ops_module.fetch_bars
+
+        def fake_fetch_bars(instruments, start, end, throttle_seconds=0.0, adjust="qfq"):
+            calls.append([item.ticker for item in instruments])
+            return [
+                {
+                    "market": instrument.market,
+                    "ticker": instrument.ticker,
+                    "date": end.isoformat(),
+                    "open": 10.0,
+                    "close": 10.0,
+                    "high": 10.0,
+                    "low": 10.0,
+                    "volume": 1000,
+                    "amount": 10000,
+                    "change_pct": 0.0,
+                    "adj_open": 10.0,
+                    "adj_close": 10.0,
+                    "adj_high": 10.0,
+                    "adj_low": 10.0,
+                    "adj_factor": 1.0,
+                    "adjustment_status": "ADJUSTED",
+                }
+                for instrument in instruments
+            ], []
+
+        data_ops_module.fetch_bars = fake_fetch_bars
+        try:
+            result = data_update(
+                self.conn,
+                "2026-06-05",
+                fetch_events=False,
+                fetch_intraday=False,
+                repair_coverage=True,
+                repair_scope="benchmarks",
+            )
+        finally:
+            data_ops_module.fetch_bars = original_fetch_bars
+
+        fetched = {ticker for call in calls for ticker in call}
+        self.assertEqual(
+            {"000300.SS", "000905.SS", "000852.SS", "399006.SZ", "000688.SS", "899050.BJ"},
+            fetched,
+        )
+        self.assertEqual(result.price_bars, 6)
+
     def test_data_update_repair_coverage_all_includes_raw_fallback(self) -> None:
         import alpha_ledger.data_ops as data_ops_module
 
@@ -1533,6 +1654,100 @@ class AlphaLedgerMvpTest(unittest.TestCase):
             self.assertEqual(row["intraday_no_trade_symbol_count"], 7)
         finally:
             conn.close()
+
+    def test_data_audit_signal_intraday_scope_ignores_full_market_intraday_gap(self) -> None:
+        as_of = "2026-06-05"
+        for ticker in ("000001.SZ", "000002.SZ"):
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO instruments
+                    (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+                VALUES ('CN_A', ?, ?, 'test', ?, 1, '[]', 'now')
+                """,
+                (ticker, ticker, ticker),
+            )
+        for ticker in ("000300.SS", "000905.SS", "000852.SS", "399006.SZ", "000688.SS", "899050.BJ", "000001.SZ", "000002.SZ"):
+            self.conn.execute(
+                """
+                INSERT INTO price_bars (
+                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                ) VALUES ('CN_A', ?, ?, 10, 10, 10, 10, 1000, 10000, 0,
+                          10, 10, 10, 10, 1, 'ADJUSTED')
+                """,
+                (ticker, as_of),
+            )
+        self.conn.execute(
+            """
+            INSERT INTO intraday_bars (
+                market, ticker, datetime, date, time, open, close, high, low, volume, amount
+            ) VALUES ('CN_A', '000001.SZ', '2026-06-05 14:59:00', ?, '14:59:00', 10, 10, 10, 10, 1000, 10000)
+            """,
+            (as_of,),
+        )
+        result = audit_data_coverage(
+            self.conn,
+            as_of,
+            as_of,
+            "CN_A",
+            write=False,
+            ignore_adjustment_for_short_term=True,
+            intraday_universe=[Instrument("CN_A", "000001.SZ", "signal", "test", "000001.SZ", True, ())],
+        )
+
+        self.assertEqual(result.confidence_level, CONFIDENCE_HIGH)
+        self.assertEqual(result.intraday_tradable_target_count, 1)
+        self.assertEqual(result.intraday_tradable_symbol_count, 1)
+        self.assertTrue(any("信号池分时覆盖完整：1/1" in note for note in result.notes))
+        self.assertFalse(any("目标期有成交标的" in note for note in result.notes))
+
+    def test_data_audit_signal_intraday_scope_reports_missing_signal_intraday(self) -> None:
+        as_of = "2026-06-05"
+        for ticker in ("000001.SZ", "000002.SZ"):
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO instruments
+                    (market, ticker, name, source, source_symbol, active, tags_json, created_at)
+                VALUES ('CN_A', ?, ?, 'test', ?, 1, '[]', 'now')
+                """,
+                (ticker, ticker, ticker),
+            )
+        for ticker in ("000300.SS", "000905.SS", "000852.SS", "399006.SZ", "000688.SS", "899050.BJ", "000001.SZ", "000002.SZ"):
+            self.conn.execute(
+                """
+                INSERT INTO price_bars (
+                    market, ticker, date, open, close, high, low, volume, amount, change_pct,
+                    adj_open, adj_close, adj_high, adj_low, adj_factor, adjustment_status
+                ) VALUES ('CN_A', ?, ?, 10, 10, 10, 10, 1000, 10000, 0,
+                          10, 10, 10, 10, 1, 'ADJUSTED')
+                """,
+                (ticker, as_of),
+            )
+        self.conn.execute(
+            """
+            INSERT INTO intraday_bars (
+                market, ticker, datetime, date, time, open, close, high, low, volume, amount
+            ) VALUES ('CN_A', '000001.SZ', '2026-06-05 14:59:00', ?, '14:59:00', 10, 10, 10, 10, 1000, 10000)
+            """,
+            (as_of,),
+        )
+        result = audit_data_coverage(
+            self.conn,
+            as_of,
+            as_of,
+            "CN_A",
+            write=False,
+            ignore_adjustment_for_short_term=True,
+            intraday_universe=[
+                Instrument("CN_A", "000001.SZ", "signal", "test", "000001.SZ", True, ()),
+                Instrument("CN_A", "000002.SZ", "signal", "test", "000002.SZ", True, ()),
+            ],
+        )
+
+        self.assertNotEqual(result.confidence_level, CONFIDENCE_HIGH)
+        self.assertEqual(result.intraday_tradable_target_count, 2)
+        self.assertEqual(result.intraday_tradable_symbol_count, 1)
+        self.assertTrue(any("信号池分时覆盖不足：目标信号 2 只，已覆盖 1 只，缺 1 只" in note for note in result.notes))
 
     def test_adjustment_probe_reports_success_partial_and_failed(self) -> None:
         import alpha_ledger.data_ops as data_ops_module
@@ -1825,6 +2040,277 @@ class AlphaLedgerMvpTest(unittest.TestCase):
         ticker2, _, _ = normalize_cn_code("600519.sh")
         self.assertEqual(ticker1, "600519.SS")
         self.assertEqual(ticker2, "600519.SS")
+
+    def test_refine_candidates_with_intraday_computes_conclusions(self) -> None:
+        from alpha_ledger.screener import refine_candidates_with_intraday
+        from alpha_ledger.db import connect, init_db
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.sqlite"
+            with connect(db_path) as conn:
+                init_db(conn)
+                # Seed a strategy for FK
+                conn.execute(
+                    "INSERT OR IGNORE INTO strategies "
+                    "(id, name, market_scope, thesis, entry_rules_json, exit_rules_json, created_at) "
+                    "VALUES ('test', 'test', 'CN_A', 'test', '[]', '[]', datetime('now'))"
+                )
+                # Seed an instrument
+                conn.execute(
+                    "INSERT OR REPLACE INTO instruments "
+                    "(market, ticker, name, source, source_symbol, active, tags_json, created_at) "
+                    "VALUES ('CN_A', '600519.SS', '贵州茅台', 'test', 'sh600519', 1, '[]', datetime('now'))"
+                )
+                # Seed a candidate
+                conn.execute(
+                    """
+                    INSERT INTO candidates
+                        (market, ticker, as_of_date, action, signal_close, entry_price,
+                         stop_loss, target_1, target_2, reward_risk_ratio,
+                         buy_zone_low, buy_zone_high, risk_notes, evidence_json,
+                         strategy_id, name, candidate_score, thesis, trigger_condition,
+                         confirmation_status, created_at)
+                    VALUES ('CN_A', '600519.SS', '2026-06-03', 'BUY_CANDIDATE',
+                            1800.0, 1800.0, 1750.0, 1900.0, 2000.0, 2.0,
+                            1760.0, 1820.0, '', '[]',
+                            'test', '贵州茅台', 80.0, 'test thesis', 'test trigger',
+                            'PENDING', datetime('now'))
+                    """
+                )
+                # Seed intraday bars where close > VWAP (strong day)
+                base = "2026-06-03 09:"
+                for minute in range(30):
+                    t = f"{base}{minute:02d}:00"
+                    price = 1800.0 + minute * 0.5  # trending up
+                    conn.execute(
+                        "INSERT INTO intraday_bars "
+                        "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                        "VALUES (?, ?, ?, '2026-06-03', ?, ?, ?, ?, ?, ?, ?)",
+                        ("CN_A", "600519.SS", t, t[11:], price, price + 0.2,
+                         price + 1.0, price - 0.5, 10000, 10000 * price),
+                    )
+                # Add a bar where close pulls back from high (high-to-close >= 3%)
+                conn.execute(
+                    "INSERT INTO intraday_bars "
+                    "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                    "VALUES (?, ?, '2026-06-03 14:55:00', '2026-06-03', '14:55:00', 1815.0, 1805.0, 1820.0, 1804.0, 10000, 18050000)",
+                    ("CN_A", "600519.SS"),
+                )
+                conn.commit()
+
+                updated = refine_candidates_with_intraday(conn, "2026-06-03")
+                self.assertEqual(updated, 1)
+
+                row = conn.execute(
+                    "SELECT risk_notes, evidence_json FROM candidates WHERE ticker = '600519.SS'"
+                ).fetchone()
+                notes = row["risk_notes"]
+                evidence = json.loads(row["evidence_json"])
+
+                # Should contain intraday conclusions
+                self.assertIn("VWAP", notes)
+                self.assertIn("分时结论：", notes)
+                # Evidence should have conclusions list
+                ctx = [e for e in evidence if e.get("type") == "intraday_execution_context"]
+                self.assertEqual(len(ctx), 1)
+                self.assertIn("conclusions", ctx[0])
+                self.assertIsInstance(ctx[0]["conclusions"], list)
+
+
+class TestModelTopPicksIntradayConclusion(unittest.TestCase):
+    """Model top picks should display intraday conclusion from same-day bars."""
+
+    def _setup_db(self, conn: sqlite3.Connection) -> None:
+        """Create tables and seed data for model top picks tests."""
+        init_db(conn)
+        # Insert a model registry entry (PRODUCTION status)
+        conn.execute(
+            "INSERT INTO model_registry "
+            "(model_name, model_version, model_family, feature_set, label_name, label_expr, "
+            "horizon_days, status, metrics_json, created_at, updated_at) "
+            "VALUES ('test_model', 'v1', 'lgb', 'Alpha158', 'T+2', 'Ref($close, -2)/Ref($close, -1)-1', "
+            "2, 'PRODUCTION', '{}', '2026-06-01', '2026-06-01')"
+        )
+        # Insert model scores
+        for ticker, pct in [("000001.SZ", 0.95), ("600000.SS", 0.80)]:
+            conn.execute(
+                "INSERT INTO model_scores "
+                "(model_name, model_version, market, score_date, ticker, score, percentile, created_at) "
+                "VALUES ('test_model', 'v1', 'CN_A', '2026-06-05', ?, 0.5, ?, '2026-06-05')",
+                (ticker, pct),
+            )
+        # Insert price bars
+        for ticker, close, prev_close in [("000001.SZ", 15.0, 14.5), ("600000.SS", 8.0, 8.2)]:
+            # Use a name without 'ST' substring (ST triggers exclusion)
+            display = "平安银行" if ticker == "000001.SZ" else "浦发银行"
+            conn.execute(
+                "INSERT INTO instruments "
+                "(market, ticker, name, source, source_symbol, created_at) "
+                "VALUES ('CN_A', ?, ?, 'test', ?, '2026-06-01')",
+                (ticker, display, ticker),
+            )
+            conn.execute(
+                "INSERT INTO price_bars "
+                "(market, ticker, date, open, high, low, close, volume) "
+                "VALUES ('CN_A', ?, '2026-06-05', ?, ?, ?, ?, 100000)",
+                (ticker, close - 0.1, close + 0.2, close - 0.3, close),
+            )
+            conn.execute(
+                "INSERT INTO price_bars "
+                "(market, ticker, date, open, high, low, close, volume) "
+                "VALUES ('CN_A', ?, '2026-06-04', ?, ?, ?, ?, 100000)",
+                (ticker, prev_close - 0.1, prev_close + 0.2, prev_close - 0.3, prev_close),
+            )
+        conn.commit()
+
+    def test_model_pick_with_intraday_bars_shows_conclusion(self):
+        from alpha_ledger.reporting import _model_top_picks
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as f:
+            conn = sqlite3.connect(f.name)
+            conn.row_factory = sqlite3.Row
+            self._setup_db(conn)
+
+            # Add intraday bars for 000001.SZ (the top pick)
+            # Bars where close >= VWAP → "VWAP 支撑", close near high → "强势收盘"
+            for i in range(10):
+                t = f"2026-06-05 09:{30+i:02d}:00"
+                price = 15.0 + i * 0.01
+                conn.execute(
+                    "INSERT INTO intraday_bars "
+                    "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                    "VALUES (?, ?, ?, '2026-06-05', ?, ?, ?, ?, ?, 10000, ?)",
+                    ("CN_A", "000001.SZ", t, t[11:], price, price + 0.01, price + 0.02, price - 0.01, 10000 * price),
+                )
+            # Last bar: close at high (strong close)
+            conn.execute(
+                "INSERT INTO intraday_bars "
+                "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                "VALUES (?, ?, '2026-06-05 14:55:00', '2026-06-05', '14:55:00', 15.09, 15.10, 15.10, 15.08, 10000, 151000)",
+                ("CN_A", "000001.SZ"),
+            )
+            conn.commit()
+
+            picks = _model_top_picks(conn, "2026-06-05")
+            # Key is the display_label from production_model_labels
+            model_key = [k for k in picks if "test_model" in k.lower()][0]
+            top = picks[model_key]
+            self.assertGreaterEqual(len(top), 1)
+            # Find the pick with intraday bars (000001.SZ)
+            pick = next(p for p in top if p["ticker"] == "000001.SZ")
+            # Should have a non-empty intraday conclusion
+            self.assertNotEqual(pick["intraday_conclusion"], "")
+            self.assertNotEqual(pick["intraday_conclusion"], "-")
+            self.assertIn("VWAP", pick["intraday_conclusion"])
+            # Other pick (no intraday bars) should show '-'
+            other = next(p for p in top if p["ticker"] != "000001.SZ")
+            self.assertEqual(other["intraday_conclusion"], "-")
+            conn.close()
+
+    def test_model_pick_without_intraday_bars_shows_dash(self):
+        from alpha_ledger.reporting import _model_top_picks
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as f:
+            conn = sqlite3.connect(f.name)
+            conn.row_factory = sqlite3.Row
+            self._setup_db(conn)
+            # No intraday bars inserted
+
+            picks = _model_top_picks(conn, "2026-06-05")
+            model_key = [k for k in picks if "test_model" in k.lower()][0]
+            top = picks[model_key]
+            self.assertGreaterEqual(len(top), 1)
+            # Every pick should show '-' when no intraday bars exist
+            for pick in top:
+                self.assertEqual(pick["intraday_conclusion"], "-")
+            conn.close()
+
+    def test_model_pick_uses_price_bar_change_pct_when_available(self):
+        from alpha_ledger.reporting import _model_top_picks
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as f:
+            conn = sqlite3.connect(f.name)
+            conn.row_factory = sqlite3.Row
+            self._setup_db(conn)
+            conn.execute(
+                """
+                UPDATE price_bars
+                SET change_pct = 2.81
+                WHERE market = 'CN_A' AND ticker = '600000.SS' AND date = '2026-06-05'
+                """
+            )
+            conn.execute(
+                """
+                UPDATE price_bars
+                SET close = 64.0
+                WHERE market = 'CN_A' AND ticker = '600000.SS' AND date = '2026-06-04'
+                """
+            )
+            conn.commit()
+
+            picks = _model_top_picks(conn, "2026-06-05")
+            model_key = [k for k in picks if "test_model" in k.lower()][0]
+            pick = next(p for p in picks[model_key] if p["ticker"] == "600000.SS")
+            self.assertAlmostEqual(pick["change_pct"], 2.81)
+            conn.close()
+
+    def test_render_daily_plan_model_picks_has_intraday_column(self):
+        from alpha_ledger.reporting import render_daily_plan
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as f:
+            conn = sqlite3.connect(f.name)
+            conn.row_factory = sqlite3.Row
+            self._setup_db(conn)
+
+            # Add intraday bars for 600000.SS (the non-candidate model pick)
+            for i in range(10):
+                t = f"2026-06-05 09:{30+i:02d}:00"
+                price = 8.0 + i * 0.01
+                conn.execute(
+                    "INSERT INTO intraday_bars "
+                    "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                    "VALUES (?, ?, ?, '2026-06-05', ?, ?, ?, ?, ?, 10000, ?)",
+                    ("CN_A", "600000.SS", t, t[11:], price, price + 0.01, price + 0.02, price - 0.01, 10000 * price),
+                )
+            # Last bar: close at high (strong close)
+            conn.execute(
+                "INSERT INTO intraday_bars "
+                "(market, ticker, datetime, date, time, open, close, high, low, volume, amount) "
+                "VALUES (?, ?, '2026-06-05 14:55:00', '2026-06-05', '14:55:00', 8.09, 8.10, 8.10, 8.08, 10000, 81000)",
+                ("CN_A", "600000.SS"),
+            )
+            # Add a dummy strategy (required by daily_action_plan JOIN)
+            conn.execute(
+                "INSERT INTO strategies "
+                "(id, name, market_scope, thesis, entry_rules_json, exit_rules_json, "
+                "target_horizon_days, version, status, weight, created_at) "
+                "VALUES ('test_strat', 'Test策略', 'CN_A', 'test', '[]', '[]', "
+                "10, 'v1', 'ACTIVE', 1.0, '2026-06-01')"
+            )
+            # Add a dummy candidate so daily_action_plan returns rows (avoids early return)
+            conn.execute(
+                "INSERT INTO candidates "
+                "(as_of_date, market, ticker, name, strategy_id, candidate_score, action, "
+                "entry_price, signal_close, stop_loss, target_1, target_2, "
+                "reward_risk_ratio, confirmation_status, thesis, trigger_condition, risk_notes, "
+                "data_date, created_at) "
+                "VALUES ('2026-06-05', 'CN_A', '000001.SZ', '平安银行', 'test_strat', 80.0, 'BUY_CANDIDATE', "
+                "15.0, 15.0, 14.0, 17.0, 18.0, "
+                "2.0, 'PENDING', 'test thesis', 'test trigger', 'test notes', "
+                "'2026-06-05', '2026-06-05')"
+            )
+            conn.commit()
+
+            report = render_daily_plan(conn, "2026-06-05")
+            # Model picks table should have 分时结论 header
+            self.assertIn("分时结论", report)
+            # The model picks section should exist
+            self.assertIn("模型选股", report)
+            # The report should contain the intraday conclusion for the pick
+            # (VWAP 支撑 or similar)
+            self.assertIn("VWAP", report)
+            conn.close()
 
 
 if __name__ == "__main__":

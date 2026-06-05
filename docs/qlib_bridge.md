@@ -2,7 +2,19 @@
 
 This document describes how Alpha Ledger data can be exported to Microsoft Qlib format for cross-validation and model experimentation.
 
-## Quick Start
+Production note: the recommended production path is `python -m alpha_ledger production-run --as-of YYYY-MM-DD`. The manual CSV and `dump_all` steps below are research/maintenance procedures, not the daily production path.
+
+## Production Boundary
+
+Daily production should use the unified pipeline:
+
+```bash
+python -m alpha_ledger production-run --as-of YYYY-MM-DD
+```
+
+That command performs core data refresh, qfq factor repair, Qlib incremental refresh, production model prediction, 1-minute intraday refinement, and formal daily report generation. The manual export and `dump_all` commands below are for research, initialization, or maintenance only.
+
+## Research / Maintenance Quick Start
 
 ### 1. Export to Qlib CSV
 
@@ -48,7 +60,7 @@ python qlib/cli/run.py /path/to/Stock\ Analysis/workflow_config_alpha_ledger_smo
 
 ### raw_adjusted (default)
 
-Uses Alpha Ledger's adjusted prices directly (adj_open, adj_close, etc.) without normalization. Suitable for Qlib pipeline smoke testing.
+Uses Alpha Ledger's unified qfq price reader. Exported OHLC are computed as `raw OHLC * adj_factor`; `adj_*` columns are kept only as compatibility fields, not the source of truth.
 
 ### qlib_normalized (future)
 
@@ -59,41 +71,37 @@ Normalizes prices to first-day-close = 1.0. Matches Qlib's official data format.
 | Field | Source | Notes |
 |-------|--------|-------|
 | `date` | `price_bars.date` | YYYY-MM-DD |
-| `open` | `adj_open` | In raw_adjusted mode |
-| `close` | `adj_close` | In raw_adjusted mode |
-| `high` | `adj_high` | In raw_adjusted mode |
-| `low` | `adj_low` | In raw_adjusted mode |
+| `open` | `open * adj_factor` | In raw_adjusted mode |
+| `close` | `close * adj_factor` | In raw_adjusted mode |
+| `high` | `high * adj_factor` | In raw_adjusted mode |
+| `low` | `low * adj_factor` | In raw_adjusted mode |
 | `volume` | `volume` | Original volume |
 | `vwap` | `amount/volume` or `(high+low+close)/3` | See VWAP note below |
 | `money` | `amount` | Total traded value (may be empty) |
 | `factor` | `adj_factor` | Adjustment factor |
 | `change` | `change_pct / 100` | close/prev_close - 1 |
 
-## VWAP Note
+## VWAP / Amount Note
 
 Sina CN daily endpoint (`scale=240`) returns only day/open/high/low/close/volume — no `amount` field. Sina intraday has `amount` but only recent coverage, so it is not suitable for full historical daily amount backfill.
 
-Two paths now provide `amount` for `price_bars`:
+Current production and maintenance paths for `amount`:
 
-1. **BaoStock QFQ path** (`backfill-qfq`): The `query_history_k_data_plus` call with `adjustflag=2` also requests `amount` and `turn` alongside adjusted OHLC. These raw market metrics are written to `price_bars.amount` and `price_bars.turnover_pct` with no-overwrite semantics (existing positive amount and non-null turnover_pct are preserved).
+1. **Daily fast path**: `data-update --core-only --adjust none` uses the fast A-share snapshot path for same-day OHLCV, `pre_close`, `amount`, and layered benchmarks. This is the production path.
 
-2. **BaoStock enrichment path** (`enrich-daily-bars`): A separate pass using `adjustflag=3` specifically for `amount` and `turn` when they were missed by the QFQ path.
+2. **BaoStock enrichment path** (`enrich-daily-bars`): A separate maintenance pass using `adjustflag=3` specifically for `amount` and `turn` when fast-path or historical rows are missing these fields.
 
-When `amount` is still NULL after both passes:
+When `amount` is still NULL after enrichment:
 - `vwap` is computed as `(high + low + close) / 3` (typical price approximation)
 - `money` is left empty
 
 This is a common proxy in quantitative research. For actual VWAP from intraday data, use Alpha Ledger's `intraday_bars` table.
 
-**Important:** The `amount` and `turnover_pct` from the BaoStock QFQ path are raw market metrics carried alongside forward-adjusted OHLC. They should pass VWAP sanity checks (`vwap_sanity_check()` in `qfq_backfill`) before full trust.
+**Important:** `amount` and `turnover_pct` are raw market metrics. They are not multiplied by qfq factors. They should pass VWAP sanity checks before full trust.
 
-## Priority 1: Daily Amount/Turnover Enrichment (2026-05-30)
+## Amount / Turnover Enrichment
 
-The `backfill-qfq` command now also captures `amount` and `turnover_pct` from BaoStock in the same API call that fetches adjusted OHLC (no extra pass needed for tickers that go through QFQ backfill).
-
-For rows that were already ADJUSTED before the QFQ path gained amount/turnover support, the `enrich-daily-bars` command provides a separate backfill using `adjustflag=3`.
-
-After either path, `export-qlib-csv` produces real `vwap = amount / volume` and `money = amount` instead of the typical-price fallback.
+After daily fast-path update or enrichment, `export-qlib-csv` produces real `vwap = amount / volume` and `money = amount` instead of the typical-price fallback where possible.
 
 ```bash
 # Dry-run: see which tickers need enrichment
@@ -106,14 +114,24 @@ python -m alpha_ledger enrich-daily-bars \
 ```
 
 **Design choices:**
-- QFQ path (`backfill-qfq`): BaoStock `adjustflag=2` with fields `date,open,high,low,close,volume,amount,turn,tradestatus,isST`. The `amount` and `turn` (→ `turnover_pct`) are raw market metrics carried alongside adjusted OHLC in the same API call.
-- Enrichment path (`enrich-daily-bars`): BaoStock `adjustflag=3` (no adjustment) as a catch-up for rows that were already ADJUSTED before QFQ gained amount/turnover support.
-- Both paths: only `amount` and `turn` (→ `turnover_pct`) are stored from the optional fields.
+- Daily production path: same-day fast snapshot first; missing fields are repaired by fallback sources rather than filled with 0.
+- Enrichment path (`enrich-daily-bars`): BaoStock `adjustflag=3` (no adjustment) as catch-up for historical `amount` and `turn`.
+- Only `amount` and `turn` (→ `turnover_pct`) are stored from the optional enrichment fields.
 - Resume-safe: only rows where `amount IS NULL OR amount <= 0 OR turnover_pct IS NULL` are touched.
 - Benchmarks/indexes are skipped (BaoStock does not support them).
 - Reports written to `reports/daily_enrichment_*.md` and `.json`.
 
-**Important:** Qlib Alpha158/Alpha360 training should wait for both full QFQ backfill (`backfill-qfq`) and daily enrichment (`enrich-daily-bars`) to complete before formal training runs。实际 VWAP 覆盖率取决于 amount 字段填充情况，未填充的 ticker 回退到 `(high+low+close)/3`。
+## QFQ Factor Maintenance Before Formal Training
+
+Formal Qlib Alpha158/Alpha360 training should wait for qfq factor repair and daily enrichment:
+
+```bash
+python -m alpha_ledger detect-adjustment-breaks --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-repair-daily --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-maintenance --as-of YYYY-MM-DD --mode scan-and-repair --lookback-days 60 --force
+```
+
+The current qfq source of truth is `raw OHLC * adj_factor`. `adj_*` columns are compatibility fields only. `backfill-qfq`, if still present in the codebase, is a legacy slow maintenance fallback and must not be used as the daily production qfq path.
 
 ## Ticker Normalization
 

@@ -94,7 +94,9 @@ def tickers_needing_enrichment(
     """Return canonical CN_A tickers that have price_bars needing enrichment.
 
     A row needs enrichment when: ``amount IS NULL OR amount <= 0 OR
-    turnover_pct IS NULL``.
+    turnover_pct IS NULL``. Valuation fields may be filled opportunistically
+    when a row is already being enriched, but they do not make a row a target
+    by themselves.
 
     Parameters
     ----------
@@ -155,7 +157,7 @@ def _fetch_baostock_daily_enrichment_map(
 
     rs = bs.query_history_k_data_plus(
         bs_symbol,
-        "date,code,volume,amount,turn,pctChg,isST",
+        "date,code,volume,amount,turn,pctChg,isST,peTTM,psTTM",
         start_date=start_d.isoformat(),
         end_date=end_d.isoformat(),
         frequency="d",
@@ -180,14 +182,33 @@ def _fetch_baostock_daily_enrichment_map(
             turn_val = float(turn_str) if turn_str not in (None, "") else None
         except (ValueError, IndexError):
             continue
+        # peTTM (index 7), psTTM (index 8)
+        pe_ttm_val = None
+        ps_ttm_val = None
+        try:
+            pe_str = row[7] if len(row) > 7 else None
+            if pe_str not in (None, ""):
+                pe_ttm_val = float(pe_str)
+        except (ValueError, IndexError):
+            pass
+        try:
+            ps_str = row[8] if len(row) > 8 else None
+            if ps_str not in (None, ""):
+                ps_ttm_val = float(ps_str)
+        except (ValueError, IndexError):
+            pass
         # Only store rows where we have at least one useful value
-        if amount_val is None and turn_val is None:
+        if amount_val is None and turn_val is None and pe_ttm_val is None and ps_ttm_val is None:
             continue
         rows[row_date] = {}
         if amount_val is not None:
             rows[row_date]["amount"] = amount_val
         if turn_val is not None:
             rows[row_date]["turnover_pct"] = turn_val
+        if pe_ttm_val is not None:
+            rows[row_date]["pe_ttm"] = pe_ttm_val
+        if ps_ttm_val is not None:
+            rows[row_date]["ps_ttm"] = ps_ttm_val
     return rows
 
 
@@ -209,17 +230,45 @@ def _update_enriched_bars(
     for row_date, values in enrichment_map.items():
         amount = values.get("amount")
         turnover = values.get("turnover_pct")
+        pe_ttm = values.get("pe_ttm")
+        ps_ttm = values.get("ps_ttm")
         cursor = conn.execute(
             """
             UPDATE price_bars
-            SET amount = COALESCE(?, amount),
-                turnover_pct = COALESCE(?, turnover_pct)
+            SET amount = CASE
+                    WHEN ? IS NOT NULL AND (amount IS NULL OR amount <= 0) THEN ?
+                    ELSE amount
+                END,
+                turnover_pct = CASE
+                    WHEN ? IS NOT NULL AND turnover_pct IS NULL THEN ?
+                    ELSE turnover_pct
+                END,
+                pe_ttm = CASE
+                    WHEN ? IS NOT NULL AND pe_ttm IS NULL THEN ?
+                    ELSE pe_ttm
+                END,
+                ps_ttm = CASE
+                    WHEN ? IS NOT NULL AND ps_ttm IS NULL THEN ?
+                    ELSE ps_ttm
+                END
             WHERE market = 'CN_A'
               AND ticker = ?
               AND date = ?
-              AND (amount IS NULL OR amount <= 0 OR turnover_pct IS NULL)
+              AND (
+                    (? IS NOT NULL AND (amount IS NULL OR amount <= 0))
+                 OR (? IS NOT NULL AND turnover_pct IS NULL)
+                 OR (? IS NOT NULL AND pe_ttm IS NULL)
+                 OR (? IS NOT NULL AND ps_ttm IS NULL)
+              )
             """,
-            (amount, turnover, ticker, row_date),
+            (
+                amount, amount,
+                turnover, turnover,
+                pe_ttm, pe_ttm,
+                ps_ttm, ps_ttm,
+                ticker, row_date,
+                amount, turnover, pe_ttm, ps_ttm,
+            ),
         )
         if cursor.rowcount == 0:
             # Check if the row exists but was already enriched

@@ -1,6 +1,6 @@
 # Alpha Ledger — Agent 工作指南
 
-本文件给 Claude Code、Codex 或其他执行 agent 使用。产品方向、模块边界和演进路线以 [docs/PRODUCT_ARCHITECTURE.md](docs/PRODUCT_ARCHITECTURE.md) 为准。
+本文件给 Claude Code、Codex 或其他 agent 使用。产品方向、模块边界和演进路线以 [docs/PRODUCT_ARCHITECTURE.md](docs/PRODUCT_ARCHITECTURE.md) 为准。
 
 ## 项目定位
 
@@ -39,18 +39,7 @@ Alpha Ledger 是 A 股量化研究账本，目标是持续验证哪些策略和�
 python -m alpha_ledger production-run --as-of YYYY-MM-DD
 ```
 
-生产 Pipeline 的目标顺序：
-
-1. 交易日解析。
-2. 核心数据快路径：OHLCV、`pre_close`、`amount`、分层基准。
-3. 除权断点检测与前复权因子快修。
-4. 数据审计。
-5. Qlib 增量刷新。
-6. Production 模型预测刷新。
-7. 策略/模型信号生产与 1 分钟分时复核。
-8. 信号准入。
-9. 决策输出。
-10. 慢任务异步补充。
+生产 Pipeline 的详细步骤见 [docs/PRODUCT_ARCHITECTURE.md](docs/PRODUCT_ARCHITECTURE.md) 和 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)。
 
 `daily-run`、`daily-plan`、手工 `screen` 不是正式生产入口，只能作为研究或排障命令。
 
@@ -80,6 +69,18 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 - 机器学习：Qlib，预测分写入 `model_scores`
 - 测试：`unittest` / `pytest`
 
+## 项目结构
+
+```
+alpha_ledger/       Python 包，CLI 入口、核心逻辑
+data/               SQLite 数据库、Qlib 导出、universe
+docs/               产品架构、数据模型、策略库等文档
+outputs/            Qlib 刷新、模型运行中间产物
+reports/            生产日报、模型验证、回测报告
+scripts/            独立脚本（训练、回补、模型更新）
+tests/              测试用例
+```
+
 ## 常用命令
 
 ```bash
@@ -89,7 +90,7 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 # 生产底层命令：仅排障或手工分步执行，日常不要替代 production-run
 python -m alpha_ledger data-update --as-of YYYY-MM-DD --markets CN_A --core-only --adjust none
 python -m alpha_ledger detect-adjustment-breaks --as-of YYYY-MM-DD
-python -m alpha_ledger qfq-repair-daily --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-repair-breaks --as-of YYYY-MM-DD
 python -m alpha_ledger data-audit --start YYYY-MM-DD --end YYYY-MM-DD --markets CN_A --ignore-adjustment-for-short-term
 python -m alpha_ledger qlib-refresh --as-of YYYY-MM-DD --mode incremental
 python -m alpha_ledger model-predict --as-of YYYY-MM-DD --models production
@@ -100,11 +101,6 @@ python -m alpha_ledger production-async --as-of YYYY-MM-DD
 
 # 定期复权维护：每周或半月补漏
 python -m alpha_ledger qfq-maintenance --as-of YYYY-MM-DD --mode scan-and-repair --lookback-days 60 --force
-
-# 研究/旧入口：不是正式生产入口
-python -m alpha_ledger screen --as-of YYYY-MM-DD
-python -m alpha_ledger confirm-candidates --as-of YYYY-MM-DD
-python -m alpha_ledger daily-plan --as-of YYYY-MM-DD
 
 # 回测与验证
 python -m alpha_ledger replay --start <START> --end <END> --through <THROUGH> --benchmark auto
@@ -124,11 +120,11 @@ python -m alpha_ledger import-qlib-predictions --pred-path <pred.pkl> --model-na
 - 不要在数据不足、基准缺失或准入口径不一致时生成正式 alpha 结论。
 - 不要随意修改 `data/` 下 SQLite schema；涉及迁移必须先说明方案。
 - A 股 ticker 内部统一使用 `.SS` / `.SZ` / `.BJ`，Qlib 边界再做 `SH600519` 这类转换。
-- A 股原始 OHLCV 不改；前复权主数据是 `adj_factor`，由 `pre_close` 断点检测和 `qfq-repair-daily` 快修维护。`adj_*` 只是兼容字段。
+- A 股原始 OHLCV 不改；前复权主数据是 `adj_factor`，由 `pre_close` 断点检测和 `qfq-repair-breaks` 快修维护。`adj_*` 只是兼容字段。
 - BaoStock qfq 不作为每日生产主路径，只作为 `qfq-maintenance` 的补漏、疑似样本校验和历史维护源。
-- A 股收益评估优先使用 `raw OHLC * adj_factor`；短线研究可容忍 `RAW_FALLBACK`，但正式升权受限。
+- A 股收益评估直接使用前复权价格（`adj_close` 等）；`RAW_FALLBACK` 状态的数据仅限短线研究，正式升权受限。
 - 交易成本使用统一成本函数，不要在模块内重复硬编码费率。
-- 回测评估模块包含信号级、路径级、组合级三层，不要把“回放评估”和“组合回测”拆成互相冲突的口径。
+- 回测评估模块包含信号级、路径级、组合级三层，不要把"回放评估"和"组合回测"拆成互相冲突的口径。
 
 ## 文档参考
 

@@ -30,7 +30,7 @@ from typing import Any
 import pandas as pd
 
 from .benchmarks import benchmark_for_asset
-from .adjustments import detect_adjustment_breaks, qfq_repair_daily
+from .adjustments import detect_adjustment_breaks, qfq_repair_breaks
 from .data_ops import audit_data_coverage, data_update
 from .db import connect, init_db
 from .ledger import now_utc
@@ -759,18 +759,19 @@ def production_run(
 
         try:
             adjustment_breaks = detect_adjustment_breaks(conn, as_of, market="CN_A")
-            qfq_repair = qfq_repair_daily(conn, as_of, market="CN_A")
+            qfq_repair = qfq_repair_breaks(conn, as_of, start="2024-01-01", market="CN_A", source="baostock")
         except Exception as exc:
-            record("qfq-repair-daily", "FAILED", str(exc))
+            record("qfq-repair-breaks", "FAILED", str(exc))
         else:
             repair_status = "SUCCESS" if qfq_repair.failed_count == 0 else "PARTIAL_SUCCESS"
             record(
-                "qfq-repair-daily",
+                "qfq-repair-breaks",
                 repair_status,
                 (
                     f"confirmed={adjustment_breaks.confirmed}, suspected={adjustment_breaks.suspected}, "
                     f"targets={qfq_repair.target_count}, repaired={qfq_repair.repaired_count}, "
-                    f"failed={qfq_repair.failed_count}, updated_rows={qfq_repair.updated_rows}"
+                    f"failed={qfq_repair.failed_count}, updated_rows={qfq_repair.updated_rows}, "
+                    f"missing_rows={qfq_repair.missing_rows}"
                 ),
             )
 

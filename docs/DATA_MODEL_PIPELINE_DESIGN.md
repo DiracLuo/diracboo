@@ -47,7 +47,7 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 ```text
 data-update --core-only --adjust none
 -> detect-adjustment-breaks
--> qfq-repair-daily
+-> qfq-repair-breaks
 -> data-audit
 -> qlib-refresh --mode incremental
 -> model-predict --models production
@@ -75,7 +75,7 @@ data-update --core-only --adjust none
 
 | 类型 | 内容 | 处理 |
 |---|---|---|
-| 快路径 | 交易日历、当日快照 OHLCV、pre_close、amount、分层基准、除权断点检测、复权因子快修、Qlib 数据、生产模型预测、日报 | 每天收盘后同步完成 |
+| 快路径 | 交易日历、当日快照 OHLCV、pre_close、amount、分层基准、除权断点检测、前复权断点回补、Qlib 数据、生产模型预测、日报 | 每天收盘后同步完成 |
 | 慢路径 | 事件、财报、资金流、成交额/换手历史修复、北向/融资融券、复权补漏校验 | 异步补充，不阻塞日报 |
 
 ### 3.2 数据源优先级
@@ -121,8 +121,8 @@ data-update --core-only --adjust none
 每日断点检测：
 detect-adjustment-breaks 对比 pre_close 与上一交易日原始 close，发现除权断点后写入 adjustment_maintenance_queue。
 
-每日快速修复：
-qfq-repair-daily 用 factor_ratio = pre_close / previous_raw_close 修复队列股票，只乘除权日前历史 adj_factor，并同步 adj_* 兼容字段。
+每日断点回补：
+qfq-repair-breaks 只读取当天 CONFIRMED_BY_PRECLOSE 队列股票，逐只用 BaoStock qfq 拉取 2024-01-01 至 as_of 的前复权价格，只刷新 adj_* / adj_factor / adjustment_status 等复权字段，不修改原始 open/high/low/close/volume/amount/pre_close/change_pct。
 
 定期审计：
 qfq-maintenance --mode scan-and-repair 扫描近期断点；BaoStock 只作为疑似样本、失败样本和历史补漏的校验源。
@@ -233,7 +233,7 @@ Lite Walk-forward 使用季度滚动窗口，覆盖 Alpha158 / Alpha360、2024 /
 | `production-run` | 唯一推荐生产入口 |
 | `production-daily` | 只读日报生成器 |
 | `detect-adjustment-breaks` | 生产/维护共用的除权断点检测 |
-| `qfq-repair-daily` | 基于 pre_close 的每日复权因子快修 |
+| `qfq-repair-breaks` | 每日生产前复权断点回补，只处理 CONFIRMED_BY_PRECLOSE 队列股票 |
 | `qfq-maintenance --mode scan-and-repair` | 周期复权补漏维护 |
 | `model-predict` | Production 模型推理，不训练 |
 | `model-arena` | 研究线模型竞技，不写正式生产分数 |

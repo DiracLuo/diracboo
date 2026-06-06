@@ -127,7 +127,7 @@ Formal Qlib Alpha158/Alpha360 training should wait for qfq factor repair and dai
 
 ```bash
 python -m alpha_ledger detect-adjustment-breaks --as-of YYYY-MM-DD
-python -m alpha_ledger qfq-repair-daily --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-repair-breaks --as-of YYYY-MM-DD --start 2024-01-01 --source baostock
 python -m alpha_ledger qfq-maintenance --as-of YYYY-MM-DD --mode scan-and-repair --lookback-days 60 --force
 ```
 

@@ -181,7 +181,7 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 ```mermaid
 flowchart TD
     A["P1 交易日解析<br/>as_of / 最新行情日 / 计划交易日"] --> B["P2 快速数据更新<br/>价格 / pre_close / amount / 基准"]
-    B --> C["P3 复权因子维护<br/>detect-adjustment-breaks / qfq-repair-daily"]
+    B --> C["P3 前复权断点回补<br/>detect-adjustment-breaks / qfq-repair-breaks"]
     C --> D["P4 数据审计<br/>覆盖率 / stale data / 数据质量"]
     D --> E["P5 Qlib 增量刷新<br/>更新模型可用数据集"]
     E --> F["P6 模型预测刷新<br/>生成最新 model_scores"]

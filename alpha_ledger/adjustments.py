@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from .ledger import now_utc
+from .market_data import Instrument, _baostock_logout, fetch_baostock_cn_adjusted_daily_map
 
 
 CONFIRMED_BY_PRECLOSE = "CONFIRMED_BY_PRECLOSE"
-CONFIRMED_BY_DERIVED_PRECLOSE = "CONFIRMED_BY_DERIVED_PRECLOSE"
 SUSPECTED_BY_PRICE_GAP = "SUSPECTED_BY_PRICE_GAP"
 IGNORED_DATA_QUALITY = "IGNORED_DATA_QUALITY"
 CONFIRMED_REASONS = {CONFIRMED_BY_PRECLOSE}
@@ -48,6 +49,8 @@ class QfqRepairResult:
     failed_count: int = 0
     updated_rows: int = 0
     errors: list[str] = field(default_factory=list)
+    missing_rows: int = 0
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,7 @@ def _upsert_queue(
     reason: str,
     status: str,
     error_message: str = "",
+    preserve_done: bool = True,
 ) -> None:
     now = now_utc()
     conn.execute(
@@ -168,7 +172,7 @@ def _upsert_queue(
             raw_change_pct = excluded.raw_change_pct,
             reason = excluded.reason,
             status = CASE
-                WHEN adjustment_maintenance_queue.status = 'DONE' THEN 'DONE'
+                WHEN ? = 1 AND adjustment_maintenance_queue.status = 'DONE' THEN 'DONE'
                 ELSE excluded.status
             END,
             error_message = excluded.error_message,
@@ -189,8 +193,47 @@ def _upsert_queue(
             error_message,
             now,
             now,
+            1 if preserve_done else 0,
         ),
     )
+
+
+def _has_baostock_break_repair(
+    conn: sqlite3.Connection,
+    *,
+    market: str,
+    ticker: str,
+    ex_date: str,
+    previous_date: str,
+) -> bool:
+    event = conn.execute(
+        """
+        SELECT 1
+        FROM adjustment_events
+        WHERE market = ?
+          AND ticker = ?
+          AND ex_date = ?
+          AND source = 'baostock_qfq_break_repair'
+          AND status = 'SUCCESS'
+        LIMIT 1
+        """,
+        (market, ticker, ex_date),
+    ).fetchone()
+    if event is not None:
+        return True
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM price_bars
+        WHERE market = ?
+          AND ticker = ?
+          AND date IN (?, ?)
+          AND adjustment_source = 'baostock_qfq_break_repair'
+        LIMIT 1
+        """,
+        (market, ticker, previous_date, ex_date),
+    ).fetchone()
+    return row is not None
 
 
 def detect_adjustment_breaks(
@@ -262,18 +305,16 @@ def detect_adjustment_breaks(
             if preclose_gap >= preclose_threshold_pct and (
                 change_pct is None or abs(official_change - float(change_pct)) <= change_tolerance_pct
             ):
-                prev_factor = _valid_factor(previous_adj_factor) or 1.0
-                current_factor = _valid_factor(row["adj_factor"]) or 1.0
-                qfq_pre_close = pre * current_factor
-                continuity_gap_pct = (
-                    abs((raw_prev * prev_factor) / qfq_pre_close - 1.0) * 100.0
-                    if qfq_pre_close
-                    else 100.0
-                )
-                if continuity_gap_pct <= continuity_tolerance_pct:
-                    continue
                 confirmed += 1
-                queued += 1
+                already_baostock_repaired = _has_baostock_break_repair(
+                    conn,
+                    market=market,
+                    ticker=ticker,
+                    ex_date=as_of,
+                    previous_date=str(previous_date),
+                )
+                if not already_baostock_repaired:
+                    queued += 1
                 _upsert_queue(
                     conn,
                     market=market,
@@ -286,7 +327,8 @@ def detect_adjustment_breaks(
                     change_pct=official_change,
                     raw_change_pct=raw_change_pct,
                     reason=CONFIRMED_BY_PRECLOSE,
-                    status="PENDING",
+                    status="DONE" if already_baostock_repaired else "PENDING",
+                    preserve_done=already_baostock_repaired,
                 )
                 continue
         if change_pct is not None and abs(raw_change_pct - float(change_pct)) >= price_gap_threshold_pct:
@@ -321,14 +363,152 @@ def _mark_queue_failed(conn: sqlite3.Connection, queue_id: int, error: str) -> N
     )
 
 
-def qfq_repair_daily(
+def _insert_adjustment_event(
+    conn: sqlite3.Connection,
+    *,
+    market: str,
+    ticker: str,
+    ex_date: str,
+    previous_date: str,
+    previous_raw_close: float,
+    pre_close: float,
+    factor_ratio: float,
+    source: str,
+    status: str,
+    error_message: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO adjustment_events (
+            market, ticker, ex_date, previous_date, previous_raw_close,
+            pre_close, factor_ratio, source, confidence, status,
+            error_message, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HIGH', ?, ?, ?)
+        ON CONFLICT(market, ticker, ex_date, source) DO UPDATE SET
+            previous_date = excluded.previous_date,
+            previous_raw_close = excluded.previous_raw_close,
+            pre_close = excluded.pre_close,
+            factor_ratio = excluded.factor_ratio,
+            confidence = excluded.confidence,
+            status = excluded.status,
+            error_message = excluded.error_message,
+            created_at = excluded.created_at
+        """,
+        (
+            market,
+            ticker,
+            ex_date,
+            previous_date,
+            previous_raw_close,
+            pre_close,
+            factor_ratio,
+            source,
+            status,
+            error_message[:1000],
+            now_utc(),
+        ),
+    )
+
+
+def _fetch_baostock_qfq_map(
+    ticker: str,
+    start: str,
+    end: str,
+) -> dict[str, dict[str, float]]:
+    instrument = Instrument(
+        market="CN_A",
+        ticker=ticker,
+        name="",
+        source="baostock",
+        source_symbol="",
+        active=True,
+        tags=(),
+    )
+    return fetch_baostock_cn_adjusted_daily_map(
+        instrument,
+        date.fromisoformat(start),
+        date.fromisoformat(end),
+        adjust="qfq",
+    )
+
+
+def _update_break_adjusted_bars(
+    conn: sqlite3.Connection,
+    *,
+    market: str,
+    ticker: str,
+    start: str,
+    end: str,
+    adjusted_map: dict[str, dict[str, float]],
+    source: str,
+) -> tuple[int, int]:
+    existing_dates = {
+        str(row["date"])
+        for row in conn.execute(
+            """
+            SELECT date
+            FROM price_bars
+            WHERE market = ? AND ticker = ? AND date >= ? AND date <= ?
+            """,
+            (market, ticker, start, end),
+        ).fetchall()
+    }
+    updated_rows = 0
+    for row_date in sorted(existing_dates.intersection(adjusted_map)):
+        values = adjusted_map[row_date]
+        adj_close = float(values["adj_close"])
+        cursor = conn.execute(
+            """
+            UPDATE price_bars
+            SET adj_open = ?,
+                adj_high = ?,
+                adj_low = ?,
+                adj_close = ?,
+                adj_factor = CASE WHEN close IS NOT NULL AND close != 0 THEN ? / close ELSE adj_factor END,
+                adjustment_status = 'ADJUSTED',
+                adjustment_source = ?,
+                adjusted_at = ?,
+                adjustment_error = NULL
+            WHERE market = ? AND ticker = ? AND date = ?
+            """,
+            (
+                float(values["adj_open"]),
+                float(values["adj_high"]),
+                float(values["adj_low"]),
+                adj_close,
+                adj_close,
+                source,
+                now_utc(),
+                market,
+                ticker,
+                row_date,
+            ),
+        )
+        updated_rows += cursor.rowcount
+    missing_rows = len(existing_dates.difference(adjusted_map))
+    return updated_rows, missing_rows
+
+
+def qfq_repair_breaks(
     conn: sqlite3.Connection,
     as_of: str,
     *,
+    start: str = "2024-01-01",
     market: str = "CN_A",
-    tolerance_pct: float = 0.5,
+    source: str = "baostock",
+    throttle: float = 0.3,
+    dry_run: bool = False,
 ) -> QfqRepairResult:
-    """Repair queued confirmed breaks using explicit same-day pre_close."""
+    """Refresh qfq fields for same-day confirmed adjustment-break stocks only.
+
+    This is the production daily path. Target discovery is intentionally narrow:
+    it only reads ``CONFIRMED_BY_PRECLOSE`` rows from
+    ``adjustment_maintenance_queue`` for ``detected_date=as_of``. It never
+    expands targets from ``adjustment_status`` and never updates raw OHLCV,
+    amount, ``pre_close`` or spot change fields.
+    """
+    if source != "baostock":
+        raise ValueError("qfq-repair-breaks currently supports source='baostock' only")
     queue_rows = conn.execute(
         """
         SELECT *
@@ -341,85 +521,42 @@ def qfq_repair_daily(
         """,
         (market, as_of, CONFIRMED_BY_PRECLOSE),
     ).fetchall()
+    if dry_run:
+        return QfqRepairResult(as_of, len(queue_rows), dry_run=True)
+
     errors: list[str] = []
-    repaired = failed = updated_rows = 0
-    for row in queue_rows:
-        qid = int(row["id"])
-        ticker = str(row["ticker"])
-        raw_prev_close = row["raw_prev_close"]
-        pre_close = row["pre_close"]
-        ex_date = str(row["detected_date"])
-        source = "pre_close"
-        conn.execute("SAVEPOINT qfq_repair_one")
-        try:
-            if raw_prev_close in (None, 0) or pre_close in (None, 0):
-                raise ValueError("missing raw_prev_close/pre_close")
-            factor_ratio = float(pre_close) / float(raw_prev_close)
-            if factor_ratio <= 0 or factor_ratio > 1.5:
-                raise ValueError(f"invalid factor_ratio={factor_ratio:.6f}")
-            prev_before = conn.execute(
-                """
-                SELECT close, adj_factor
-                FROM price_bars
-                WHERE market = ? AND ticker = ? AND date = ?
-                """,
-                (market, ticker, str(row["previous_trade_date"])),
-            ).fetchone()
-            current_before = conn.execute(
-                """
-                SELECT adj_factor
-                FROM price_bars
-                WHERE market = ? AND ticker = ? AND date = ?
-                """,
-                (market, ticker, ex_date),
-            ).fetchone()
-            prev_factor_before = _valid_factor(prev_before["adj_factor"] if prev_before else None) or 1.0
-            current_factor_before = _valid_factor(current_before["adj_factor"] if current_before else None) or 1.0
-            pre_gap_pct = (
-                abs((float(raw_prev_close) * prev_factor_before) / (float(pre_close) * current_factor_before) - 1.0) * 100.0
-                if float(pre_close) * current_factor_before
-                else 100.0
+    repaired = failed = updated_rows = missing_rows = 0
+    try:
+        for index, row in enumerate(queue_rows, start=1):
+            qid = int(row["id"])
+            ticker = str(row["ticker"])
+            ex_date = str(row["detected_date"])
+            previous_date = str(row["previous_trade_date"])
+            raw_prev_close = row["raw_prev_close"]
+            pre_close = row["pre_close"]
+            factor_ratio = (
+                float(pre_close) / float(raw_prev_close)
+                if raw_prev_close not in (None, 0) and pre_close not in (None, 0)
+                else 0.0
             )
-            if pre_gap_pct <= tolerance_pct:
-                conn.execute(
-                    """
-                    UPDATE price_bars
-                    SET adj_factor = COALESCE(NULLIF(adj_factor, 0), 1.0),
-                        adj_open = open * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                        adj_high = high * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                        adj_low = low * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                        adj_close = close * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                        adjustment_status = 'ADJUSTED',
-                        adjustment_source = COALESCE(adjustment_source, ?),
-                        adjustment_error = NULL,
-                        adjusted_at = ?
-                    WHERE market = ? AND ticker = ? AND date = ?
-                    """,
-                    (f"{source}_already_continuous", now_utc(), market, ticker, ex_date),
+            conn.execute("SAVEPOINT qfq_repair_break_one")
+            try:
+                if raw_prev_close in (None, 0) or pre_close in (None, 0):
+                    raise ValueError("missing raw_prev_close/pre_close")
+                adjusted_map = _fetch_baostock_qfq_map(ticker, start, as_of)
+                if not adjusted_map:
+                    raise ValueError("BaoStock returned no qfq rows")
+                updated, missing = _update_break_adjusted_bars(
+                    conn,
+                    market=market,
+                    ticker=ticker,
+                    start=start,
+                    end=as_of,
+                    adjusted_map=adjusted_map,
+                    source="baostock_qfq_break_repair",
                 )
-                conn.execute(
-                    """
-                    INSERT INTO adjustment_events (
-                        market, ticker, ex_date, previous_date, previous_raw_close,
-                        pre_close, factor_ratio, source, confidence, status,
-                        error_message, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 1.0, ?, 'HIGH', 'SUCCESS', 'already continuous', ?)
-                    ON CONFLICT(market, ticker, ex_date, source) DO UPDATE SET
-                        status = 'SUCCESS',
-                        error_message = 'already continuous',
-                        created_at = excluded.created_at
-                    """,
-                    (
-                        market,
-                        ticker,
-                        ex_date,
-                        str(row["previous_trade_date"]),
-                        float(raw_prev_close),
-                        float(pre_close),
-                        source,
-                        now_utc(),
-                    ),
-                )
+                if updated == 0:
+                    raise ValueError("no existing price_bars rows matched BaoStock qfq data")
                 conn.execute(
                     """
                     UPDATE adjustment_maintenance_queue
@@ -428,142 +565,58 @@ def qfq_repair_daily(
                     """,
                     (now_utc(), qid),
                 )
-                conn.execute("RELEASE qfq_repair_one")
-                continue
-            cursor = conn.execute(
-                """
-                UPDATE price_bars
-                SET adj_factor = COALESCE(NULLIF(adj_factor, 0), 1.0) * ?,
-                    adj_open = open * (COALESCE(NULLIF(adj_factor, 0), 1.0) * ?),
-                    adj_high = high * (COALESCE(NULLIF(adj_factor, 0), 1.0) * ?),
-                    adj_low = low * (COALESCE(NULLIF(adj_factor, 0), 1.0) * ?),
-                    adj_close = close * (COALESCE(NULLIF(adj_factor, 0), 1.0) * ?),
-                    adjustment_status = 'ADJUSTED',
-                    adjustment_source = ?,
-                    adjustment_error = NULL,
-                    adjusted_at = ?
-                WHERE market = ?
-                  AND ticker = ?
-                  AND date < ?
-                """,
-                (factor_ratio, factor_ratio, factor_ratio, factor_ratio, factor_ratio, source, now_utc(), market, ticker, ex_date),
-            )
-            rowcount = cursor.rowcount
-            current_cursor = conn.execute(
-                """
-                UPDATE price_bars
-                SET adj_factor = COALESCE(NULLIF(adj_factor, 0), 1.0),
-                    adj_open = open * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                    adj_high = high * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                    adj_low = low * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                    adj_close = close * COALESCE(NULLIF(adj_factor, 0), 1.0),
-                    adjustment_status = 'ADJUSTED',
-                    adjustment_source = ?,
-                    adjustment_error = NULL,
-                    adjusted_at = ?
-                WHERE market = ?
-                  AND ticker = ?
-                  AND date = ?
-                """,
-                (source, now_utc(), market, ticker, ex_date),
-            )
-            rowcount += current_cursor.rowcount
-            prev = conn.execute(
-                """
-                SELECT close, adj_factor
-                FROM price_bars
-                WHERE market = ? AND ticker = ? AND date = ?
-                """,
-                (market, ticker, str(row["previous_trade_date"])),
-            ).fetchone()
-            current = conn.execute(
-                """
-                SELECT adj_factor
-                FROM price_bars
-                WHERE market = ? AND ticker = ? AND date = ?
-                """,
-                (market, ticker, ex_date),
-            ).fetchone()
-            prev_factor = _valid_factor(prev["adj_factor"] if prev else None) or 1.0
-            current_factor = _valid_factor(current["adj_factor"] if current else None) or 1.0
-            prev_qfq_close = float(prev["close"]) * prev_factor
-            qfq_pre_close = float(pre_close) * current_factor
-            continuity_gap_pct = abs(prev_qfq_close / qfq_pre_close - 1.0) * 100.0 if qfq_pre_close else 100.0
-            if continuity_gap_pct > tolerance_pct:
-                raise ValueError(f"continuity gap {continuity_gap_pct:.3f}% exceeds {tolerance_pct:.3f}%")
-            conn.execute(
-                """
-                INSERT INTO adjustment_events (
-                    market, ticker, ex_date, previous_date, previous_raw_close,
-                    pre_close, factor_ratio, source, confidence, status,
-                    error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HIGH', 'SUCCESS', '', ?)
-                ON CONFLICT(market, ticker, ex_date, source) DO UPDATE SET
-                    previous_date = excluded.previous_date,
-                    previous_raw_close = excluded.previous_raw_close,
-                    pre_close = excluded.pre_close,
-                    factor_ratio = excluded.factor_ratio,
-                    confidence = excluded.confidence,
-                    status = excluded.status,
-                    error_message = '',
-                    created_at = excluded.created_at
-                """,
-                (
-                    market,
-                    ticker,
-                    ex_date,
-                    str(row["previous_trade_date"]),
-                    float(raw_prev_close),
-                    float(pre_close),
-                    factor_ratio,
-                    source,
-                    now_utc(),
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE adjustment_maintenance_queue
-                SET status = 'DONE', error_message = '', updated_at = ?
-                WHERE id = ?
-                """,
-                (now_utc(), qid),
-            )
-            conn.execute("RELEASE qfq_repair_one")
-            repaired += 1
-            updated_rows += rowcount
-        except Exception as exc:
-            conn.execute("ROLLBACK TO qfq_repair_one")
-            conn.execute("RELEASE qfq_repair_one")
-            failed += 1
-            message = f"{ticker} {exc}"
-            errors.append(message)
-            _mark_queue_failed(conn, qid, str(exc))
-            conn.execute(
-                """
-                INSERT INTO adjustment_events (
-                    market, ticker, ex_date, previous_date, previous_raw_close,
-                    pre_close, factor_ratio, source, confidence, status,
-                    error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'HIGH', 'FAILED', ?, ?)
-                ON CONFLICT(market, ticker, ex_date, source) DO UPDATE SET
-                    status = 'FAILED',
-                    error_message = excluded.error_message,
-                    created_at = excluded.created_at
-                """,
-                (
-                    market,
-                    ticker,
-                    ex_date,
-                    str(row["previous_trade_date"]),
-                    float(raw_prev_close or 0),
-                    float(pre_close or 0),
-                    source,
-                    str(exc)[:1000],
-                    now_utc(),
-                ),
-            )
+                _insert_adjustment_event(
+                    conn,
+                    market=market,
+                    ticker=ticker,
+                    ex_date=ex_date,
+                    previous_date=previous_date,
+                    previous_raw_close=float(raw_prev_close),
+                    pre_close=float(pre_close),
+                    factor_ratio=factor_ratio,
+                    source="baostock_qfq_break_repair",
+                    status="SUCCESS",
+                    error_message=f"missing_dates={missing}",
+                )
+                conn.execute("RELEASE qfq_repair_break_one")
+                repaired += 1
+                updated_rows += updated
+                missing_rows += missing
+            except Exception as exc:
+                conn.execute("ROLLBACK TO qfq_repair_break_one")
+                conn.execute("RELEASE qfq_repair_break_one")
+                failed += 1
+                message = f"{ticker} {exc}"
+                errors.append(message)
+                _mark_queue_failed(conn, qid, str(exc))
+                _insert_adjustment_event(
+                    conn,
+                    market=market,
+                    ticker=ticker,
+                    ex_date=ex_date,
+                    previous_date=previous_date,
+                    previous_raw_close=float(raw_prev_close or 0),
+                    pre_close=float(pre_close or 0),
+                    factor_ratio=factor_ratio,
+                    source="baostock_qfq_break_repair",
+                    status="FAILED",
+                    error_message=str(exc),
+                )
+            if throttle > 0 and index < len(queue_rows):
+                time.sleep(throttle)
+    finally:
+        if queue_rows:
+            _baostock_logout()
     conn.commit()
-    return QfqRepairResult(as_of, len(queue_rows), repaired, failed, updated_rows, errors)
+    return QfqRepairResult(
+        as_of,
+        target_count=len(queue_rows),
+        repaired_count=repaired,
+        failed_count=failed,
+        updated_rows=updated_rows,
+        errors=errors,
+        missing_rows=missing_rows,
+    )
 
 
 def write_qfq_maintenance_scan_report(
@@ -640,7 +693,7 @@ def qfq_maintenance_scan_and_repair(
             ignored=total.ignored + daily.ignored,
             queued=total.queued + daily.queued,
         )
-        repaired = qfq_repair_daily(conn, day, market=market)
+        repaired = qfq_repair_breaks(conn, day, start="2024-01-01", market=market, source="baostock")
         total_repair = QfqRepairResult(
             as_of=end_date,
             target_count=total_repair.target_count + repaired.target_count,

@@ -4,13 +4,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from alpha_ledger.adjustments import (
     CONFIRMED_BY_PRECLOSE,
     SUSPECTED_BY_PRICE_GAP,
     detect_adjustment_breaks,
     get_price_frame,
-    qfq_repair_daily,
+    qfq_repair_breaks,
 )
 from alpha_ledger.db import connect, init_db
 from alpha_ledger.qlib_export import export_qlib_csv
@@ -85,7 +86,14 @@ class AdjustmentFactorTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(queue["reason"], CONFIRMED_BY_PRECLOSE)
 
-                repaired = qfq_repair_daily(conn, "2026-06-05")
+                with patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                        "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
+                    repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
                 self.assertEqual(repaired.repaired_count, 1)
                 raw = conn.execute(
                     "SELECT close, adj_close, adj_factor FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-04'"
@@ -114,7 +122,14 @@ class AdjustmentFactorTest(unittest.TestCase):
                     change_pct=-1.315,
                 )
                 detect_adjustment_breaks(conn, "2026-06-05")
-                repaired = qfq_repair_daily(conn, "2026-06-05")
+                with patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 31.94, "adj_high": 31.94, "adj_low": 31.94, "adj_close": 31.94},
+                        "2026-06-05": {"adj_open": 31.52, "adj_high": 31.52, "adj_low": 31.52, "adj_close": 31.52},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
+                    repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
                 self.assertEqual(repaired.repaired_count, 1)
                 row = conn.execute(
                     "SELECT close, adj_close FROM price_bars WHERE ticker='003026.SZ' AND date='2026-06-04'"
@@ -144,7 +159,7 @@ class AdjustmentFactorTest(unittest.TestCase):
                 self.assertEqual(queue["reason"], SUSPECTED_BY_PRICE_GAP)
                 self.assertIsNone(queue["pre_close"])
 
-                repaired = qfq_repair_daily(conn, "2026-06-05")
+                repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
                 self.assertEqual(repaired.target_count, 0)
                 self.assertEqual(repaired.repaired_count, 0)
                 row = conn.execute(
@@ -165,7 +180,7 @@ class AdjustmentFactorTest(unittest.TestCase):
                 count = conn.execute("SELECT COUNT(*) AS n FROM adjustment_maintenance_queue").fetchone()["n"]
                 self.assertEqual(count, 1)
 
-    def test_repair_multiplies_existing_factor_instead_of_overwriting(self) -> None:
+    def test_break_repair_refreshes_existing_factor_from_baostock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with connect(Path(tmpdir) / "test.sqlite") as conn:
                 init_db(conn)
@@ -181,22 +196,36 @@ class AdjustmentFactorTest(unittest.TestCase):
                     status="ADJUSTED",
                 )
                 detect_adjustment_breaks(conn, "2026-06-05")
-                qfq_repair_daily(conn, "2026-06-05")
+                with patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 8.0, "adj_high": 8.0, "adj_low": 8.0, "adj_close": 8.0},
+                        "2026-06-05": {"adj_open": 8.1, "adj_high": 8.1, "adj_low": 8.1, "adj_close": 8.1},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
+                    qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
                 row = conn.execute(
                     "SELECT adj_factor, adj_close FROM price_bars WHERE ticker='000001.SZ' AND date='2026-06-04'"
                 ).fetchone()
-                self.assertAlmostEqual(row["adj_factor"], 0.4)
-                self.assertAlmostEqual(row["adj_close"], 4.0)
+                self.assertAlmostEqual(row["adj_factor"], 0.8)
+                self.assertAlmostEqual(row["adj_close"], 8.0)
 
-    def test_repair_does_not_double_adjust_already_continuous_rows(self) -> None:
+    def test_detect_keeps_baostock_repaired_break_done_without_requeue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with connect(Path(tmpdir) / "test.sqlite") as conn:
                 init_db(conn)
                 self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95, adj_factor=45.61 / 63.95, status="ADJUSTED")
                 self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
+                conn.execute(
+                    """
+                    UPDATE price_bars
+                    SET adjustment_source='baostock_qfq_break_repair'
+                    WHERE ticker='301213.SZ'
+                    """
+                )
                 detect_adjustment_breaks(conn, "2026-06-05")
-                repaired = qfq_repair_daily(conn, "2026-06-05")
-                self.assertEqual(repaired.updated_rows, 0)
+                repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
+                self.assertEqual(repaired.target_count, 0)
                 row = conn.execute(
                     "SELECT adj_factor, adj_close FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-04'"
                 ).fetchone()
@@ -218,11 +247,18 @@ class AdjustmentFactorTest(unittest.TestCase):
                 )
                 first = detect_adjustment_breaks(conn, "2026-06-05")
                 self.assertEqual(first.confirmed, 1)
-                repaired = qfq_repair_daily(conn, "2026-06-05")
+                with patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                        "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
+                    repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
                 self.assertEqual(repaired.repaired_count, 1)
 
                 second = detect_adjustment_breaks(conn, "2026-06-05")
-                self.assertEqual(second.confirmed, 0)
+                self.assertEqual(second.confirmed, 1)
                 self.assertEqual(second.suspected, 0)
                 self.assertEqual(second.queued, 0)
                 count = conn.execute(
@@ -255,26 +291,166 @@ class AdjustmentFactorTest(unittest.TestCase):
                 self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95)
                 self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
                 conn.commit()
-            command_qfq_maintenance(
-                str(db_path),
-                "2026-06-05",
-                interval_days=14,
-                lookback_days=2,
-                source="auto",
-                throttle=0.0,
-                limit=None,
-                commit_every=50,
-                out_dir=str(Path(tmpdir) / "reports"),
-                force=True,
-                dry_run=False,
-                mode="scan-and-repair",
-            )
+            with patch(
+                "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                return_value={
+                    "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                    "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                },
+            ), patch("alpha_ledger.adjustments._baostock_logout"):
+                command_qfq_maintenance(
+                    str(db_path),
+                    "2026-06-05",
+                    interval_days=14,
+                    lookback_days=2,
+                    source="auto",
+                    throttle=0.0,
+                    limit=None,
+                    commit_every=50,
+                    out_dir=str(Path(tmpdir) / "reports"),
+                    force=True,
+                    dry_run=False,
+                    mode="scan-and-repair",
+                )
             self.assertTrue((Path(tmpdir) / "reports" / "2026-06-05" / "summary.md").exists())
             with connect(db_path) as conn:
                 row = conn.execute(
                     "SELECT adj_close FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-04'"
                 ).fetchone()
                 self.assertAlmostEqual(row["adj_close"], 45.61, places=2)
+
+    def test_qfq_repair_breaks_only_processes_confirmed_preclose_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with connect(Path(tmpdir) / "test.sqlite") as conn:
+                init_db(conn)
+                self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95, status="ADJUSTED")
+                self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
+                self._insert_bar(conn, "003026.SZ", "2026-06-04", 46.47, status="ADJUSTED")
+                self._insert_bar(conn, "003026.SZ", "2026-06-05", 31.52, pre_close=31.94, change_pct=-1.315)
+                self._insert_bar(conn, "000001.SZ", "2026-06-04", 10.0)
+                self._insert_bar(conn, "000001.SZ", "2026-06-05", 8.0, pre_close=None, change_pct=1.0)
+                detect_adjustment_breaks(conn, "2026-06-05")
+
+                def fake_fetch(instrument, start, end, adjust="qfq"):
+                    if instrument.ticker == "301213.SZ":
+                        return {
+                            "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                            "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                        }
+                    if instrument.ticker == "003026.SZ":
+                        return {
+                            "2026-06-04": {"adj_open": 31.94, "adj_high": 31.94, "adj_low": 31.94, "adj_close": 31.94},
+                            "2026-06-05": {"adj_open": 31.52, "adj_high": 31.52, "adj_low": 31.52, "adj_close": 31.52},
+                        }
+                    raise AssertionError(f"unexpected ticker {instrument.ticker}")
+
+                with patch("alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map", side_effect=fake_fetch) as fetch, \
+                    patch("alpha_ledger.adjustments._baostock_logout"):
+                    repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
+
+                self.assertEqual(repaired.target_count, 2)
+                self.assertEqual(repaired.repaired_count, 2)
+                self.assertEqual(fetch.call_count, 2)
+                suspected = conn.execute(
+                    "SELECT status FROM adjustment_maintenance_queue WHERE ticker='000001.SZ'"
+                ).fetchone()
+                self.assertEqual(suspected["status"], "PENDING")
+
+    def test_qfq_repair_breaks_preserves_raw_spot_fields_and_refreshes_adjusted_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with connect(Path(tmpdir) / "test.sqlite") as conn:
+                init_db(conn)
+                self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95, adj_factor=1.0, status="ADJUSTED")
+                self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
+                conn.execute(
+                    """
+                    UPDATE price_bars
+                    SET amount=123456, volume=789, pre_close=45.61, change_pct=2.8064,
+                        change_amount=1.28, bid_price=46.88, ask_price=46.90, quote_time='15:00:00'
+                    WHERE ticker='301213.SZ' AND date='2026-06-05'
+                    """
+                )
+                detect_adjustment_breaks(conn, "2026-06-05")
+                before = dict(conn.execute(
+                    """
+                    SELECT open, high, low, close, volume, amount, pre_close, change_pct,
+                           change_amount, bid_price, ask_price, quote_time
+                    FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-05'
+                    """
+                ).fetchone())
+                with patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                        "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
+                    repaired = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
+                self.assertEqual(repaired.updated_rows, 2)
+                after = dict(conn.execute(
+                    """
+                    SELECT open, high, low, close, volume, amount, pre_close, change_pct,
+                           change_amount, bid_price, ask_price, quote_time
+                    FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-05'
+                    """
+                ).fetchone())
+                self.assertEqual(after, before)
+                adjusted = conn.execute(
+                    """
+                    SELECT adj_close, adj_factor, adjustment_status, adjustment_source
+                    FROM price_bars WHERE ticker='301213.SZ' AND date='2026-06-04'
+                    """
+                ).fetchone()
+                self.assertAlmostEqual(adjusted["adj_close"], 45.61, places=2)
+                self.assertAlmostEqual(adjusted["adj_factor"], 45.61 / 63.95, places=6)
+                self.assertEqual(adjusted["adjustment_status"], "ADJUSTED")
+                self.assertEqual(adjusted["adjustment_source"], "baostock_qfq_break_repair")
+
+    def test_qfq_repair_breaks_dry_run_does_not_fetch_or_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with connect(Path(tmpdir) / "test.sqlite") as conn:
+                init_db(conn)
+                self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95)
+                self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
+                detect_adjustment_breaks(conn, "2026-06-05")
+                with patch("alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map") as fetch:
+                    result = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", dry_run=True)
+                self.assertTrue(result.dry_run)
+                self.assertEqual(result.target_count, 1)
+                fetch.assert_not_called()
+                queue = conn.execute(
+                    "SELECT status FROM adjustment_maintenance_queue WHERE ticker='301213.SZ'"
+                ).fetchone()
+                self.assertEqual(queue["status"], "PENDING")
+
+    def test_qfq_repair_breaks_records_missing_dates_and_failed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with connect(Path(tmpdir) / "test.sqlite") as conn:
+                init_db(conn)
+                self._insert_bar(conn, "301213.SZ", "2026-06-04", 63.95)
+                self._insert_bar(conn, "301213.SZ", "2026-06-05", 46.89, pre_close=45.61, change_pct=2.8064)
+                self._insert_bar(conn, "003026.SZ", "2026-06-04", 46.47)
+                self._insert_bar(conn, "003026.SZ", "2026-06-05", 31.52, pre_close=31.94, change_pct=-1.315)
+                detect_adjustment_breaks(conn, "2026-06-05")
+
+                def fake_fetch(instrument, start, end, adjust="qfq"):
+                    if instrument.ticker == "301213.SZ":
+                        return {
+                            "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                        }
+                    raise RuntimeError("network down")
+
+                with patch("alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map", side_effect=fake_fetch), \
+                    patch("alpha_ledger.adjustments._baostock_logout"):
+                    result = qfq_repair_breaks(conn, "2026-06-05", start="2026-06-04", throttle=0.0)
+                self.assertEqual(result.repaired_count, 1)
+                self.assertEqual(result.failed_count, 1)
+                self.assertEqual(result.missing_rows, 1)
+                failed = conn.execute(
+                    "SELECT status, error_message FROM adjustment_maintenance_queue WHERE ticker='003026.SZ'"
+                ).fetchone()
+                self.assertEqual(failed["status"], "FAILED")
+                self.assertIn("network down", failed["error_message"])
 
 
 if __name__ == "__main__":

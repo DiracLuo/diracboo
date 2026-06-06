@@ -18,7 +18,7 @@ Alpha Ledger 已经接入三类公开日线行情源，并统一写入 `price_ba
 
 ```bash
 python -m alpha_ledger detect-adjustment-breaks --as-of YYYY-MM-DD
-python -m alpha_ledger qfq-repair-daily --as-of YYYY-MM-DD
+python -m alpha_ledger qfq-repair-breaks --as-of YYYY-MM-DD --start 2024-01-01 --source baostock
 ```
 
 每周或半月再做一次补漏维护，默认扫描最近 45 天，BaoStock 只处理失败/疑似样本和历史补漏：
@@ -127,7 +127,7 @@ python -m alpha_ledger fetch-prices \
   --adjust none
 ```
 
-正式生产不要用上述手工命令替代 `production-run`。前复权日常主路径是 `detect-adjustment-breaks` + `qfq-repair-daily` 维护 `adj_factor`，不是在拉行情时全市场请求 qfq。缺 `pre_close` 时不得自动反推复权因子，只能作为疑似样本等待外部校验。
+正式生产不要用上述手工命令替代 `production-run`。前复权日常主路径是 `detect-adjustment-breaks` + `qfq-repair-breaks`：先用当天 spot 的 `pre_close` 识别 confirmed 断点，再只对断点股票调用 BaoStock qfq 回补复权字段。缺 `pre_close` 时不得自动反推复权因子，只能作为疑似样本等待外部校验。
 
 筛选候选：
 
@@ -177,14 +177,14 @@ python -m alpha_ledger walk-forward \
 python -m alpha_ledger production-run --as-of 2026-05-27
 ```
 
-`production-run` 是唯一推荐生产入口，会编排核心行情快路径、除权断点检测、复权因子快修、数据审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和只读日报生成。
+`production-run` 是唯一推荐生产入口，会编排核心行情快路径、除权断点检测、前复权断点回补、数据审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和只读日报生成。
 
 当前生产编排的关键底层步骤为：
 
 ```text
 data-update --core-only --adjust none
 -> detect-adjustment-breaks
--> qfq-repair-daily
+-> qfq-repair-breaks
 -> data-audit
 -> qlib-refresh --mode incremental
 -> model-predict --models production
@@ -207,7 +207,7 @@ python -m alpha_ledger data-update \
 该模式会重新检查已有日期范围内的覆盖缺口：
 
 - 分层基准缺失时补沪深300、中证500、中证1000、创业板指、科创50、北证50。
-- 不推荐再用旧的全市场 adjustment repair 入口作为每日复权路径。前复权优先使用 `detect-adjustment-breaks` + `qfq-repair-daily`，只修发生断点的股票。
+- 不推荐再用旧的全市场 adjustment repair 入口作为每日复权路径。前复权优先使用 `detect-adjustment-breaks` + `qfq-repair-breaks`，只修当天 confirmed 断点股票。
 - 修复结果继续写入 `data_fetch_runs` 和 `data_fetch_errors`。
 
 旧的复权接口探测仍可用于排查 BaoStock/AkShare 是否可作为维护源，但不是每日生产必跑步骤：
@@ -231,7 +231,7 @@ python -m alpha_ledger data-audit \
 python -m alpha_ledger data-backfill --start 2025-12-01 --end 2026-05-26 --markets CN_A --batch-days 180 --adjust none --throttle 0.3
 ```
 
-当前补库主线使用 `--adjust none`，只维护原始价格和 `pre_close/change_pct`。需要修复复权时优先运行 `detect-adjustment-breaks`、`qfq-repair-daily` 或 `qfq-maintenance --mode scan-and-repair`，不要和日常补库混跑。
+当前补库主线使用 `--adjust none`，只维护原始价格和 `pre_close/change_pct`。每日复权断点闭环优先运行 `detect-adjustment-breaks`、`qfq-repair-breaks`；周期补漏才使用 `qfq-maintenance --mode scan-and-repair`，不要和日常补库混跑。
 
 新增数据任务表：
 
@@ -259,7 +259,7 @@ python -m alpha_ledger tune-weights \
 
 ## BaoStock、AkShare 与 Tushare
 
-BaoStock 已安装并用于 A 股日线换手率/成交额补充，以及前复权补漏和校验。前复权生产主路径不再每日调用 BaoStock 全量 qfq；只有 `qfq-maintenance --mode scan-and-repair` 遇到失败/疑似样本或历史补漏时，才应使用 BaoStock `adjustflag="2"`。
+BaoStock 已安装并用于 A 股日线换手率/成交额补充，以及前复权补漏和校验。前复权生产主路径只对当天 confirmed 断点股票调用 BaoStock `adjustflag="2"` 回补 2024-01-01 至 as_of 的 qfq 字段；`qfq-maintenance --mode scan-and-repair` 仅用于周期审计、失败/疑似样本和历史补漏。
 
 AkShare 已安装并用于事件、财务、当前资金流和 A 股分钟线兜底；但本环境中 AkShare 的东方财富链路偶尔会出现 `ProxyError / RemoteDisconnected`，所以 A 股分钟线当前优先使用新浪直连源。当前前复权优先使用 `pre_close` 推导因子，AkShare/BaoStock 只做维护源。
 

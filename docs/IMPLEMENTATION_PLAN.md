@@ -37,7 +37,7 @@
 
 ### 决策输出模块
 
-- 正式生产入口是 `production-run`，它编排数据快路径、复权因子快修、审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和正式日报。
+- 正式生产入口是 `production-run`，它编排数据快路径、除权断点检测、前复权断点回补、审计、Qlib 增量刷新、Production 模型预测、1 分钟分时复核和正式日报。
 - `production-daily` 是只读日报生成器，只读取已经准备好的数据和预测。
 - `daily-plan` / `daily-run` 仅作为旧/研究入口保留，不作为正式生产路径。
 - `--as-of` 表示数据截止日，不表示自然日今天。
@@ -101,7 +101,7 @@ python -m alpha_ledger production-async --as-of <DATE>
 
 python -m alpha_ledger detect-adjustment-breaks --as-of <DATE>
 
-python -m alpha_ledger qfq-repair-daily --as-of <DATE>
+python -m alpha_ledger qfq-repair-breaks --as-of <DATE> --start 2024-01-01 --source baostock
 
 python -m alpha_ledger qfq-maintenance \
   --as-of <DATE> \
@@ -152,7 +152,7 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 
 它负责快速数据更新、数据审计、Qlib 增量刷新、Production 模型预测和只读日报生成。
 
-当前生产链路还包括：`pre_close` 除权断点检测、`qfq-repair-daily` 复权因子快修、信号池 1 分钟分时复核和分时结论生成。其中模型预测刷新必须进入日报前置流程。每天不一定重训模型，但必须确认当天 `model_scores` 是最新可用状态。`daily-plan` / `daily-run` 仅作为旧/研究入口，不再作为正式生产路径。
+当前生产链路还包括：`pre_close` 除权断点检测、`qfq-repair-breaks` 前复权断点回补、信号池 1 分钟分时复核和分时结论生成。其中模型预测刷新必须进入日报前置流程。每天不一定重训模型，但必须确认当天 `model_scores` 是最新可用状态。`daily-plan` / `daily-run` 仅作为旧/研究入口，不再作为正式生产路径。
 
 ### 5.3 拆分快任务和慢任务
 
@@ -160,7 +160,7 @@ python -m alpha_ledger production-run --as-of YYYY-MM-DD
 
 建议拆分：
 
-- 快任务：价格、`pre_close`、`amount`、基准、交易状态、复权因子快修、数据审计、模型预测、筛选、信号池 1 分钟分时复核、准入、日报。
+- 快任务：价格、`pre_close`、`amount`、基准、交易状态、前复权断点回补、数据审计、模型预测、筛选、信号池 1 分钟分时复核、准入、日报。
 - 慢任务：事件、公告、财报、资金流、周期复权维护、模型训练、深度复盘。
 
 ### 5.4 信号跟踪模块

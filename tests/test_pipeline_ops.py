@@ -794,6 +794,20 @@ class ProductionDailyTest(TestCase):
                 calls.append("data-audit")
                 return SimpleNamespace(confidence_level="HIGH_CONFIDENCE")
 
+            def fake_detect(*args, **kwargs):
+                calls.append("detect-adjustment-breaks")
+                return SimpleNamespace(confirmed=0, suspected=0)
+
+            def fake_repair(*args, **kwargs):
+                calls.append("qfq-repair-breaks")
+                return SimpleNamespace(
+                    target_count=0,
+                    repaired_count=0,
+                    failed_count=0,
+                    updated_rows=0,
+                    missing_rows=0,
+                )
+
             def fake_qlib(*args, **kwargs):
                 calls.append("qlib-refresh")
                 return SimpleNamespace(status="SUCCESS", version="v1", mode="incremental", row_count=1, error_message="")
@@ -808,6 +822,8 @@ class ProductionDailyTest(TestCase):
                 return SimpleNamespace(status="SUCCESS", report_path=str(Path(tmpdir) / "daily.md"), error_message="")
 
             with patch("alpha_ledger.pipeline_ops.data_update", side_effect=fake_data), \
+                 patch("alpha_ledger.pipeline_ops.detect_adjustment_breaks", side_effect=fake_detect), \
+                 patch("alpha_ledger.pipeline_ops.qfq_repair_breaks", side_effect=fake_repair), \
                  patch("alpha_ledger.pipeline_ops.audit_data_coverage", side_effect=fake_audit), \
                  patch("alpha_ledger.pipeline_ops.qlib_refresh", side_effect=fake_qlib), \
                  patch("alpha_ledger.pipeline_ops.model_predict", side_effect=fake_predict), \
@@ -821,6 +837,8 @@ class ProductionDailyTest(TestCase):
                 calls,
                 [
                     "data-update",
+                    "detect-adjustment-breaks",
+                    "qfq-repair-breaks",
                     "data-audit",
                     "qlib-refresh",
                     "model-predict",
@@ -1296,7 +1314,14 @@ class QfqMaintenanceTest(TestCase):
                 "--out-dir",
                 str(Path(tmpdir) / "reports"),
             ]
-            with patch.object(sys, "argv", argv):
+            with patch.object(sys, "argv", argv), \
+                patch(
+                    "alpha_ledger.adjustments.fetch_baostock_cn_adjusted_daily_map",
+                    return_value={
+                        "2026-06-04": {"adj_open": 45.61, "adj_high": 45.61, "adj_low": 45.61, "adj_close": 45.61},
+                        "2026-06-05": {"adj_open": 46.89, "adj_high": 46.89, "adj_low": 46.89, "adj_close": 46.89},
+                    },
+                ), patch("alpha_ledger.adjustments._baostock_logout"):
                 self.assertEqual(cli_main(), 0)
 
             with connect(db_path) as conn:
@@ -1308,4 +1333,4 @@ class QfqMaintenanceTest(TestCase):
                     """
                 ).fetchone()
             self.assertAlmostEqual(row["adj_close"], 45.61, places=2)
-            self.assertEqual(row["adjustment_source"], "pre_close")
+            self.assertEqual(row["adjustment_source"], "baostock_qfq_break_repair")

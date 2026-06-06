@@ -14,7 +14,7 @@ from .qfq_backfill import qfq_backfill, write_qfq_backfill_report
 from .adjustments import (
     detect_adjustment_breaks,
     qfq_maintenance_scan_and_repair,
-    qfq_repair_daily,
+    qfq_repair_breaks,
 )
 from .benchmarks import CN_A_BENCHMARKS
 from .data_ops import REPAIR_SCOPES, audit_data_coverage, data_update, probe_adjustment_sources
@@ -479,12 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
     detect_adj.add_argument("--as-of", required=True, help="Detection date YYYY-MM-DD")
     detect_adj.add_argument("--market", default="CN_A")
 
-    repair_daily = subparsers.add_parser(
-        "qfq-repair-daily",
-        help="Repair queued CN_A qfq factors using explicit pre_close factor ratios",
+    repair_breaks = subparsers.add_parser(
+        "qfq-repair-breaks",
+        help="Repair only same-day confirmed CN_A qfq breaks via BaoStock qfq history",
     )
-    repair_daily.add_argument("--as-of", required=True, help="Repair date YYYY-MM-DD")
-    repair_daily.add_argument("--market", default="CN_A")
+    repair_breaks.add_argument("--as-of", required=True, help="Repair date YYYY-MM-DD")
+    repair_breaks.add_argument("--start", default="2024-01-01", help="QFQ refresh start date YYYY-MM-DD")
+    repair_breaks.add_argument("--market", default="CN_A")
+    repair_breaks.add_argument("--source", choices=["baostock"], default="baostock")
+    repair_breaks.add_argument("--throttle", type=float, default=0.3, help="Seconds between BaoStock calls")
+    repair_breaks.add_argument("--dry-run", action="store_true", help="List confirmed break targets without DB writes")
 
     enrich_daily = subparsers.add_parser(
         "enrich-daily-bars",
@@ -1391,14 +1395,32 @@ def command_detect_adjustment_breaks(db_path: str, as_of: str, market: str) -> N
     )
 
 
-def command_qfq_repair_daily(db_path: str, as_of: str, market: str) -> None:
+def command_qfq_repair_breaks(
+    db_path: str,
+    as_of: str,
+    start: str,
+    market: str,
+    source: str,
+    throttle: float,
+    dry_run: bool,
+) -> None:
     with closing(connect(db_path)) as conn:
         init_db(conn)
-        result = qfq_repair_daily(conn, as_of, market=market)
+        result = qfq_repair_breaks(
+            conn,
+            as_of,
+            start=start,
+            market=market,
+            source=source,
+            throttle=throttle,
+            dry_run=dry_run,
+        )
+    mode = " DRY-RUN" if dry_run else ""
     print(
-        f"QFQ repair daily: as_of={as_of}, targets={result.target_count}, "
-        f"repaired={result.repaired_count}, failed={result.failed_count}, "
-        f"updated_rows={result.updated_rows}"
+        f"QFQ repair breaks{mode}: as_of={as_of}, start={start}, "
+        f"targets={result.target_count}, repaired={result.repaired_count}, "
+        f"failed={result.failed_count}, updated_rows={result.updated_rows}, "
+        f"missing_rows={result.missing_rows}"
     )
     if result.failed_count:
         for error in result.errors[:20]:
@@ -1904,8 +1926,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "detect-adjustment-breaks":
         command_detect_adjustment_breaks(args.db, args.as_of, args.market)
-    elif args.command == "qfq-repair-daily":
-        command_qfq_repair_daily(args.db, args.as_of, args.market)
+    elif args.command == "qfq-repair-breaks":
+        command_qfq_repair_breaks(
+            args.db,
+            args.as_of,
+            args.start,
+            args.market,
+            args.source,
+            args.throttle,
+            args.dry_run,
+        )
     elif args.command == "enrich-daily-bars":
         command_enrich_daily_bars(
             args.db,

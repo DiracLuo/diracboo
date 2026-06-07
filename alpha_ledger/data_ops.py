@@ -5,6 +5,9 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+import exchange_calendars
+import pandas as pd
+
 from .benchmarks import CN_A_BENCHMARKS
 from .db import upsert_many
 from .event_data import fetch_events_to_db
@@ -840,6 +843,17 @@ def audit_data_coverage(
     return result
 
 
+def _is_cn_a_trading_day(as_of_date: str) -> bool:
+    """Check whether as_of_date is a CN_A trading day using exchange_calendars."""
+    try:
+        xshg = exchange_calendars.get_calendar("XSHG")
+        return xshg.is_session(pd.Timestamp(as_of_date))
+    except Exception:
+        # Fallback: treat weekdays as trading days if calendar lookup fails.
+        d = date.fromisoformat(as_of_date)
+        return d.weekday() < 5
+
+
 def data_update(
     conn: sqlite3.Connection,
     as_of_date: str,
@@ -857,6 +871,11 @@ def data_update(
     selected_markets = _split_markets(markets)
     if selected_markets != {"CN_A"}:
         raise ValueError("data-update v1 only supports CN_A")
+    if not _is_cn_a_trading_day(as_of_date):
+        raise ValueError(
+            f"{as_of_date} is not a CN_A trading day. "
+            "Use a valid trading day or run without data-update."
+        )
     if repair_scope not in REPAIR_SCOPES:
         raise ValueError(f"Unsupported repair scope: {repair_scope}")
     latest = _latest_price_date(conn, "CN_A")

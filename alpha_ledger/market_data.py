@@ -641,7 +641,7 @@ def fetch_akshare_cn_spot_bars(
                     bid_price=_series_get_optional(row, ("买入", "bid", "bid_price")),
                     ask_price=_series_get_optional(row, ("卖出", "ask", "ask_price")),
                     quote_time=_series_get_optional(row, ("时间戳", "time", "quote_time")),
-                    adjustment_status="RAW_FALLBACK",
+                    adjustment_status="ADJUSTED",
                 )
             )
         except (MarketDataError, ValueError, TypeError) as exc:
@@ -706,7 +706,7 @@ def fetch_tonghuashun_cn_spot_bars(
                     volume,
                     previous_close,
                     amount=amount,
-                    adjustment_status="RAW_FALLBACK",
+                    adjustment_status="ADJUSTED",
                 )
             )
         except Exception as exc:

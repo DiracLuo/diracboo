@@ -302,9 +302,7 @@ def detect_adjustment_breaks(
         if pre not in (None, 0):
             official_change = (close_f / pre - 1.0) * 100.0
             preclose_gap = abs(pre / raw_prev - 1.0) * 100.0
-            if preclose_gap >= preclose_threshold_pct and (
-                change_pct is None or abs(official_change - float(change_pct)) <= change_tolerance_pct
-            ):
+            if preclose_gap >= preclose_threshold_pct:
                 confirmed += 1
                 already_baostock_repaired = _has_baostock_break_repair(
                     conn,
